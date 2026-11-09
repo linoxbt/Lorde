@@ -1,0 +1,285 @@
+#!/usr/bin/env python
+"""Step 6: Lorde Bench judge evaluation on the held-out test set.
+
+    python forge/06_judge_eval.py \
+        --judge base=openai/student@http://localhost:8001/v1 \
+        --judge lorde=openai/lorde@http://localhost:8002/v1 \
+        --gpu-hourly base=0.50 --gpu-hourly lorde=0.50 --structured
+
+For each judge: gate-usable rate, decision agreement and Cohen's kappa vs the
+teacher, Spearman and MAE of scores, grounding verdict accuracy, per-language
+and per-variant breakdowns, agreement with human labels (the teacher's own
+human agreement is the ceiling), agreement with Aya Expanse 32B on the
+calibration slice, latency and throughput at fixed concurrency, cost per 1M
+judgments vs the API teacher, and AuditKIT paired-bootstrap significance tests.
+``--structured`` also runs every judge with vLLM structured outputs ("<name>+so").
+
+Writes results/judge_eval.{json,md} and results/preds/<judge>.jsonl.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lorde_forge import audit, config, contract, jsonl, llm, metrics  # noqa: E402
+from lorde_forge.report import fmt, table  # noqa: E402
+
+
+def kv(pairs: list[str]) -> dict[str, float]:
+    out = {}
+    for p in pairs or []:
+        k, _, v = p.partition("=")
+        out[k] = float(v)
+    return out
+
+
+def predict(ep: llm.Endpoint, items: list[dict], structured: bool, path: Path, concurrency: int) -> dict[str, dict]:
+    by_uid = {r["uid"]: r for r in items}
+    with jsonl.Appender(path) as out:
+        todo = [r for r in items if r["uid"] not in out]
+        reqs = [llm.Request(uid=r["uid"], messages=[{"role": "user", "content": r["prompt"]}],
+                            params=llm.judge_params(r["kind"], structured)) for r in todo]
+
+        def save(res: llm.Result) -> None:
+            j = contract.parse_reply(by_uid[res.uid]["kind"], res.text)
+            out.add({**res.as_row(), "ok": j.ok, "score": j.score, "verdict": j.verdict})
+
+        if reqs:
+            llm.run(ep, reqs, concurrency=concurrency, on_result=save, desc=path.stem)
+    return {r["uid"]: r for r in jsonl.read(path) if r["uid"] in by_uid}
+
+
+def perf(ep: llm.Endpoint, items: list[dict], structured: bool, n: int, concurrency: int) -> dict:
+    """Timed run at fixed concurrency (not cached), for latency and throughput."""
+    sample = items[:n]
+    reqs = [llm.Request(uid=r["uid"], messages=[{"role": "user", "content": r["prompt"]}],
+                        params=llm.judge_params(r["kind"], structured)) for r in sample]
+    res, wall = llm.run(ep, reqs, concurrency=concurrency, desc=f"perf {ep.name}")
+    ok = [r for r in res if r.error is None]
+    s = metrics.latency_stats([r.latency_s for r in ok], wall, n_ok=len(ok),
+                              completion_tokens=sum(r.completion_tokens for r in ok))
+    s.update({"n": len(sample), "concurrency": concurrency, "errors": len(res) - len(ok),
+              "mean_prompt_tokens": round(sum(r.prompt_tokens for r in ok) / max(1, len(ok)), 1),
+              "mean_completion_tokens": round(sum(r.completion_tokens for r in ok) / max(1, len(ok)), 1)})
+    return s
+
+
+def row_of(p: dict | None) -> dict:
+    if not p:
+        return {"ok": False, "score": None, "verdict": None}
+    return {"ok": bool(p.get("ok")), "score": p.get("score"), "verdict": p.get("verdict")}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--judge", action="append", required=True, help="name=openai/model@base_url")
+    ap.add_argument("--gpu-hourly", action="append", default=[], help="name=USD per GPU hour")
+    ap.add_argument("--structured", action="store_true", help="also evaluate with structured outputs")
+    ap.add_argument("--candidate", default="lorde")
+    ap.add_argument("--baseline", default="base")
+    ap.add_argument("--test", default=str(config.DATA / "test.jsonl"))
+    ap.add_argument("--human-labels", default=str(config.DATA / "human_labels.jsonl"))
+    ap.add_argument("--calibration", default=str(config.DATA / "labels_32b.jsonl"))
+    ap.add_argument("--concurrency", type=int, default=16)
+    ap.add_argument("--perf-n", type=int, default=256)
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--out", default=str(config.RESULTS / "judge_eval"))
+    args = ap.parse_args()
+
+    test = jsonl.read(args.test)
+    if args.limit:
+        test = test[: args.limit]
+    if not test:
+        sys.exit("empty test set: run forge/03_make_splits.py first")
+    uids = [t["uid"] for t in test]
+    teacher = [{"ok": True, "score": t["teacher_score"], "verdict": t.get("teacher_verdict")} for t in test]
+    langs = [t["lang"] for t in test]
+    kinds = [t["kind"] for t in test]
+    variant_keys = [f"{t['kind']}:{t.get('variant', '?')}" for t in test]
+    prices = kv(args.gpu_hourly)
+
+    eps = [llm.Endpoint.parse(s) for s in args.judge]
+    runs: list[tuple[str, llm.Endpoint, bool]] = [(e.name, e, False) for e in eps]
+    if args.structured:
+        runs += [(f"{e.name}+so", e, True) for e in eps]
+
+    preds: dict[str, dict[str, dict]] = {}
+    perf_stats: dict[str, dict] = {}
+    for name, ep, structured in runs:
+        print(f"[eval] judge {name} ({ep.model} @ {ep.base_url}, structured={structured})")
+        preds[name] = predict(ep, test, structured, config.RESULTS / "preds" / f"{name}.jsonl", args.concurrency)
+        perf_stats[name] = perf(ep, test, structured, args.perf_n, args.concurrency)
+
+    rows = {name: [row_of(preds[name].get(u)) for u in uids] for name in preds}
+    report: dict = {"n_test": len(test), "templates": contract.fingerprints(), "judges": {}}
+    for name in rows:
+        gpu = prices.get(name.removesuffix("+so"))
+        p = perf_stats[name]
+        report["judges"][name] = {
+            "vs_teacher": metrics.compare(rows[name], teacher),
+            "by_kind": metrics.grouped(rows[name], teacher, kinds),
+            "by_lang": metrics.grouped(rows[name], teacher, langs),
+            "by_variant": metrics.grouped(rows[name], teacher, variant_keys),
+            "perf": p,
+            "gpu_hourly": gpu,
+            "cost_per_1M": metrics.cost_per_million_gpu(gpu, p.get("judgments_per_s")) if gpu else None,
+        }
+
+    # Human agreement: teacher is the ceiling.
+    human = {r["uid"]: r for r in jsonl.read(args.human_labels)}  # latest row per uid wins
+    hu = [i for i, u in enumerate(uids) if u in human]
+    if hu:
+        href = [{"ok": True, "score": human[uids[i]]["human_score"], "verdict": human[uids[i]].get("human_verdict")}
+                for i in hu]
+        report["human"] = {"n": len(hu), "teacher": metrics.compare([teacher[i] for i in hu], href)}
+        for name in rows:
+            report["human"][name] = metrics.compare([rows[name][i] for i in hu], href)
+
+    # Calibration: agreement with Aya Expanse 32B (Cohere API) on the overlap.
+    cal = {r["uid"]: r for r in jsonl.read(args.calibration) if not r.get("call_error")}
+    ci = [i for i, u in enumerate(uids) if u in cal]
+    if ci:
+        cref = [{"ok": bool(cal[uids[i]]["ok"]), "score": cal[uids[i]]["score"], "verdict": cal[uids[i]].get("verdict")}
+                for i in ci]
+        report["calibration_32b"] = {"n": len(ci), "teacher_8b": metrics.compare([teacher[i] for i in ci], cref)}
+        for name in rows:
+            report["calibration_32b"][name] = metrics.compare([rows[name][i] for i in ci], cref)
+
+    # API reference cost: Aya Expanse 32B at Cohere list price, with measured token counts.
+    tok_src = list(cal.values()) or jsonl.read(config.DATA / "labels.jsonl")
+    tok_src = [r for r in tok_src if r.get("prompt_tokens")]
+    if tok_src:
+        pt = sum(r["prompt_tokens"] for r in tok_src) / len(tok_src)
+        ct = sum(r["completion_tokens"] for r in tok_src) / len(tok_src)
+        price = config.COHERE_32B_PRICE_PER_M
+        api = metrics.cost_per_million_api(pt, ct, price["input"], price["output"])
+        report["api_reference"] = {"model": f"{config.CALIBRATION_MODEL} (Cohere API)",
+                                   "mean_prompt_tokens": round(pt, 1), "mean_completion_tokens": round(ct, 1),
+                                   "price_per_1M_tokens": price, "cost_per_1M_judgments": api,
+                                   "token_source": "calibration labels" if cal else "teacher labels (8B tokenizer)"}
+
+    # AuditKIT significance: does the candidate agree with the teacher more often than the baseline?
+    ref_dec = [t["teacher_score"] >= config.THRESHOLD for t in test]
+
+    def dec(name: str) -> list[bool]:
+        return [bool(r["ok"] and r["score"] is not None and r["score"] >= config.THRESHOLD) for r in rows[name]]
+
+    sig = {}
+    for cand in (args.candidate, f"{args.candidate}+so"):
+        for base in (args.baseline, f"{args.baseline}+so"):
+            if cand in rows and base in rows and base.endswith("+so") == cand.endswith("+so"):
+                sig[f"{cand} vs {base}"] = audit.decision_significance(uids, ref_dec, dec(base), dec(cand))
+    report["significance_decision_agreement"] = sig
+
+    report["acceptance"] = acceptance(report, args.candidate)
+    jsonl.write_json(f"{args.out}.json", report)
+    Path(f"{args.out}.md").write_text(render_md(report, args.candidate), encoding="utf-8")
+    print(f"[eval] wrote {args.out}.md / .json")
+    for c in report["acceptance"]:
+        print(f"  {'PASS' if c['met'] else 'FAIL' if c['met'] is False else ' -- '}  {c['criterion']}: {c['value']}")
+
+
+def acceptance(r: dict, cand: str) -> list[dict]:
+    j = r["judges"].get(cand)
+    if not j:
+        return []
+    vt = j["vs_teacher"]
+    so = r["judges"].get(f"{cand}+so", {}).get("vs_teacher", {})
+    out = []
+
+    def add(criterion, value, ok, blocking=True, fmt_pct=True):
+        out.append({"criterion": criterion, "value": fmt(value, pct=fmt_pct), "met": ok, "blocking": blocking})
+
+    add("Gate-usable rate, unconstrained ≥ 99.0%", vt["gate_usable_rate"], vt["gate_usable_rate"] >= 0.99)
+    if so:
+        add("Gate-usable rate, structured outputs = 100%", so["gate_usable_rate"], so["gate_usable_rate"] >= 1.0)
+    add("Decision agreement vs teacher ≥ 90%", vt["decision_agreement"], vt["decision_agreement"] >= 0.90)
+    add("Cohen's κ vs teacher ≥ 0.75", vt["kappa"], vt["kappa"] is not None and vt["kappa"] >= 0.75, fmt_pct=False)
+    add("Spearman ρ ≥ 0.80 (reported)", vt["spearman"], vt["spearman"] is not None and vt["spearman"] >= 0.80,
+        blocking=False, fmt_pct=False)
+    add("MAE ≤ 0.10 (reported)", vt["mae"], vt["mae"] is not None and vt["mae"] <= 0.10, blocking=False, fmt_pct=False)
+    g = j["by_kind"].get("grounding", {})
+    if g.get("verdict_accuracy") is not None:
+        add("Grounding verdict accuracy ≥ 85%", g["verdict_accuracy"], g["verdict_accuracy"] >= 0.85)
+    h = r.get("human")
+    if h and cand in h:
+        ceiling = h["teacher"]["decision_agreement"]
+        add(f"Human decision agreement ≥ teacher's ({fmt(ceiling, True)}) − 3 pts",
+            h[cand]["decision_agreement"], h[cand]["decision_agreement"] >= ceiling - 0.03)
+    worst = min(((k, v["decision_agreement"]) for k, v in j["by_lang"].items()), key=lambda x: x[1])
+    add(f"Per-language decision agreement ≥ 85% (worst: {worst[0]})", worst[1], worst[1] >= 0.85)
+    p95 = j["perf"].get("p95_s")
+    out.append({"criterion": "p95 latency ≤ 1.5 s at 16 concurrent (production on L4; reported on this GPU)",
+                "value": f"{p95} s" if p95 is not None else "–", "met": p95 is not None and p95 <= 1.5,
+                "blocking": False})
+    return out
+
+
+def render_md(r: dict, cand: str) -> str:
+    js = r["judges"]
+    lines = [f"# Lorde Bench: judge evaluation\n\nHeld-out test set: **{r['n_test']}** items "
+             f"(grouped by prompt / source passage, never seen in training). Reference: teacher "
+             f"(Aya Expanse 8B) decisions at threshold {config.THRESHOLD}. Unparseable replies count as rejects, "
+             f"as in CuratorKIT.\n",
+             f"Templates: {', '.join(t['id'] for t in r['templates']['templates'].values())}\n"]
+    head = ["Judge", "Gate-usable", "Decision agr.", "κ", "Spearman", "MAE", "Verdict acc.", "Pass rate",
+            "p50 s", "p95 s", "judg/s", "$ / 1M"]
+    body = []
+    for name, j in js.items():
+        v, p = j["vs_teacher"], j["perf"]
+        body.append([f"**{name}**" if name.startswith(cand) else name, fmt(v["gate_usable_rate"], True),
+                     fmt(v["decision_agreement"], True), fmt(v["kappa"]), fmt(v["spearman"]), fmt(v["mae"]),
+                     fmt(j["by_kind"].get("grounding", {}).get("verdict_accuracy"), True), fmt(v["pass_rate"], True),
+                     fmt(p.get("p50_s")), fmt(p.get("p95_s")), fmt(p.get("judgments_per_s")),
+                     fmt(j.get("cost_per_1M"))])
+    lines += ["## Before / after\n", table(head, body), ""]
+    if "api_reference" in r:
+        a = r["api_reference"]
+        lines += [f"API reference: {a['model']} at ${a['price_per_1M_tokens']['input']}/1M input and "
+                  f"${a['price_per_1M_tokens']['output']}/1M output tokens, {a['mean_prompt_tokens']} prompt + "
+                  f"{a['mean_completion_tokens']} completion tokens per judgment ({a['token_source']}) → "
+                  f"**${a['cost_per_1M_judgments']} per 1M judgments**.\n"]
+        c = js.get(cand, {}).get("cost_per_1M")
+        if c:
+            lines += [f"Lorde on this GPU: **${c} per 1M judgments**, {a['cost_per_1M_judgments'] / c:.0f}× cheaper.\n"]
+
+    lines += ["## Acceptance criteria (spec 9.2)\n",
+              table(["Criterion", "Value", "Met", "Blocking"],
+                    [[c["criterion"], c["value"], fmt(c["met"]), fmt(c["blocking"])] for c in r["acceptance"]]), ""]
+
+    langs = sorted(next(iter(js.values()))["by_lang"])
+    lines += ["## Decision agreement by language\n",
+              table(["Judge", *langs], [[n, *(fmt(j["by_lang"][lg]["decision_agreement"], True) for lg in langs)]
+                                        for n, j in js.items()]), ""]
+    var = sorted(next(iter(js.values()))["by_variant"])
+    lines += ["## Pass rate by variant (teacher vs judges)\n",
+              table(["Variant", "n", "teacher", *js], [[v, js[next(iter(js))]["by_variant"][v]["n"],
+                    fmt(js[next(iter(js))]["by_variant"][v]["ref_pass_rate"], True),
+                    *(fmt(j["by_variant"][v]["pass_rate"], True) for j in js.values())] for v in var]), ""]
+    if "human" in r:
+        h = r["human"]
+        lines += [f"## Agreement with human labels (n = {h['n']})\n",
+                  table(["Judge", "Decision agr.", "κ", "Spearman", "MAE"],
+                        [[n, fmt(m["decision_agreement"], True), fmt(m["kappa"]), fmt(m["spearman"]), fmt(m["mae"])]
+                         for n, m in h.items() if isinstance(m, dict)]), ""]
+    if "calibration_32b" in r:
+        c = r["calibration_32b"]
+        lines += [f"## Agreement with Aya Expanse 32B (Cohere API, n = {c['n']})\n",
+                  table(["Judge", "Decision agr.", "κ", "MAE"],
+                        [[n, fmt(m["decision_agreement"], True), fmt(m["kappa"]), fmt(m["mae"])]
+                         for n, m in c.items() if isinstance(m, dict)]), ""]
+    if r.get("significance_decision_agreement"):
+        lines += ["## Significance (AuditKIT paired bootstrap, decision agreement with teacher)\n",
+                  table(["Comparison", "n", "baseline", "candidate", "Δ", "p", "significant"],
+                        [[k, s.get("n"), fmt(s.get("mean_baseline"), True), fmt(s.get("mean_candidate"), True),
+                          fmt(s.get("delta"), True), s.get("p_value"), fmt(s.get("significant"))]
+                         for k, s in r["significance_decision_agreement"].items()]), ""]
+    return "\n".join(lines) + "\n"
+
+
+if __name__ == "__main__":
+    main()
