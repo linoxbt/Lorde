@@ -77,11 +77,10 @@ def generate(model_path: str, rows: list[dict], batch: int, max_new_tokens: int)
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    _, _, bf16 = T.precision()
     tok = AutoTokenizer.from_pretrained(model_path, padding_side="left")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16 if bf16 else torch.float16,
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=T.torch_dtype(),
                                                  device_map="auto").eval()
     outs: list[str] = []
     for i in range(0, len(rows), batch):

@@ -34,12 +34,21 @@ class Recipe:
 
 
 def precision() -> tuple[str, bool, bool]:
-    """('bf16'|'fp16', fp16, bf16): T4 has no bf16."""
+    """('bf16'|'fp16'|'fp32', fp16, bf16): bf16 on L4/A100, fp16 on T4 (no bf16), fp32 without a GPU."""
     import torch
 
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    if not torch.cuda.is_available():
+        return "fp32", False, False
+    if torch.cuda.is_bf16_supported():
         return "bf16", False, True
     return "fp16", True, False
+
+
+def torch_dtype():
+    import torch
+
+    prec, _, _ = precision()
+    return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[prec]
 
 
 def token_len(tok, row: dict) -> int:
@@ -55,9 +64,41 @@ def filter_by_tokens(rows: list[dict], tok, max_len: int) -> tuple[list[dict], i
     return keep, len(rows) - len(keep)
 
 
+def render_chat(rows: list[dict], tok) -> list[dict]:
+    """Conversational prompt/completion rows -> plain strings with the chat template applied.
+
+    AlignTune flattens chat-format columns to plain text before TRL sees them, which would train
+    without the chat template that vLLM applies at serving time. Rendering here (prompt with the
+    generation prompt, completion = the rest of the full conversation, leading BOS removed because
+    the tokenizer adds it) gives token ids identical to TRL's own conversational path.
+    """
+    adds_bos = tok.bos_token is not None and tok("x")["input_ids"][:1] == [tok.bos_token_id]
+    out = []
+    for r in rows:
+        p, c = r["prompt"], r["completion"]
+        if not isinstance(p, list):
+            out.append({"prompt": p, "completion": c})
+            continue
+        full = tok.apply_chat_template(p + c, tokenize=False)
+        prompt = tok.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
+        if not full.startswith(prompt):
+            raise ValueError("chat template: the prompt is not a prefix of the full conversation")
+        completion = full[len(prompt):]
+        if adds_bos and prompt.startswith(tok.bos_token):
+            prompt = prompt[len(tok.bos_token):]
+        out.append({"prompt": prompt, "completion": completion})
+    return out
+
+
 def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: int, r: Recipe) -> None:
     from aligntune.core.backend_factory import create_sft_trainer
+    from transformers import AutoTokenizer
 
+    from . import jsonl
+
+    rendered = train_path.with_name(train_path.stem + ".rendered.jsonl")
+    jsonl.write(rendered, render_chat(jsonl.read(train_path), AutoTokenizer.from_pretrained(base_model)))
+    train_path = rendered
     prec, fp16, bf16 = precision()
     trainer = create_sft_trainer(
         model_name=base_model, dataset_name=str(train_path), backend="trl", output_dir=str(out_dir),
@@ -75,7 +116,6 @@ def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: in
 
 def train_trl(base_model: str, train_path: Path, val_path: Path | None, out_dir: Path, n_rows: int,
               r: Recipe) -> None:
-    import torch
     from datasets import load_dataset
     from peft import LoraConfig
     from trl import SFTConfig, SFTTrainer
@@ -92,7 +132,7 @@ def train_trl(base_model: str, train_path: Path, val_path: Path | None, out_dir:
         completion_only_loss=True, packing=False, fp16=fp16, bf16=bf16, gradient_checkpointing=True,
         logging_steps=10, eval_strategy="steps" if val_path else "no", eval_steps=100, save_strategy="steps",
         save_steps=200, save_total_limit=2, report_to="none", seed=42,
-        model_init_kwargs={"dtype": torch.bfloat16 if bf16 else torch.float16},
+        model_init_kwargs={"dtype": torch_dtype()},
     )
     peft_cfg = LoraConfig(r=r.lora_r, lora_alpha=r.lora_alpha, lora_dropout=r.lora_dropout,
                           target_modules=r.targets, task_type="CAUSAL_LM")
@@ -116,12 +156,10 @@ def find_adapter(adapter_dir: Path) -> Path:
 
 
 def merge(base_model: str, adapter_dir: Path, merged_dir: Path) -> None:
-    import torch
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    _, _, bf16 = precision()
-    dtype = torch.bfloat16 if bf16 else torch.float16
+    dtype = torch_dtype()
     src = find_adapter(adapter_dir)
     print(f"[train] merging {src} into {base_model} ({dtype})")
     base = AutoModelForCausalLM.from_pretrained(base_model, dtype=dtype, device_map="cpu")
