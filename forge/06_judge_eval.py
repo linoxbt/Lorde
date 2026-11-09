@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lorde_forge import audit, config, contract, jsonl, llm, metrics  # noqa: E402
+from lorde_forge.judge import as_metric_row, predict  # noqa: E402
 from lorde_forge.report import fmt, table  # noqa: E402
 
 
@@ -35,22 +36,6 @@ def kv(pairs: list[str]) -> dict[str, float]:
         k, _, v = p.partition("=")
         out[k] = float(v)
     return out
-
-
-def predict(ep: llm.Endpoint, items: list[dict], structured: bool, path: Path, concurrency: int) -> dict[str, dict]:
-    by_uid = {r["uid"]: r for r in items}
-    with jsonl.Appender(path) as out:
-        todo = [r for r in items if r["uid"] not in out]
-        reqs = [llm.Request(uid=r["uid"], messages=[{"role": "user", "content": r["prompt"]}],
-                            params=llm.judge_params(r["kind"], structured)) for r in todo]
-
-        def save(res: llm.Result) -> None:
-            j = contract.parse_reply(by_uid[res.uid]["kind"], res.text)
-            out.add({**res.as_row(), "ok": j.ok, "score": j.score, "verdict": j.verdict})
-
-        if reqs:
-            llm.run(ep, reqs, concurrency=concurrency, on_result=save, desc=path.stem)
-    return {r["uid"]: r for r in jsonl.read(path) if r["uid"] in by_uid}
 
 
 def perf(ep: llm.Endpoint, items: list[dict], structured: bool, n: int, concurrency: int) -> dict:
@@ -66,12 +51,6 @@ def perf(ep: llm.Endpoint, items: list[dict], structured: bool, n: int, concurre
               "mean_prompt_tokens": round(sum(r.prompt_tokens for r in ok) / max(1, len(ok)), 1),
               "mean_completion_tokens": round(sum(r.completion_tokens for r in ok) / max(1, len(ok)), 1)})
     return s
-
-
-def row_of(p: dict | None) -> dict:
-    if not p:
-        return {"ok": False, "score": None, "verdict": None}
-    return {"ok": bool(p.get("ok")), "score": p.get("score"), "verdict": p.get("verdict")}
 
 
 def main() -> None:
@@ -114,7 +93,7 @@ def main() -> None:
         preds[name] = predict(ep, test, structured, config.RESULTS / "preds" / f"{name}.jsonl", args.concurrency)
         perf_stats[name] = perf(ep, test, structured, args.perf_n, args.concurrency)
 
-    rows = {name: [row_of(preds[name].get(u)) for u in uids] for name in preds}
+    rows = {name: [as_metric_row(preds[name].get(u)) for u in uids] for name in preds}
     report: dict = {"n_test": len(test), "templates": contract.fingerprints(), "judges": {}}
     for name in rows:
         gpu = prices.get(name.removesuffix("+so"))

@@ -24,10 +24,10 @@ TEXT = {
 }
 
 
-def run(step: str, *args: str, env: dict) -> str:
-    p = subprocess.run([sys.executable, str(ROOT / "forge" / step), *args], env=env, capture_output=True,
-                       text=True, timeout=600)
-    assert p.returncode == 0, f"{step} failed:\n{p.stdout[-3000:]}\n{p.stderr[-3000:]}"
+def run(step: str, *args: str, env: dict, codes: tuple[int, ...] = (0,)) -> str:
+    script = ROOT / step if "/" in step else ROOT / "forge" / step
+    p = subprocess.run([sys.executable, str(script), *args], env=env, capture_output=True, text=True, timeout=600)
+    assert p.returncode in codes, f"{step} failed:\n{p.stdout[-3000:]}\n{p.stderr[-3000:]}"
     return p.stdout
 
 
@@ -109,3 +109,28 @@ def test_forge_pipeline(world):
     assert plug["judges"]["lorde"]["judge_error_rate"] == 0.0
     assert jsonl.read(root / "data" / "gated" / "lorde" / "passed.jsonl")
     assert list((root / "data" / "gated" / "lorde").glob("**/lexsi_provenance.json"))
+
+    # Lorde Bench: frozen sets and the CI runner. The stub judge scores long answers high, so the
+    # adversarial set (injections make answers longer) must trip the <= 5% gate and exit 1.
+    run("bench/build_sets.py", env=env)
+    adv = jsonl.read(root / "bench" / "data" / "adversarial-100.jsonl")
+    assert adv and all(a["expected_decision"] is False for a in adv)
+    assert {a["attack"] for a in adv} >= {"injection", "empty"}
+    run("bench/run_bench.py", "--judge", f"lorde=openai/lorde@{world['lorde']}", "--structured",
+        "--concurrency", "4", env=env, codes=(0, 1))
+    bench = json.loads((root / "bench" / "results" / "lorde+so.json").read_text())
+    assert bench["vs_teacher_8b"]["decision_agreement"] == 1.0
+    assert bench["adversarial_pass_rate"] > 0.05 and bench["passed"] is False
+
+    # Step 8 scoring with AuditKIT on precomputed answers (training and generation need a GPU).
+    ev = jsonl.read(root / "data" / "downstream_eval.jsonl")
+    outs = {"ungated": lambda r: "I am not sure.", "teacher": lambda r: r["answer"], "lorde": lambda r: r["answer"]}
+    for name, f in outs.items():
+        jsonl.write(root / "results" / "downstream" / f"preds_{name}.jsonl", [{**r, "output": f(r)} for r in ev])
+    run("08_downstream.py", "score", env=env)
+    down = json.loads((root / "results" / "downstream.json").read_text())
+    assert down["metrics"]["lorde"]["f1_score"] == 1.0 and down["within_2pct_of_teacher"] is True
+
+    run("09_publish.py", "--user", "tester", "--dry-run", env=env)
+    card = (root / "results" / "cards" / "model_README.md").read_text()
+    assert "license: cc-by-nc-4.0" in card and "Template fingerprints" in card
