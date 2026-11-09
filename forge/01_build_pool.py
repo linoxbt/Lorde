@@ -114,18 +114,57 @@ def _chunk(text: str, lo: int = 900, hi: int = 2200) -> str | None:
     return out if len(out) >= lo * 0.6 else None
 
 
+ROWS_API = "https://datasets-server.huggingface.co/rows"
+
+
+def _wiki_rows_api(config_name: str, page: int = 100, max_rows: int = 20000):
+    """Articles in dump order from the Hub's datasets-server: fast, no shard downloads."""
+    import json as _json
+    import time as _time
+    import urllib.parse
+    import urllib.request
+
+    for offset in range(0, max_rows, page):
+        q = urllib.parse.urlencode({"dataset": config.WIKI_DATASET, "config": config_name, "split": "train",
+                                    "offset": offset, "length": page})
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(f"{ROWS_API}?{q}", timeout=60) as r:
+                    rows = _json.load(r).get("rows", [])
+                break
+            except Exception:  # noqa: BLE001  (rate limits, transient errors)
+                if attempt == 4:
+                    raise
+                _time.sleep(2 ** attempt)
+        if not rows:
+            return
+        for row in rows:
+            yield row["row"]
+
+
+def _wiki_stream(config_name: str):
+    from datasets import load_dataset
+
+    yield from load_dataset(config.WIKI_DATASET, config_name, split="train", streaming=True)
+
+
+def _articles(config_name: str):
+    """Rows API first; fall back to `datasets` streaming if the API is unreachable."""
+    try:
+        yield from _wiki_rows_api(config_name)
+    except Exception as e:  # noqa: BLE001
+        print(f"[pool] datasets-server unavailable for {config_name} ({e}); streaming instead")
+        yield from _wiki_stream(config_name)
+
+
 def chunk_wikipedia(n_judge: int, n_down_raw: int, n_down_eval: int) -> list[dict]:
     """Disjoint article ranges: judge pool, then downstream raw, then downstream eval."""
     if F_CHUNKS.exists():
         return jsonl.read(F_CHUNKS)
-    from datasets import load_dataset
-
     rows = []
     plan = [("judge", n_judge), ("down_raw", n_down_raw), ("down_eval", n_down_eval)]
     for lang, meta in config.LANGS.items():
-        ds = load_dataset(config.WIKI_DATASET, f"{config.WIKI_DUMP}.{meta['wiki']}", split="train",
-                          streaming=True)
-        it = iter(ds)
+        it = _articles(f"{config.WIKI_DUMP}.{meta['wiki']}")
         for use, n in plan:
             got = 0
             while got < n:
@@ -145,7 +184,7 @@ def chunk_wikipedia(n_judge: int, n_down_raw: int, n_down_eval: int) -> list[dic
                 rows.append({"chunk_id": f"{prefix}-{lang}-c{got:04d}", "lang": lang, "use": use,
                              "title": title, "url": art.get("url"), "text": c})
                 got += 1
-        print(f"[pool] chunked wikipedia {lang}: {Counter(r['use'] for r in rows if r['lang'] == lang)}")
+        print(f"[pool] chunked wikipedia {lang}: {dict(Counter(r['use'] for r in rows if r['lang'] == lang))}")
     jsonl.write(F_CHUNKS, rows)
     return rows
 
