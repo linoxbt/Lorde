@@ -49,6 +49,10 @@ lorde_forge/     shared library: contract (render/parse/fingerprints), schemas, 
 forge/           Phase 0 pipeline: steps 00-09 and kaggle_runbook.ipynb
 bench/           Lorde Bench: golden-300, adversarial-100, CI runner with blocking criteria
 space/           Gradio demo Space (playground, Bench results)
+gateway/         Lorde Gateway (Phase 1): FastAPI judge API, OpenAI-compatible proxy, auth, limits, metrics, /mcp
+sdk/             `pip install lorde`: typed sync/async client, CuratorKIT preset, CLI, stdio MCP server
+skills/          lorde-gating: a Claude skill that teaches agents when and how to gate data with Lorde
+infra/           Dockerfile for the Gateway
 docs/            HF Article template and builder, submission checklist
 requirements/    forge-train, forge-serve, forge-data (three separate environments) and dev
 tests/           contract and parser fuzzing, metrics, and an end-to-end run on stub OpenAI servers
@@ -99,6 +103,46 @@ cfg = CuratorConfig(
 Curator(cfg).run()
 ```
 
+## Serve Lorde: Gateway, SDK and MCP (Phase 1 slice)
+
+The Gateway sits in front of Lorde Serve (vLLM). It renders CuratorKIT's prompts, always requests the gate's
+JSON schema, parses with CuratorKIT, and returns decisions; its OpenAI-compatible endpoint recognises
+CuratorKIT's prompts by template fingerprint and adds the schema, so CuratorKIT works with no code change.
+
+```bash
+pip install -r requirements/runtime.txt
+export LORDE_KEY_PEPPER=$(python -c "import secrets; print(secrets.token_hex(32))")
+export VLLM_BASE_URL=http://localhost:8002/v1 LORDE_MODEL_REVISION=v1.0.0
+python -m gateway.keys create --name me --org demo          # prints lorde_sk_... once
+uvicorn gateway.app:app --port 8080                          # or: docker build -f infra/Dockerfile.gateway .
+```
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/judge/reward`, `/v1/judge/grounding` | judge one item → score, details, `decision`, model, template |
+| POST | `/v1/judge/batch` | up to 256 items of one kind |
+| POST | `/v1/chat/completions` | OpenAI-compatible proxy for CuratorKIT/LiteLLM (temperature ≤ 0.3) |
+| GET | `/v1/models`, `/healthz`, `/readyz`, `/metrics` | model list, liveness, readiness, Prometheus |
+| * | `/mcp` | MCP Streamable HTTP: `lorde_judge_reward`, `lorde_judge_grounding`, `lorde_judge_batch`, `lorde_model_info` |
+
+Errors are `{"error": {"code", "message", "request_id"}}` with the spec §11.2 codes; every response has
+`x-request-id`, judge responses add `x-lorde-model` and `x-lorde-template`. Keys are `lorde_sk_` + 32 random
+bytes; only the prefix and SHA-256(key + pepper) are stored. Usage events carry no content.
+
+```python
+from lorde import Lorde                                  # pip install ./sdk
+r = Lorde().judge.grounding(source_text=src, question=q, answer=a)   # LORDE_API_KEY, LORDE_BASE_URL
+from lorde.curatorkit import judge_llm                   # CuratorConfig(..., judge_llm=judge_llm())
+```
+
+```bash
+claude mcp add --transport http lorde https://api.<domain>/mcp --header "Authorization: Bearer $LORDE_API_KEY"
+claude mcp add lorde -- lorde mcp                        # local stdio, through the SDK
+```
+
+Not in this slice yet: gating jobs and uploads (`/v1/jobs`, worker), Supabase-backed keys and usage, Redis
+rate limits for more than one replica, the Console.
+
 ## Reproducibility notes
 
 - **Every step resumes.** Model calls append to JSONL caches as replies arrive (`data/cache/`, `data/labels.jsonl`,
@@ -125,7 +169,9 @@ pytest -q      # contract vs CuratorKIT, parser fuzzing (Hypothesis), metrics, s
 ```
 
 The end-to-end test runs steps 1-3 and 6-9, Bench and the article builder against small OpenAI-compatible stub
-servers (no GPU). Training (step 5) and downstream training and generation (step 8) need a GPU and run on Kaggle.
+servers (no GPU). Gateway and SDK tests cover auth, limits, errors, the OpenAI proxy's schema injection, MCP,
+and a real CuratorKIT run through a live Gateway. Step 5 (AlignTune and TRL engines, merge) and step 8 were
+also run end to end on CPU with `trl-internal-testing/tiny-Cohere2ForCausalLM`; full-size training needs a GPU.
 
 ## Changes from the spec
 
