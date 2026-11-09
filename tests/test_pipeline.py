@@ -134,3 +134,7 @@ def test_forge_pipeline(world):
     run("09_publish.py", "--user", "tester", "--dry-run", env=env)
     card = (root / "results" / "cards" / "model_README.md").read_text()
     assert "license: cc-by-nc-4.0" in card and "Template fingerprints" in card
+
+    run("docs/build_article.py", env=env)
+    article = (root / "docs" / "HF_ARTICLE.md").read_text()
+    assert "<!--" not in article and "cheaper" in article and "Pending" not in article

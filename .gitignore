@@ -10,3 +10,9 @@ data/**/*.tmp
 *.egg-info/
 .env
 logs/
+# pipeline outputs (synced to a private HF dataset, published by forge/09_publish.py)
+data/
+results/
+envs/
+bench/data/
+bench/results/

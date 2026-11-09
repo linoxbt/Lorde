@@ -1,0 +1,4 @@
+-r forge-data.txt
+pytest>=8
+hypothesis>=6
+ruff>=0.6

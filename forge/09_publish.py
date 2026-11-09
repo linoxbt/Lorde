@@ -264,8 +264,12 @@ def main() -> None:
         api.create_repo(space_id, repo_type="space", space_sdk="gradio", private=private, exist_ok=True)
         api.upload_folder(repo_id=space_id, repo_type="space", folder_path=str(config.ROOT / "space"),
                           commit_message="Lorde demo")
+        api.upload_folder(repo_id=space_id, repo_type="space", folder_path=str(config.ROOT / "lorde_forge"),
+                          path_in_repo="lorde_forge", ignore_patterns=["__pycache__/*", "*.pyc"],
+                          commit_message="Judge contract (CuratorKIT rendering and parsing)")
         api.add_space_variable(space_id, "LORDE_MODEL", model_id)
         api.add_space_variable(space_id, "LORDE_REVISION", args.tag)
+        api.add_space_variable(space_id, "LORDE_DATA", data_id)
         visibility(space_id, "space")
         print(f"[publish] space -> https://huggingface.co/spaces/{space_id}")
 

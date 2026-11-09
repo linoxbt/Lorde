@@ -6,6 +6,10 @@
         --judge lorde=openai/lorde@http://localhost:8002/v1 \
         --gpu-hourly base=0.50 --gpu-hourly lorde=0.50 --structured
 
+    # optional closed-model reference for the ROI comparison (any OpenAI-compatible API)
+    ... --judge closed=openai/<model>@https://api.openai.com/v1 --judge-key closed=OPENAI_API_KEY \
+        --api-price closed=<USD per 1M input>,<USD per 1M output>
+
 For each judge: gate-usable rate, decision agreement and Cohen's kappa vs the
 teacher, Spearman and MAE of scores, grounding verdict accuracy, per-language
 and per-variant breakdowns, agreement with human labels (the teacher's own
@@ -57,6 +61,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--judge", action="append", required=True, help="name=openai/model@base_url")
     ap.add_argument("--gpu-hourly", action="append", default=[], help="name=USD per GPU hour")
+    ap.add_argument("--judge-key", action="append", default=[],
+                    help="name=ENV_VAR holding that judge's API key (default VLLM_API_KEY)")
+    ap.add_argument("--api-price", action="append", default=[],
+                    help="name=IN,OUT USD per 1M tokens, for API judges (e.g. a closed model)")
     ap.add_argument("--structured", action="store_true", help="also evaluate with structured outputs")
     ap.add_argument("--candidate", default="lorde")
     ap.add_argument("--baseline", default="base")
@@ -81,7 +89,11 @@ def main() -> None:
     variant_keys = [f"{t['kind']}:{t.get('variant', '?')}" for t in test]
     prices = kv(args.gpu_hourly)
 
+    keys = dict(p.split("=", 1) for p in args.judge_key)
+    api_prices = {k: tuple(float(x) for x in v.split(",")) for k, v in (p.split("=", 1) for p in args.api_price)}
     eps = [llm.Endpoint.parse(s) for s in args.judge]
+    for e in eps:
+        e.api_key_env = keys.get(e.name, e.api_key_env)
     runs: list[tuple[str, llm.Endpoint, bool]] = [(e.name, e, False) for e in eps]
     if args.structured:
         runs += [(f"{e.name}+so", e, True) for e in eps]
@@ -97,7 +109,12 @@ def main() -> None:
     report: dict = {"n_test": len(test), "templates": contract.fingerprints(), "judges": {}}
     for name in rows:
         gpu = prices.get(name.removesuffix("+so"))
+        api_price = api_prices.get(name.removesuffix("+so"))
         p = perf_stats[name]
+        if api_price and p.get("mean_prompt_tokens") is not None:
+            cost = metrics.cost_per_million_api(p["mean_prompt_tokens"], p["mean_completion_tokens"], *api_price)
+        else:
+            cost = metrics.cost_per_million_gpu(gpu, p.get("judgments_per_s")) if gpu else None
         report["judges"][name] = {
             "vs_teacher": metrics.compare(rows[name], teacher),
             "by_kind": metrics.grouped(rows[name], teacher, kinds),
@@ -105,7 +122,8 @@ def main() -> None:
             "by_variant": metrics.grouped(rows[name], teacher, variant_keys),
             "perf": p,
             "gpu_hourly": gpu,
-            "cost_per_1M": metrics.cost_per_million_gpu(gpu, p.get("judgments_per_s")) if gpu else None,
+            "api_price_per_1M_tokens": api_price,
+            "cost_per_1M": cost,
         }
 
     # Human agreement: teacher is the ceiling.
