@@ -77,7 +77,8 @@ Step by step:
 | 6 | `python forge/06_judge_eval.py --judge base=... --judge lorde=... --structured` | data | `results/judge_eval.md` |
 | 7 | `python forge/07_curatorkit_plugin.py --judge lorde=... [--structured]` | data | `data/gated/*`, `results/plugin_eval.md` |
 | 8 | `python forge/08_downstream.py all --sets ungated,teacher,lorde` | train | `results/downstream.md` |
-| 9 | `python forge/09_publish.py --user you --space [--public]` | data | HF repos, cards, collections |
+| 9 | `python forge/09_publish.py --user you [--space] [--public]` | data | HF repos, cards, collections (Space needs HF PRO) |
+| 10 | `python forge/10_export_gguf.py --user you` (optional) | train | `<you>/lorde-tiny-aya-GGUF` for llama.cpp CPU serving |
 | Bench | `python bench/build_sets.py` · `python bench/run_bench.py --judge lorde=... --structured` | data | `bench/results/*` |
 | Article | `python docs/build_article.py` | data | `docs/HF_ARTICLE.md` |
 

@@ -259,26 +259,32 @@ def main() -> None:
     visibility(data_id, "dataset")
     print(f"[publish] data -> https://huggingface.co/datasets/{data_id}")
 
-    # Space
+    # Space (Docker/Gradio Spaces on free CPU need a PRO subscription; a refusal must not stop publishing)
+    space_ok = False
     if args.space:
-        api.create_repo(space_id, repo_type="space", space_sdk="gradio", private=private, exist_ok=True)
-        api.upload_folder(repo_id=space_id, repo_type="space", folder_path=str(config.ROOT / "space"),
-                          commit_message="Lorde demo")
-        api.upload_folder(repo_id=space_id, repo_type="space", folder_path=str(config.ROOT / "lorde_forge"),
-                          path_in_repo="lorde_forge", ignore_patterns=["__pycache__/*", "*.pyc"],
-                          commit_message="Judge contract (CuratorKIT rendering and parsing)")
-        api.add_space_variable(space_id, "LORDE_MODEL", model_id)
-        api.add_space_variable(space_id, "LORDE_REVISION", args.tag)
-        api.add_space_variable(space_id, "LORDE_DATA", data_id)
-        visibility(space_id, "space")
-        print(f"[publish] space -> https://huggingface.co/spaces/{space_id}")
+        try:
+            api.create_repo(space_id, repo_type="space", space_sdk="gradio", private=private, exist_ok=True)
+            api.upload_folder(repo_id=space_id, repo_type="space", folder_path=str(config.ROOT / "space"),
+                              commit_message="Lorde demo")
+            api.upload_folder(repo_id=space_id, repo_type="space", folder_path=str(config.ROOT / "lorde_forge"),
+                              path_in_repo="lorde_forge", ignore_patterns=["__pycache__/*", "*.pyc"],
+                              commit_message="Judge contract (CuratorKIT rendering and parsing)")
+            api.add_space_variable(space_id, "LORDE_MODEL", model_id)
+            api.add_space_variable(space_id, "LORDE_REVISION", args.tag)
+            api.add_space_variable(space_id, "LORDE_DATA", data_id)
+            visibility(space_id, "space")
+            space_ok = True
+            print(f"[publish] space -> https://huggingface.co/spaces/{space_id}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[publish] skipped the Space ({type(e).__name__}: {str(e)[:160]}). Gradio/Docker Spaces need "
+                  "a Hugging Face PRO subscription; use the live Console as the public demo link instead.")
 
     # Collections (the submission form asks for a model collection and a dataset collection)
     models = api.create_collection(title="Lorde models", namespace=args.user, private=private, exists_ok=True,
                                    description="Lorde: Tiny Aya Global as CuratorKIT's judge")
     if not args.skip_model:
         api.add_collection_item(models.slug, item_id=model_id, item_type="model", exists_ok=True)
-    if args.space:
+    if space_ok:
         api.add_collection_item(models.slug, item_id=space_id, item_type="space", exists_ok=True)
     datasets_c = api.create_collection(title="Lorde datasets", namespace=args.user, private=private,
                                        exists_ok=True, description="Data, labels, provenance and results for Lorde")

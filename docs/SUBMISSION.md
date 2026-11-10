@@ -10,7 +10,7 @@ Shortlist announced 16 Nov; Demo Day 22 Nov (shortlisted teams get $200 in HF cr
 | Track 1: chain ≥ 2 repos, 3+ preferred | CuratorKIT → AlignTune → AuditKIT (all three) | ☐ |
 | Cohere models only (core) | Tiny Aya Global (student), Aya Expanse 8B/32B (teacher); others only as reference judges | ☐ |
 | All artifacts on Hugging Face | model, adapters/merged weights, data, labels, logs, results | ☐ |
-| Deployed publicly | Space `<user>/lorde-demo` + public GitHub repo | ☐ |
+| Deployed publicly | Live Console https://lorde-console.vercel.app (Gateway on Railway) + public GitHub repo. A demo Space needs HF PRO, so it is optional. | ☐ |
 | Before/after on more than one metric, with rationale | `results/judge_eval.md` + article "Metrics, and why" | ☐ |
 | Write-up: metrics, approach, datasets/tasks/models rationale, why better | `docs/HF_ARTICLE.md` (HF Article) | ☐ |
 | ROI vs closed model (optional, preferred) | article ROI table: volume, GPU hours, $/h, tokens/s, API cost | ☐ |

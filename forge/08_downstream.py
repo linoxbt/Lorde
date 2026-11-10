@@ -52,8 +52,8 @@ def stage_train(args) -> None:
     recipe = T.Recipe(epochs=args.epochs, batch_size=4, grad_accum=4, lr=2e-4, max_len=1536)
     for s in args.sets:
         out = RUNS / s
-        if (out / "merged" / "config.json").exists() and not args.force:
-            print(f"[downstream] {s}: already trained ({out / 'merged'})")
+        if (out / "meta.json").exists() and not args.force:
+            print(f"[downstream] {s}: already trained ({out / 'adapter'})")
             continue
         rows = jsonl.read(config.DATA / "gated" / s / "passed.jsonl")
         if not rows:
@@ -69,19 +69,23 @@ def stage_train(args) -> None:
             T.train_aligntune(args.base_model, path, out / "adapter", len(keep), recipe)
         else:
             T.train_trl(args.base_model, path, None, out / "adapter", len(keep), recipe)
-        T.merge(args.base_model, out / "adapter", out / "merged")
+        # No merge: generation loads base + adapter, which saves ~6.7 GB of disk per set on Kaggle.
         jsonl.write_json(out / "meta.json", {"rows": len(keep), "dropped": dropped, "seconds": round(time.time() - t0)})
 
 
-def generate(model_path: str, rows: list[dict], batch: int, max_new_tokens: int) -> list[str]:
+def generate(base_model: str, adapter: Path | None, rows: list[dict], batch: int, max_new_tokens: int) -> list[str]:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model_path, padding_side="left")
+    tok = AutoTokenizer.from_pretrained(base_model, padding_side="left")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=T.torch_dtype(),
-                                                 device_map="auto").eval()
+    model = AutoModelForCausalLM.from_pretrained(base_model, dtype=T.torch_dtype(), device_map="auto")
+    if adapter is not None:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, str(T.find_adapter(adapter)))
+    model = model.eval()
     outs: list[str] = []
     for i in range(0, len(rows), batch):
         prompts = [PROMPT.format(context=r["context"], question=r["question"]) for r in rows[i: i + batch]]
@@ -102,15 +106,15 @@ def stage_generate(args) -> None:
     ev = jsonl.read(config.DATA / "downstream_eval.jsonl")
     if args.limit:
         ev = ev[: args.limit]
-    targets = [(s, str(RUNS / s / "merged")) for s in args.sets]
+    targets: list[tuple[str, Path | None]] = [(s, RUNS / s / "adapter") for s in args.sets]
     if args.include_base:
-        targets.insert(0, ("base", args.base_model))
-    for name, path in targets:
+        targets.insert(0, ("base", None))
+    for name, adapter in targets:
         dst = OUT / f"preds_{name}.jsonl"
         if dst.exists() and not args.force:
             print(f"[downstream] {name}: predictions exist ({dst})")
             continue
-        outs = generate(path, ev, args.gen_batch, args.max_new_tokens)
+        outs = generate(args.base_model, adapter, ev, args.gen_batch, args.max_new_tokens)
         jsonl.write(dst, ({**r, "output": o} for r, o in zip(ev, outs)))
 
 
