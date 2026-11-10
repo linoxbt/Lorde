@@ -1,0 +1,16 @@
+# Lorde API (staging): Gateway + Job Worker in one container, sharing a volume for dataset storage.
+#   docker build -f infra/Dockerfile.api -t lorde-api .
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+COPY requirements/runtime.txt requirements/runtime.txt
+RUN pip install -r requirements/runtime.txt "curatorkit[generation]==0.1.23" pyarrow
+COPY lorde_forge/ lorde_forge/
+COPY gateway/ gateway/
+COPY worker/ worker/
+COPY supabase/ supabase/
+COPY infra/start-api.sh /usr/local/bin/start-api
+RUN chmod 755 /usr/local/bin/start-api && useradd --create-home --uid 10001 lorde
+ENV LORDE_STORAGE_DIR=/data/storage LORDE_WORK_DIR=/data/work PORT=8080
+EXPOSE 8080
+CMD ["start-api"]
