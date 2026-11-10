@@ -12,6 +12,19 @@ jobs:
   forge:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,7 +40,9 @@ jobs:
         run: ruff check .
       - name: Shell syntax
         run: bash -n forge/00_serve.sh
-      - name: Tests (contract, parser fuzzing, metrics, end-to-end pipeline on stub servers)
+      - name: Tests (contract, parser fuzzing, metrics, pipeline, gateway, SDK, Supabase SQL, worker)
         env:
           LITELLM_LOG: ERROR
+          LORDE_TEST_PG_URL: postgresql://postgres@localhost:5432/postgres
+          LORDE_TEST_REDIS_URL: redis://localhost:6379/15
         run: pytest -q
