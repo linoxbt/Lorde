@@ -48,7 +48,10 @@ function Verdict({ kind, raw, threshold, title, note }: { kind: Gate; raw: strin
   );
 }
 
-export function Playground({ demo }: { demo: boolean }) {
+export function Playground({ demo, gateway = false }: { demo: boolean; gateway?: boolean }) {
+  const [keyed, setKeyed] = useState(false);
+  // Live judging needs a Gateway and the visitor's own key; otherwise the playground is simulated.
+  const live = gateway && keyed;
   const [kind, setKind] = useState<Gate>("grounding");
   const [f, setF] = useState(EX);
   const [threshold, setThreshold] = useState(0.7);
@@ -61,7 +64,7 @@ export function Playground({ demo }: { demo: boolean }) {
     const fields = kind === "grounding" ? { source_text: f.source_text, question: f.question, answer: f.answer }
       : { instruction: f.instruction, response: f.response };
     try {
-      if (demo) {
+      if (!live) {
         const r = await fetch("/api/judge", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind, ...fields }) });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error?.message);
@@ -78,7 +81,7 @@ export function Playground({ demo }: { demo: boolean }) {
 
   return (
     <div className="space-y-6">
-      {!demo && <ConnectKey />}
+      {gateway && <ConnectKey onChange={setKeyed} />}
       <div className="grid gap-6 xl:grid-cols-2">
         <Card className="space-y-4 p-5">
           <div role="radiogroup" aria-label="Gate" className="inline-flex rounded-full border border-line p-1">
@@ -113,7 +116,7 @@ export function Playground({ demo }: { demo: boolean }) {
           {res?.base && <Verdict kind={kind} raw={res.base} threshold={threshold} title="Untuned small model" note="Simulated" />}
         </div>
       </div>
-      {demo && <p className="text-[12px] text-muted">Demo mode: replies come from a transparent heuristic in the shape Lorde returns, not from the model. Connect the Gateway for real judgments.</p>}
+      {!live && <p className="text-[12px] text-muted">Simulated: replies come from a transparent heuristic in the shape Lorde returns, not from the model.{gateway ? " Connect an API key above to judge with the live Gateway." : ""}</p>}
     </div>
   );
 }

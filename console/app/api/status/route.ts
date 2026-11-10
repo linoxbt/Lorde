@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { env, gatewayEnabled } from "@/lib/env";
+import { env } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -17,7 +17,7 @@ async function probe(path: string): Promise<{ ok: boolean; ms: number; body: unk
 }
 
 export async function GET() {
-  if (!gatewayEnabled()) {
+  if (!env.gatewayUrl) {  // health checks need no key: the URL is enough
     const checks: Check[] = [
       { name: "Gateway", state: "demo", detail: "Not connected: set LORDE_GATEWAY_URL to monitor it." },
       { name: "Lorde Serve", state: "demo", detail: "Checked through the Gateway's /readyz." },

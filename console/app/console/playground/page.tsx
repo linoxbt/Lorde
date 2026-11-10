@@ -1,6 +1,7 @@
 import { PageHeader } from "@/components/console/bits";
 import { Playground } from "@/components/console/playground";
 import { getWorkspace } from "@/lib/data";
+import { env } from "@/lib/env";
 
 export const metadata = { title: "Playground" };
 
@@ -9,7 +10,7 @@ export default async function PlaygroundPage() {
   return (
     <>
       <PageHeader title="Playground" lead="Judge one item with CuratorKIT's exact prompt and see what CuratorKIT would do with the reply." />
-      <Playground demo={ws.mode === "demo"} />
+      <Playground demo={ws.mode === "demo"} gateway={Boolean(env.gatewayUrl)} />
     </>
   );
 }
