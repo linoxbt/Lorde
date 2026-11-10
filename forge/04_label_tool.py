@@ -18,6 +18,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -55,13 +56,20 @@ def main() -> None:
         from huggingface_hub import HfApi, hf_hub_download
 
         api = HfApi()
-        for name in ("human_sample.jsonl", "human_labels.jsonl"):
+
+        def pull(name: str) -> bool:
             try:
                 got = hf_hub_download(args.hub, f"data/{name}", repo_type="dataset")
                 Path(args.sample if name == "human_sample.jsonl" else args.out).parent.mkdir(parents=True, exist_ok=True)
                 Path(args.sample if name == "human_sample.jsonl" else args.out).write_bytes(Path(got).read_bytes())
+                return True
             except Exception as e:
                 print(f"[label] {name} not pulled from {args.hub}: {e}")
+                return False
+
+        pull("human_labels.jsonl")
+        while not pull("human_sample.jsonl"):  # hosted before step 3 has run: wait for the sample
+            time.sleep(120)
         lock = threading.Lock()
 
         def push() -> None:  # noqa: F811 - one upload at a time, in the background
