@@ -29,7 +29,7 @@ class Settings:
     max_body_bytes: int = 5 * 1024 * 1024
     max_field_chars: int = 32_000
     max_source_chars: int = 24_000
-    upstream_timeout_s: float = 30.0
+    upstream_timeout_s: float = field(default_factory=lambda: float(_env("LORDE_UPSTREAM_TIMEOUT", "30")))
     upstream_concurrency: int = field(default_factory=lambda: int(_env("LORDE_UPSTREAM_CONCURRENCY", "16")))
     breaker_failures: int = 20
     breaker_window_s: float = 30.0
