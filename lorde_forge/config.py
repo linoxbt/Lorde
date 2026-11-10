@@ -35,7 +35,7 @@ COHERE_COMPAT_BASE = "https://api.cohere.ai/compatibility/v1"
 THRESHOLD = 0.7
 JUDGE_TEMPERATURE = 0.1
 JUDGE_MAX_TOKENS = 512
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 1536  # p99.7 of the judge SFT set; Tiny Aya's 261k vocab makes logits the memory peak on T4
 
 # Reference prices (USD), checked 9 Nov 2026. Replace with measured values in the article.
 GPU_HOURLY = {"t4": 0.50, "l4": 0.80}

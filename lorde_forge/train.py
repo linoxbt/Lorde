@@ -18,11 +18,11 @@ LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", 
 @dataclass
 class Recipe:
     epochs: int = 2
-    batch_size: int = 2
-    grad_accum: int = 8
+    batch_size: int = 1
+    grad_accum: int = 16
     lr: float = 1e-4
     warmup_frac: float = 0.03
-    max_len: int = 2048
+    max_len: int = 1536
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -55,7 +55,8 @@ def token_len(tok, row: dict) -> int:
     p, c = row["prompt"], row["completion"]
     if isinstance(p, list):  # conversational
         ids = tok.apply_chat_template(p + c, tokenize=True)
-        return len(ids["input_ids"] if isinstance(ids, dict) else ids)
+        # transformers 5 returns a BatchEncoding (a Mapping, not a dict); len() of it counts its keys.
+        return len(ids["input_ids"] if hasattr(ids, "keys") else ids)
     return len(tok(p + c)["input_ids"])
 
 

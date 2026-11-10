@@ -79,8 +79,9 @@ else echo "no COHERE_API_KEY: 32B calibration skipped"; fi
 
 SESSION_B = [
     ("setup", SETUP),
-    ("train-smoke", "CUDA_VISIBLE_DEVICES=0 envs/train/bin/python forge/05_train_sft.py --max-samples 64 --epochs 1 --run smoke"),
-    ("train", f"""CUDA_VISIBLE_DEVICES=0 envs/train/bin/python forge/05_train_sft.py {os.environ.get("TRAIN_ARGS", "")}
+    # 160 rows = 10 optimizer steps at the default batch 1 x 16, enough to time a step.
+    ("train-smoke", "CUDA_VISIBLE_DEVICES=0 envs/train/bin/python forge/05_train_sft.py --max-samples 160 --epochs 1 --run smoke"),
+    ("train", lambda: f"""CUDA_VISIBLE_DEVICES=0 envs/train/bin/python forge/05_train_sft.py {train_args()}
 cat runs/lorde-v1/train_meta.json"""),
     ("save-model", None),
 ]
@@ -106,6 +107,28 @@ bash forge/00_serve.sh stop"""),
 cat results/downstream.md"""),
     ("publish-private", f"{PY} forge/09_publish.py --user {HF_USER}"),
 ]
+
+def train_args() -> str:
+    """Epochs (and, if needed, a row cap) that fit TRAIN_BUDGET_H, timed from the smoke run."""
+    if os.environ.get("TRAIN_ARGS"):
+        return os.environ["TRAIN_ARGS"]
+    budget = float(os.environ.get("TRAIN_BUDGET_H", "5.5")) * 3600
+    try:
+        smoke = json.loads((ROOT / "runs" / "smoke" / "train_meta.json").read_text())
+        rows = sum(1 for _ in open(ROOT / "data" / "sft" / "train.jsonl"))
+        per_row = max(smoke["train_seconds"] - 150, 30) / smoke["train_rows"]  # minus model load
+    except Exception as e:
+        print(f"[driver] no smoke timing ({e}); training 1 epoch", flush=True)
+        return "--epochs 1"
+    est2 = 2 * rows * per_row
+    print(f"[driver] {per_row:.2f} s/row; 2 epochs of {rows} rows ~ {est2 / 3600:.1f} h (budget {budget / 3600:.1f} h)",
+          flush=True)
+    if est2 <= budget:
+        return "--epochs 2"
+    if est2 / 2 <= budget:
+        return "--epochs 1"
+    return f"--epochs 1 --max-samples {int(budget / per_row)}"
+
 
 SESSIONS = {"a": SESSION_A, "b": SESSION_B, "c": SESSION_C}
 
@@ -190,7 +213,7 @@ def save_model(hub: Hub) -> tuple[bool, str]:
 def main() -> None:
     which = sys.argv[1] if len(sys.argv) > 1 else "a"
     only = set(os.environ.get("ONLY_STEPS", "").split(",")) - {""}
-    plan: list[tuple[str, str, str | None]] = []
+    plan: list[tuple[str, str, object]] = []
     for s in which:
         seen_setup = any(n == "setup" for _, n, _ in plan)
         plan += [(s, n, c) for n, c in SESSIONS[s] if not (n == "setup" and seen_setup)]
@@ -216,7 +239,7 @@ def main() -> None:
             ok, note = save_model(hub)
             rc = 0 if ok else 1
         else:
-            rc = run_bash(name, script or "", hub)
+            rc = run_bash(name, (script() if callable(script) else script) or "", hub)
             note = ""
         step = {"step": f"{sess}:{name}", "rc": rc, "minutes": round((time.time() - t0) / 60, 1), "note": note}
         record["steps"].append(step)
