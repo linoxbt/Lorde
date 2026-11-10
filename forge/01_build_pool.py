@@ -17,6 +17,7 @@ Every prompt appears twice in the pool: once good (gold) and once degraded.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import os
 import sys
@@ -216,7 +217,8 @@ def phase_teacher(args: argparse.Namespace) -> None:
                 batch = batch_all[i: i + args.batch]
                 samples = [DataSample(id=c["chunk_id"], source_uri=c.get("url") or c["chunk_id"],
                                       input=c["text"], task_type="instruction_following") for c in batch]
-                produced = task.run(samples)
+                # run_async honours `concurrency`; the sync run() sends one request at a time.
+                produced = asyncio.run(task.run_async(samples))
                 by_chunk: dict[str, list[dict]] = defaultdict(list)
                 for s in produced:
                     by_chunk[s.metadata.get("source_sample_id")].append(

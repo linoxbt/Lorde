@@ -9,7 +9,7 @@
 Same commands as forge/kaggle_runbook.ipynb, run in the Kaggle kernel's own Python (huggingface_hub is
 preinstalled there). Needs HF_TOKEN in the environment and HF_USER (default Oxlino). Every step resumes from
 the private work repo <HF_USER>/lorde-work, and the driver uploads data/, results/, bench/ and logs/ there
-after each step (logs also every 10 minutes during long steps), so progress is visible while it runs and a
+after each step (data and logs also every 10 minutes during long steps), so progress is visible while it runs and a
 killed session loses at most one step. A JSON progress record goes to live/progress.json in the same repo.
 """
 
@@ -152,7 +152,7 @@ def run_bash(name: str, script: str, hub: Hub) -> int:
 
     def heartbeat() -> None:
         while not stop.wait(600):
-            hub.push(("logs",), message=f"logs during {name}")
+            hub.push(("data", "logs"), message=f"progress during {name}")
 
     t = threading.Thread(target=heartbeat, daemon=True)
     t.start()
