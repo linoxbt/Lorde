@@ -24,6 +24,7 @@ Writes results/judge_eval.{json,md} and results/preds/<judge>.jsonl.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -66,6 +67,9 @@ def main() -> None:
     ap.add_argument("--api-price", action="append", default=[],
                     help="name=IN,OUT USD per 1M tokens, for API judges (e.g. a closed model)")
     ap.add_argument("--structured", action="store_true", help="also evaluate with structured outputs")
+    ap.add_argument("--report-only", action="store_true",
+                    help="rebuild the report from cached predictions and timings (no model calls), e.g. after "
+                         "adding human labels")
     ap.add_argument("--candidate", default="lorde")
     ap.add_argument("--baseline", default="base")
     ap.add_argument("--test", default=str(config.DATA / "test.jsonl"))
@@ -100,9 +104,18 @@ def main() -> None:
 
     preds: dict[str, dict[str, dict]] = {}
     perf_stats: dict[str, dict] = {}
+    previous = Path(args.out + ".json")
+    old_judges = json.loads(previous.read_text())["judges"] if args.report_only and previous.exists() else {}
     for name, ep, structured in runs:
+        cache = config.RESULTS / "preds" / f"{name}.jsonl"
+        if args.report_only:
+            if not cache.exists():
+                sys.exit(f"--report-only: no cached predictions for {name} ({cache})")
+            preds[name] = {r["uid"]: r for r in jsonl.read(cache)}
+            perf_stats[name] = old_judges.get(name, {}).get("perf", {})
+            continue
         print(f"[eval] judge {name} ({ep.model} @ {ep.base_url}, structured={structured})")
-        preds[name] = predict(ep, test, structured, config.RESULTS / "preds" / f"{name}.jsonl", args.concurrency)
+        preds[name] = predict(ep, test, structured, cache, args.concurrency)
         perf_stats[name] = perf(ep, test, structured, args.perf_n, args.concurrency)
 
     rows = {name: [as_metric_row(preds[name].get(u)) for u in uids] for name in preds}

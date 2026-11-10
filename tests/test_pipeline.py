@@ -98,6 +98,14 @@ def test_forge_pipeline(world):
     assert "human" in rep and rep["significance_decision_agreement"]
     md = (root / "results" / "judge_eval.md").read_text()
     assert "Acceptance criteria" in md and "Before / after" in md
+    # --report-only rebuilds the same report from cached predictions without calling any model.
+    run("06_judge_eval.py", "--judge", "base=openai/student@http://127.0.0.1:9/v1",
+        "--judge", "lorde=openai/lorde@http://127.0.0.1:9/v1", "--gpu-hourly", "base=0.5", "--gpu-hourly", "lorde=0.5",
+        "--structured", "--report-only", env=env)
+    rep2 = json.loads((root / "results" / "judge_eval.json").read_text())
+    assert rep2["judges"]["lorde"]["vs_teacher"] == rep["judges"]["lorde"]["vs_teacher"]
+    assert rep2["judges"]["lorde"]["cost_per_1M"] == rep["judges"]["lorde"]["cost_per_1M"]
+    assert rep2["human"] == rep["human"]
 
     run("07_curatorkit_plugin.py", "--judge", f"lorde=openai/lorde@{world['lorde']}",
         "--judge", f"base=openai/student@{world['student']}", "--concurrency", "4", env=env)
