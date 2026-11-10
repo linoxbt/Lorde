@@ -3,6 +3,10 @@
 
     python forge/04_label_tool.py --labeler lino           # http://localhost:7860
     python forge/04_label_tool.py --labeler lino --share   # public link, e.g. for a phone
+    python forge/04_label_tool.py --hub Oxlino/lorde-work --host 0.0.0.0   # hosted (infra/Dockerfile.label)
+
+Hosted mode (``--hub``) pulls the sample and any earlier labels from the private work repo at start and pushes
+data/human_labels.jsonl back after every save; ``LABEL_PASSWORD`` (env) puts a login in front of it.
 
 Labels are appended to data/human_labels.jsonl (one row per item; the latest
 row for an item wins), so you can stop and come back at any time.
@@ -11,7 +15,9 @@ row for an item wins), so you can stop and come back at any time.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,10 +43,40 @@ def main() -> None:
     ap.add_argument("--out", default=str(config.DATA / "human_labels.jsonl"))
     ap.add_argument("--labeler", default="anon")
     ap.add_argument("--share", action="store_true")
-    ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 7860)))
+    ap.add_argument("--host", default=None)
+    ap.add_argument("--hub", default=os.environ.get("LABEL_HUB_REPO"), help="HF dataset repo to sync with")
     args = ap.parse_args()
 
     import gradio as gr
+
+    push = None
+    if args.hub:
+        from huggingface_hub import HfApi, hf_hub_download
+
+        api = HfApi()
+        for name in ("human_sample.jsonl", "human_labels.jsonl"):
+            try:
+                got = hf_hub_download(args.hub, f"data/{name}", repo_type="dataset")
+                Path(args.sample if name == "human_sample.jsonl" else args.out).parent.mkdir(parents=True, exist_ok=True)
+                Path(args.sample if name == "human_sample.jsonl" else args.out).write_bytes(Path(got).read_bytes())
+            except Exception as e:
+                print(f"[label] {name} not pulled from {args.hub}: {e}")
+        lock = threading.Lock()
+
+        def push() -> None:  # noqa: F811 - one upload at a time, in the background
+            def run() -> None:
+                if not lock.acquire(blocking=False):
+                    return
+                try:
+                    api.upload_file(path_or_fileobj=args.out, path_in_repo="data/human_labels.jsonl",
+                                    repo_id=args.hub, repo_type="dataset", commit_message="human labels")
+                except Exception as e:
+                    print(f"[label] push failed: {e}")
+                finally:
+                    lock.release()
+
+            threading.Thread(target=run, daemon=True).start()
 
     items = jsonl.read(args.sample)
     if not items:
@@ -85,6 +121,8 @@ def main() -> None:
                          "human_verdict": verdict if it["kind"] == "grounding" else None,
                          "labeler": labeler or args.labeler, "note": note or None,
                          "ts": datetime.now(UTC).isoformat()})
+            if push:
+                push()
         return view(next_index(i + 1))
 
     def skip(i: int):
@@ -110,7 +148,9 @@ def main() -> None:
         save_btn.click(save, inputs=[idx, score, verdict, note, labeler], outputs=outs)
         skip_btn.click(skip, inputs=idx, outputs=outs)
 
-    demo.launch(share=args.share, server_port=args.port)
+    pw = os.environ.get("LABEL_PASSWORD")
+    demo.launch(share=args.share, server_port=args.port, server_name=args.host,
+                auth=(os.environ.get("LABEL_USER", "lorde"), pw) if pw else None)
 
 
 if __name__ == "__main__":

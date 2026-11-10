@@ -1,0 +1,8 @@
+# Hosted human-labelling page (forge/04_label_tool.py --hub). Env: HF_TOKEN, LABEL_HUB_REPO, LABEL_PASSWORD.
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir "gradio>=5" "huggingface_hub>=1.0"
+COPY lorde_forge lorde_forge
+COPY forge/04_label_tool.py forge/04_label_tool.py
+ENV PYTHONUNBUFFERED=1
+CMD ["sh", "-c", "python forge/04_label_tool.py --host 0.0.0.0 --labeler ${LABEL_NAME:-owner}"]
