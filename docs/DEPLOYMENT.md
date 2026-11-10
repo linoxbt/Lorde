@@ -20,7 +20,12 @@ sign-in and shows demo data; the status page and the playground (with your own A
 - Auth: no key → 401; the admin key authenticates against Postgres (peppered hash).
 - `/v1/judge/*` → 503 `model_unavailable` until the model endpoint exists (expected); `/readyz` 503 for the same reason.
 - `/v1/uploads` + signed PUT to the volume works; `/v1/usage` reads Postgres.
-- CORS allows the Console origin; every Console page returns 200; `/status` shows Gateway OK, model degraded.
+- CORS allows the Console origin; every Console page returns 200.
+- With the CPU staging model: `/readyz` 200 (model loaded ~40 s after deploy); `/status` "All systems operational".
+- Live grounding judgment through the Gateway: 26 s, schema-valid reply under `curatorkit-0.1.23/hallucination@027e5efc`.
+  The untrained base model listed "about 6,650 km" as unsupported yet scored 0.8 (pass): the miscalibration Lorde is
+  trained to remove, and a ready "before" example for the article.
+- Live reward judgment through the Vercel Console proxy (`/api/gateway`, caller's own key): 17 s, "Test it." → 0.35, reject.
 
 ## Secrets
 
