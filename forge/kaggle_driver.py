@@ -80,8 +80,8 @@ else echo "no COHERE_API_KEY: 32B calibration skipped"; fi
 SESSION_B = [
     ("setup", SETUP),
     # 160 rows = 10 optimizer steps at the default batch 1 x 16, enough to time a step.
-    ("train-smoke", "CUDA_VISIBLE_DEVICES=0 envs/train/bin/python forge/05_train_sft.py --max-samples 160 --epochs 1 --run smoke"),
-    ("train", lambda: f"""CUDA_VISIBLE_DEVICES=0 envs/train/bin/python forge/05_train_sft.py {train_args()}
+    ("train-smoke", "CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True envs/train/bin/python forge/05_train_sft.py --max-samples 160 --epochs 1 --run smoke"),
+    ("train", lambda: f"""CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True envs/train/bin/python forge/05_train_sft.py {train_args()}
 cat runs/lorde-v1/train_meta.json"""),
     ("save-model", None),
 ]
@@ -103,7 +103,7 @@ CUDA_VISIBLE_DEVICES=1 bash forge/00_serve.sh lorde
 bash forge/00_serve.sh stop && bash forge/00_serve.sh teacher
 {PY} forge/07_curatorkit_plugin.py --judge teacher=openai/teacher@http://localhost:8000/v1
 bash forge/00_serve.sh stop"""),
-    ("downstream", """CUDA_VISIBLE_DEVICES=0 envs/train/bin/python forge/08_downstream.py all --sets ungated,teacher,lorde --include-base
+    ("downstream", """CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True envs/train/bin/python forge/08_downstream.py all --sets ungated,teacher,lorde --include-base
 cat results/downstream.md"""),
     ("publish-private", f"{PY} forge/09_publish.py --user {HF_USER}"),
 ]

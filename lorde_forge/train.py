@@ -39,7 +39,9 @@ def precision() -> tuple[str, bool, bool]:
 
     if not torch.cuda.is_available():
         return "fp32", False, False
-    if torch.cuda.is_bf16_supported():
+    # Native bf16 needs compute capability 8.0+ (Ampere). is_bf16_supported() also counts software emulation,
+    # so it is True on a T4 (7.5), where bf16 then runs ~10x slower than fp16 on the tensor cores.
+    if torch.cuda.get_device_capability()[0] >= 8:
         return "bf16", False, True
     return "fp16", True, False
 
