@@ -35,15 +35,13 @@ mode Lorde removes, in eight languages, while matching a larger teacher's pass/r
 - **Languages:** English, Hindi, French, Arabic, Spanish, Portuguese, Indonesian, Turkish. We chose eight
   languages that the teacher (Aya Expanse, 23 languages) and the student (Tiny Aya Global) *both* support,
   so every label comes from a teacher that actually reads the language.
-- **Labels:** Aya Expanse 8B (self-hosted vLLM) for bulk labels; Aya Expanse 32B via the Cohere API on a
-  300-item calibration slice; 200 hand labels with the gate's own rubric.
+<!-- labels_note -->
 - **Targets:** the teacher's reply re-serialized to the gate's exact keys (canonical JSON, long text
   clipped). Splits are grouped by prompt and source passage, so no test prompt appears in training.
 
 ### Training
 
-LoRA r=16, α=32 on all projections; lr 1e-4 cosine, 2 epochs, effective batch 16, max 2,048 tokens (longer
-rows dropped, never truncated); fp16 on Kaggle T4s. In production, vLLM structured outputs constrain each
+<!-- train_recipe --> In production, vLLM structured outputs constrain each
 gate's reply to its JSON schema, and Bench measures the raw model too so the model itself stays honest.
 
 ## Metrics, and why each one
@@ -59,6 +57,8 @@ gate's reply to its JSON schema, and Bench measures the raw model too so the mod
 | Latency, throughput, cost per 1M judgments | Pipeline fit and the ROI the hackathon asks for. |
 
 ## Results
+
+<!-- teacher_audit -->
 
 <!-- results:judge_eval -->
 
