@@ -9,7 +9,7 @@ Deployed 10 Nov 2026 from branch `ccr-e4bea25f-7bzaqy`.
 | Postgres (keys, jobs, judgments, usage, audit) | Railway `Postgres` (Supabase shim, `LORDE_DB_SHIM=1`) | private network |
 | Redis (rate limits) | Railway `Redis` | private network |
 | Dataset/result storage | Railway volume `lorde-data` at `/data` | served via signed Gateway URLs |
-| Model (Lorde Serve, vLLM) | **not deployed yet**: see below | `VLLM_BASE_URL` placeholder |
+| Model (staging Serve) | Railway `lorde-serve`: llama.cpp `ghcr.io/ggml-org/llama.cpp:server`, CPU, private network only, volume `lorde-models` | `http://lorde-serve.railway.internal:8080/v1` |
 
 Supabase was skipped: the organization is at the free plan's two-project limit. Without it the Console has no
 sign-in and shows demo data; the status page and the playground (with your own API key) use the live Gateway.
@@ -29,7 +29,19 @@ sign-in and shows demo data; the status page and the playground (with your own A
   once; store it in a password manager. Create more keys with `python -m gateway.keys` against `DATABASE_URL`, or
   rotate by adding a new bootstrap entry.
 
-## Connect the model
+## Staging model (no GPU, no card)
+
+The Hugging Face account cannot pay for Inference Endpoints, and Docker Spaces now need PRO, so staging serves
+Cohere's official, ungated `CohereLabs/tiny-aya-global-GGUF` (Q4_K_M) with llama.cpp on Railway CPU. It has no
+public domain: only the Gateway reaches it over Railway's private network, with an API key (`LLAMA_API_KEY` there,
+`VLLM_API_KEY` on the Gateway, generated in the build session and never displayed). The Gateway labels it
+`tiny-aya-global-q4km@staging-base-cpu`: this is the **untrained base model**, not Lorde, and a judgment takes tens of
+seconds (`LORDE_UPSTREAM_TIMEOUT=240`, `LORDE_UPSTREAM_CONCURRENCY=1`). Configuration is entirely llama.cpp
+environment variables (`LLAMA_ARG_HF_REPO`, `LLAMA_ARG_HOST=::`, `LLAMA_ARG_CTX_SIZE=4096`, `LLAMA_ARG_JINJA`,
+`LLAMA_ARG_ALIAS=lorde`). To serve the trained Lorde on CPU, export a GGUF from `runs/lorde-v1/merged`, push it to
+the Hub, and set `LLAMA_ARG_HF_REPO` to it.
+
+## Connect a GPU model (when billing works)
 
 1. Hugging Face → Inference Endpoints → New: model `CohereLabs/tiny-aya-global` for staging, or your trained
    `<you>/lorde-tiny-aya` at revision `v1.0.0`; engine **vLLM**; **AWS us-east-1, 1× NVIDIA L4**; security
