@@ -39,7 +39,7 @@ from .errors import (
     body,
 )
 from .keys import ApiKey, KeyStore
-from .limits import TokenBuckets
+from .limits import make_buckets
 from .mcp_server import build as build_mcp
 from .mcp_server import load_bench
 from .metering import UsageSink
@@ -57,28 +57,41 @@ class Gateway:
     """Everything a request needs, shared by REST routes and MCP tools."""
 
     def __init__(self, s: Settings, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        from .storage import from_settings
+
         self.s = s
-        self.keys = KeyStore(s.keys_file, s.key_pepper)
-        self.buckets = TokenBuckets()
+        self.pool = None
+        self.jobs = None
+        if s.database_url:
+            from .db import JobStore, PgKeyStore, PgUsageSink, make_pool
+
+            self.pool = make_pool(s.database_url)
+            self.keys = PgKeyStore(self.pool, s.key_pepper)
+            self.usage = PgUsageSink(self.pool)
+            self.jobs = JobStore(self.pool)
+        else:
+            self.keys = KeyStore(s.keys_file, s.key_pepper)
+            self.usage = UsageSink(s.usage_file)
+        self.storage = from_settings(s)
+        self.buckets = make_buckets(s.redis_url)
         self.metrics = Metrics()
-        self.usage = UsageSink(s.usage_file)
         self.upstream = Upstream(s, transport)
         self.service = JudgeService(s, self.upstream, self.metrics)
         self._ready: tuple[float, bool] = (0.0, False)
 
-    def auth_headers(self, headers: Mapping[str, str], scope: str = "judge") -> ApiKey:
+    async def authenticate(self, headers: Mapping[str, str], scope: str = "judge") -> ApiKey:
         auth = headers.get("authorization") or headers.get("Authorization") or ""
         if not auth.lower().startswith("bearer "):
             raise Unauthenticated("missing API key: send Authorization: Bearer lorde_sk_...")
-        key = self.keys.verify(auth[7:].strip())
+        key = await self.keys.averify(auth[7:].strip())
         if key is None:
             raise Unauthenticated("unknown or revoked API key")
         if scope not in key.scopes:
             raise Forbidden(f"this key lacks the '{scope}' scope")
         return key
 
-    def rate_limit(self, key: ApiKey, cost: int = 1) -> None:
-        wait = self.buckets.take(key.prefix, key.rpm, cost)
+    async def rate_limit(self, key: ApiKey, cost: int = 1) -> None:
+        wait = await self.buckets.atake(key.prefix, key.rpm, cost)
         if wait:
             self.metrics.rate_limited.inc()
             retry = "60" if wait == float("inf") else str(int(wait) + 1)
@@ -150,7 +163,7 @@ class McpAuth:
                 return await JSONResponse(body(err, rid), status_code=404)(scope, receive, send)
             headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
             try:
-                self.gw.auth_headers(headers, scope="judge")
+                await self.gw.authenticate(headers, scope="judge")
             except LordeError as e:
                 resp = JSONResponse(body(e, rid), status_code=e.status, headers=e.headers)
                 return await resp(scope, receive, send)
@@ -171,11 +184,15 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
+        if gw.pool is not None:
+            await gw.pool.open()
         gw.usage.start()
         async with mcp.session_manager.run():
             yield
         await gw.usage.stop()
         await gw.upstream.close()
+        if gw.pool is not None:
+            await gw.pool.close()
 
     app = FastAPI(title="Lorde Gateway", version=__version__, lifespan=lifespan,
                   description="A 3B judge for CuratorKIT's quality gates.")
@@ -206,19 +223,19 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
             err.status = e.status_code
         return JSONResponse(body(err, rid(request)), status_code=err.status)
 
-    def auth(request: Request, scope: str = "judge") -> ApiKey:
-        return gw.auth_headers(request.headers, scope)
+    async def auth(request: Request, scope: str = "judge") -> ApiKey:
+        return await gw.authenticate(request.headers, scope)
 
     def headers(kind: str) -> dict[str, str]:
         return {"x-lorde-model": s.model_label, "x-lorde-template": contract.template_id(kind)}
 
     def meter(key: ApiKey, route: str, n: int, status: int, usage: dict | None = None) -> None:
-        gw.usage.record(org_id=key.org_id, key_prefix=key.prefix, route=route, judgments=n, status=status,
-                        model_revision=s.model_label, **(usage or {}))
+        gw.usage.record(org_id=key.org_id, api_key_id=key.id, key_prefix=key.prefix, route=route, judgments=n,
+                        status=status, model_revision=s.model_label, **(usage or {}))
 
     async def run_judge(request: Request, kind: str, req: RewardRequest | GroundingRequest):
-        key = auth(request)
-        gw.rate_limit(key)
+        key = await auth(request)
+        await gw.rate_limit(key)
         fields = req.model_dump(exclude={"threshold"})
         try:
             res, usage = await gw.service.judge(kind, fields, req.threshold, rid(request))
@@ -238,18 +255,18 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
 
     @app.post("/v1/judge/batch")
     async def judge_batch(request: Request, req: BatchRequest):
-        key = auth(request)
+        key = await auth(request)
         if len(req.items) > s.max_batch:
             raise PayloadTooLarge(f"batch of {len(req.items)} exceeds {s.max_batch} items")
-        gw.rate_limit(key, len(req.items))
+        await gw.rate_limit(key, len(req.items))
         res, usage = await gw.service.batch(req.kind, req.items, req.threshold, rid(request))
         meter(key, "/v1/judge/batch", res.summary["total"] - res.summary["errors"], 200, usage)
         return JSONResponse(res.model_dump(), headers=headers(req.kind))
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
-        key = auth(request)
-        gw.rate_limit(key)
+        key = await auth(request)
+        await gw.rate_limit(key)
         try:
             payload = json.loads(await request.body())
         except json.JSONDecodeError as e:
@@ -265,7 +282,7 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
 
     @app.get("/v1/models")
     async def models(request: Request):
-        auth(request)
+        await auth(request)
         return {"object": "list", "data": [{"id": s.served_model, "object": "model", "owned_by": "lorde",
                                             "revision": s.model_label}]}
 
@@ -287,6 +304,9 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
         return PlainTextResponse(generate_latest(gw.metrics.registry).decode(),
                                  media_type="text/plain; version=0.0.4")
 
+    from .jobs import build_router
+
+    app.include_router(build_router(gw))
     app.mount("/", McpAuth(mcp_app, gw))  # after every route: only /mcp reaches the MCP transport
     return RequestContext(app, gw)  # type: ignore[return-value]
 

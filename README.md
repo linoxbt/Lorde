@@ -49,10 +49,12 @@ lorde_forge/     shared library: contract (render/parse/fingerprints), schemas, 
 forge/           Phase 0 pipeline: steps 00-09 and kaggle_runbook.ipynb
 bench/           Lorde Bench: golden-300, adversarial-100, CI runner with blocking criteria
 space/           Gradio demo Space (playground, Bench results)
-gateway/         Lorde Gateway (Phase 1): FastAPI judge API, OpenAI-compatible proxy, auth, limits, metrics, /mcp
+gateway/         Lorde Gateway (Phase 1): judge API, OpenAI-compatible proxy, jobs/uploads API, auth, limits, /mcp
+worker/          Lorde Job Worker: runs CuratorKIT gating jobs from the Postgres queue
+supabase/        migrations: schema, RLS and column grants, job queue, requeue, retention (+ a test shim)
 sdk/             `pip install lorde`: typed sync/async client, CuratorKIT preset, CLI, stdio MCP server
 skills/          lorde-gating: a Claude skill that teaches agents when and how to gate data with Lorde
-infra/           Dockerfile for the Gateway
+infra/           Dockerfiles for the Gateway and the Worker
 docs/            HF Article template and builder, submission checklist
 requirements/    forge-train, forge-serve, forge-data (three separate environments) and dev
 tests/           contract and parser fuzzing, metrics, and an end-to-end run on stub OpenAI servers
@@ -140,8 +142,34 @@ claude mcp add --transport http lorde https://api.<domain>/mcp --header "Authori
 claude mcp add lorde -- lorde mcp                        # local stdio, through the SDK
 ```
 
-Not in this slice yet: gating jobs and uploads (`/v1/jobs`, worker), Supabase-backed keys and usage, Redis
-rate limits for more than one replica, the Console.
+### Gating jobs (whole datasets)
+
+With `DATABASE_URL` (Supabase Postgres) and storage (`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`, or
+`LORDE_STORAGE_DIR` for local dev), the Gateway stores keys and usage in Postgres and serves the jobs API;
+`python -m worker.main` runs the jobs.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/uploads` | signed upload URL for a JSONL/CSV/Parquet dataset (≤ 200 MB) · scope `jobs:write` |
+| POST | `/v1/jobs` | `{upload_id \| dataset_url: "hf://datasets/..", gates, options}` · ≤ 3 queued or running per org |
+| GET | `/v1/jobs/{id}`, `/v1/jobs/{id}/results` | status and counts; signed URLs for passed, rejected, report, manifest, provenance |
+| POST | `/v1/jobs/{id}/cancel` | queued jobs stop at once; running jobs are stopped by the worker within one heartbeat |
+| GET | `/v1/usage` | usage by day, key and endpoint · scope `usage:read` |
+
+The worker claims jobs with `claim_job()` (`FOR UPDATE SKIP LOCKED`, per-org cap of 3, safe under contention),
+heartbeats every 15 s, runs CuratorKIT in a child process with Lorde as `judge_llm` and per-gate structured
+outputs, uploads results, records judgments (scores only: judged text stays in the org's storage unless
+`orgs.store_content`), and audits every job. Stale jobs are re-queued at most twice; data past each org's
+retention is purged and audited.
+
+```bash
+psql "$DATABASE_URL" -f supabase/migrations/0001_init.sql -f supabase/migrations/0002_rls.sql \
+  -f supabase/migrations/0003_functions.sql                      # or: supabase db push
+lorde jobs create data.jsonl --out results/                      # upload, gate, wait, download
+```
+
+Still to come: the Console (Next.js on Vercel), and staging deployment (HF Inference Endpoint, Railway,
+Supabase).
 
 ## Reproducibility notes
 
@@ -166,6 +194,8 @@ rate limits for more than one replica, the Console.
 ```bash
 pip install -r requirements/dev.txt
 pytest -q      # contract vs CuratorKIT, parser fuzzing (Hypothesis), metrics, splits, end-to-end on stub servers
+LORDE_TEST_PG_URL=postgresql://postgres@localhost:5432/postgres LORDE_TEST_REDIS_URL=redis://localhost:6379/15 \
+  pytest -q    # also the Supabase SQL (RLS, queue races), jobs + worker end to end, and Redis rate limits
 ```
 
 The end-to-end test runs steps 1-3 and 6-9, Bench and the article builder against small OpenAI-compatible stub

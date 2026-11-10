@@ -10,3 +10,6 @@ prometheus-client>=0.20
 scipy>=1.11                   # lorde_forge.metrics (imported lazily; kept for parity with Forge)
 tqdm>=4.66
 openai>=1.40
+psycopg[binary,pool]>=3.2     # Supabase Postgres: keys, usage, jobs queue (SKIP LOCKED)
+redis>=5                      # shared token buckets across Gateway replicas (REDIS_URL)
+huggingface_hub>=1.0          # worker: datasets given as hf://datasets/...

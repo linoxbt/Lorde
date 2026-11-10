@@ -55,10 +55,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send({"object": "list", "data": [{"id": "stub", "object": "model"}]})
 
     def do_POST(self):
+        if self.style == "slow":
+            import time
+
+            time.sleep(1.0)
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n) or b"{}")
         prompt = req["messages"][-1]["content"]
-        style = "plain" if req.get("response_format") else self.style
+        style = "plain" if req.get("response_format") or self.style == "slow" else self.style
         text = judge_reply(prompt, style)
         if text is None and "question-answer pair" in prompt:
             src = prompt.split("---")[1].strip()

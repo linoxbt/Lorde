@@ -81,6 +81,14 @@ class Lorde:
         self._headers = {"Authorization": f"Bearer {self.api_key}", "User-Agent": "lorde-python/0.1.0"}
         self._checked = False
         self.judge = _Judge(self)
+        from .jobs import Jobs
+
+        self.jobs = Jobs(self)
+
+    def _storage(self, method: str, url: str, **kw: Any) -> httpx.Response:
+        from .jobs import storage_request
+
+        return storage_request(self._http, self.base_url, method, url, **kw)
 
     def _request(self, method: str, path: str, json: dict | None = None) -> dict[str, Any]:
         if not self._checked:

@@ -35,6 +35,14 @@ class Settings:
     breaker_window_s: float = 30.0
     max_temperature: float = 0.3
     mcp_batch_limit: int = 64
+    database_url: str | None = field(default_factory=lambda: _env("DATABASE_URL"))
+    redis_url: str | None = field(default_factory=lambda: _env("REDIS_URL"))
+    supabase_url: str | None = field(default_factory=lambda: _env("SUPABASE_URL"))
+    supabase_service_key: str | None = field(default_factory=lambda: _env("SUPABASE_SERVICE_ROLE_KEY"))
+    storage_dir: str | None = field(default_factory=lambda: _env("LORDE_STORAGE_DIR"))
+    public_url: str = field(default_factory=lambda: _env("LORDE_PUBLIC_URL", "") or "")
+    max_upload_bytes: int = 200 * 1024 * 1024
+    max_active_jobs: int = 3
     mcp_allowed_hosts: list[str] = field(
         default_factory=lambda: [h.strip() for h in (_env("LORDE_MCP_ALLOWED_HOSTS", "") or "").split(",") if h.strip()])
 

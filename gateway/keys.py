@@ -60,6 +60,7 @@ class ApiKey:
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     revoked_at: str | None = None
     last_used_at: str | None = None
+    id: str | None = None
 
 
 class KeyStore:
@@ -106,6 +107,9 @@ class KeyStore:
 
     def list(self) -> list[ApiKey]:
         return list(self._load().values())
+
+    async def averify(self, key: str) -> ApiKey | None:
+        return self.verify(key)
 
     def verify(self, key: str) -> ApiKey | None:
         """The key record if ``key`` is valid and not revoked, else None (constant-time hash compare)."""
