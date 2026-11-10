@@ -1,0 +1,302 @@
+[
+ {
+  "kind": "reward",
+  "reply": "{\"grounding_score\": 0.1, \"verdict\": \"hallucinated\"}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "```json\n{\"overall_score\": 0.8}\n```",
+  "ok": true,
+  "score": 0.8
+ },
+ {
+  "kind": "reward",
+  "reply": "```\n{\"overall_score\": 0.8}\n```",
+  "ok": true,
+  "score": 0.8
+ },
+ {
+  "kind": "reward",
+  "reply": "Sure! {\"overall_score\": 0.9}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"overall_score\": 1.2}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"overall_score\": -0.1}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"overall_score\": \"0.9\"}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"overall_score\": true}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"helpfulness\": 1.0, \"honesty\": 0.5}",
+  "ok": true,
+  "score": 0.75
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"helpfulness\": 2}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "[0.9]",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "null",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "0.8",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"grounding_score\": 0.7}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"grounding_score\": 0.69999}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "  {\"grounding_score\": 1}  ",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"overall_score\": 0.5, \"helpfulness\": 3}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "```json {\"overall_score\": 0.4}```",
+  "ok": true,
+  "score": 0.4
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"dimension_scores\": {\"helpfulness\": 0.9}}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"grounding_score\": null}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "NaN",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"overall_score\": 0}",
+  "ok": true,
+  "score": 0.0
+ },
+ {
+  "kind": "reward",
+  "reply": "{\"grounding_score\": 1.0, \"extra\": [1,2]}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "reward",
+  "reply": "``````",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"grounding_score\": 0.1, \"verdict\": \"hallucinated\"}",
+  "ok": true,
+  "score": 0.1
+ },
+ {
+  "kind": "grounding",
+  "reply": "```json\n{\"overall_score\": 0.8}\n```",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "```\n{\"overall_score\": 0.8}\n```",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "Sure! {\"overall_score\": 0.9}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"overall_score\": 1.2}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"overall_score\": -0.1}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"overall_score\": \"0.9\"}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"overall_score\": true}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"helpfulness\": 1.0, \"honesty\": 0.5}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"helpfulness\": 2}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "[0.9]",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "null",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "0.8",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"grounding_score\": 0.7}",
+  "ok": true,
+  "score": 0.7
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"grounding_score\": 0.69999}",
+  "ok": true,
+  "score": 0.69999
+ },
+ {
+  "kind": "grounding",
+  "reply": "  {\"grounding_score\": 1}  ",
+  "ok": true,
+  "score": 1.0
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"overall_score\": 0.5, \"helpfulness\": 3}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "```json {\"overall_score\": 0.4}```",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"dimension_scores\": {\"helpfulness\": 0.9}}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"grounding_score\": null}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "NaN",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"overall_score\": 0}",
+  "ok": false,
+  "score": null
+ },
+ {
+  "kind": "grounding",
+  "reply": "{\"grounding_score\": 1.0, \"extra\": [1,2]}",
+  "ok": true,
+  "score": 1.0
+ },
+ {
+  "kind": "grounding",
+  "reply": "``````",
+  "ok": false,
+  "score": null
+ }
+]

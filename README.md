@@ -55,6 +55,7 @@ supabase/        migrations: schema, RLS and column grants, job queue, requeue, 
 sdk/             `pip install lorde`: typed sync/async client, CuratorKIT preset, CLI, stdio MCP server
 skills/          lorde-gating: a Claude skill that teaches agents when and how to gate data with Lorde
 infra/           Dockerfiles for the Gateway and the Worker
+console/         Lorde Console and website: Next.js 16, every page its own route, demo mode until Supabase is set
 docs/            HF Article template and builder, submission checklist
 requirements/    forge-train, forge-serve, forge-data (three separate environments) and dev
 tests/           contract and parser fuzzing, metrics, and an end-to-end run on stub OpenAI servers
@@ -168,8 +169,8 @@ psql "$DATABASE_URL" -f supabase/migrations/0001_init.sql -f supabase/migrations
 lorde jobs create data.jsonl --out results/                      # upload, gate, wait, download
 ```
 
-Still to come: the Console (Next.js on Vercel), and staging deployment (HF Inference Endpoint, Railway,
-Supabase).
+The Console (`console/`, Next.js for Vercel) covers every spec 13.1 screen; see `console/README.md`. Still to
+come: staging deployment (HF Inference Endpoint, Railway, Supabase, Vercel).
 
 ## Reproducibility notes
 

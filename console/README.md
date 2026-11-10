@@ -1,0 +1,36 @@
+# Lorde Console
+
+The web app for Lorde: the marketing site (`/`, `/docs`, `/bench`, `/model`, `/status`) and the Console
+(`/console/*`): overview, datasets, jobs, new job, job detail, review, playground, reports, API keys and settings.
+Every page is its own route. Next.js 16 (App Router), React 19, TypeScript (strict), Tailwind CSS 4, Geist,
+Recharts, Supabase (`@supabase/ssr`), zod, Playwright.
+
+```bash
+pnpm install
+pnpm dev                 # http://localhost:3000, demo data until env vars are set
+pnpm typecheck && pnpm test:unit && pnpm build
+pnpm test:e2e            # Playwright: desktop and phone projects
+```
+
+## Modes
+
+- **Demo** (no env): every page runs on deterministic, clearly labelled sample data; the playground uses a transparent
+  heuristic labelled "Simulated". Nothing is saved.
+- **Live**: set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` (see `.env.example`). Sign-in is Supabase
+  Auth (magic link, GitHub); `proxy.ts` protects `/console`; pages read through the user's own session, so the RLS
+  policies in `../supabase/migrations` decide what is visible. Keys are created server-side with `LORDE_KEY_PEPPER`
+  (same hash as the Gateway) and inserted under RLS, so only owners and admins can create or revoke them; a database
+  trigger audits every change.
+- **Gateway calls** (playground, uploads, jobs) go through `/api/gateway/*`, an allow-listed proxy to
+  `LORDE_GATEWAY_URL` that forwards the user's own API key from this browser tab (never stored server-side), or
+  `LORDE_API_KEY` for single-tenant self-hosting.
+
+## Design
+
+Layout and rhythm take cues from base.org (oversized tight headlines, pill buttons, hairline cards with line
+diagrams, a full-bleed CTA band, mono caps labels, a full-screen hamburger menu at every width) with Lorde's own
+identity: indigo accent, concentric-ring mark, original SVG art and copy. Pass/reject use the Okabe-Ito palette so
+they stay distinguishable with colour-vision deficiencies. Reduced-motion users get no animation.
+
+`tests/unit/vectors.test.ts` checks the TypeScript copy of CuratorKIT's parser against vectors recorded from the
+Python package; `tests/unit/keys.test.ts` checks key hashing against the Gateway.

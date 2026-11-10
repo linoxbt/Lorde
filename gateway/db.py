@@ -66,22 +66,19 @@ class PgKeyStore(KeyStore):
 
         key = KEY_PREFIX + _b62()
         async with self.pool.connection() as c:
+            await c.execute("select set_config('lorde.actor', %s, false)", (actor,))  # read by the audit trigger
             r = await (await c.execute(
                 "insert into api_keys (org_id, name, prefix, key_hash, scopes, rpm) values (%s,%s,%s,%s,%s,%s) "
                 "returning *", (org_id, name, prefix_of(key), hash_key(key, self.pepper), scopes or ["judge"], rpm),
             )).fetchone()
-            await c.execute("insert into audit_log (org_id, actor, action, target) values (%s, %s, 'key.create', %s)",
-                            (org_id, actor, prefix_of(key)))
         return key, self._rec(r)
 
     async def arevoke(self, prefix: str, actor: str = "cli") -> bool:
         async with self.pool.connection() as c:
+            await c.execute("select set_config('lorde.actor', %s, false)", (actor,))
             r = await (await c.execute(
                 "update api_keys set revoked_at = now() where prefix = %s and revoked_at is null returning org_id",
                 (prefix,))).fetchone()
-            if r:
-                await c.execute("insert into audit_log (org_id, actor, action, target) values (%s,%s,'key.revoke',%s)",
-                                (r["org_id"], actor, prefix))
         self._cache.pop(prefix, None)
         return bool(r)
 

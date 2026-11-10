@@ -158,3 +158,14 @@ def test_retention_purge_is_audited(db):
         assert c.execute("select count(*) from datasets where id=%s", (did,)).fetchone()[0] == 0
         assert c.execute("select count(*) from audit_log where org_id=%s and action='data.delete'",
                          (org,)).fetchone()[0] == 2
+
+
+def test_key_changes_are_audited_by_trigger(db):
+    a, org = signup(db, "audit@x.io")
+    with admin(db) as c:
+        as_user(c, a)
+        c.execute("insert into api_keys (org_id, name, prefix, key_hash) values (%s, 'k', 'lorde_sk_AUDIT001', 'h')", (org,))
+        c.execute("update api_keys set revoked_at = now() where prefix = 'lorde_sk_AUDIT001'")
+    with admin(db) as c:
+        rows = c.execute("select actor, action from audit_log where target = 'lorde_sk_AUDIT001' order by id").fetchall()
+    assert rows == [(str(a), "key.create"), (str(a), "key.revoke")]
