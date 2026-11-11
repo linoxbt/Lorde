@@ -187,7 +187,7 @@ def test_pass_rates_histogram_review_queue_and_members(db):
         assert ("reward", "?", 9, 1, 0, 0) in hist and ("reward", "?", 2, 0, 1, 0) in hist
         assert ("grounding", "?", None, 0, 0, 1) in hist
         queue = c.execute("select id, gate, score from review_queue(%s, 50)", (org,)).fetchall()
-        assert len(queue) == 4
+        assert len(queue) == 3 and all(r[2] is not None for r in queue)  # unscored judgments are not offered (0007)
         first = queue[0][0]
         c.execute("insert into human_labels (org_id, item_ref, kind, score, labeler) values (%s, %s, 'reward', 0.3, %s)",
                   (org, f"judgment:{first}", a))

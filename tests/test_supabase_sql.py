@@ -330,5 +330,96 @@ def test_function_privileges(db):
             assert not can("anon", fn) and not can("authenticated", fn), fn
         cfg = dict(c.execute("select p.proname, array_to_string(p.proconfig, ',') from pg_proc p "
                              "join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public'").fetchall())
-        for fn in ("claim_job", "requeue_stale_jobs", "expired_objects", "finish_purge", "is_member", "is_owner"):
+        for fn in ("claim_job", "requeue_stale_jobs", "expired_objects", "finish_purge", "is_member", "is_owner",
+                   "expired_objects_by_retention", "review_queue"):
             assert "search_path=public" in (cfg.get(fn) or ""), fn
+
+
+# ------------------------------------------------------------------ 0007_fairness
+
+def test_claim_job_round_robin_across_orgs(db):
+    """N1c: org B's first job runs before org A's second, though A queued both first."""
+    orgs = [signup(db, f"rr{i}@x.io")[1] for i in range(3)]
+    a, b, c_org = orgs
+    with admin(db) as c:
+        c.execute("update jobs set status = 'cancelled' where status = 'queued'")  # other tests' leftovers
+        a1 = c.execute("insert into jobs (org_id, config) values (%s, '{}') returning id", (a,)).fetchone()[0]
+        a2 = c.execute("insert into jobs (org_id, config) values (%s, '{}') returning id", (a,)).fetchone()[0]
+        a3 = c.execute("insert into jobs (org_id, config) values (%s, '{}') returning id", (a,)).fetchone()[0]
+        b1 = c.execute("insert into jobs (org_id, config) values (%s, '{}') returning id", (b,)).fetchone()[0]
+        # org C last started a job yesterday: it is due before A, which started one a moment ago
+        c.execute("insert into jobs (org_id, config, status, started_at, finished_at) values "
+                  "(%s, '{}', 'succeeded', now() - interval '1 day', now() - interval '1 day')", (c_org,))
+        c1 = c.execute("insert into jobs (org_id, config) values (%s, '{}') returning id", (c_org,)).fetchone()[0]
+
+        def claim():
+            r = c.execute("select id from claim_job('rr')").fetchone()
+            return r and r[0]
+
+        assert claim() == a1  # A and B never started a job (they come first): the older job wins
+        assert claim() == b1  # B has never started one; A just did
+        assert claim() == c1  # C's latest start (yesterday) is older than A's
+        assert claim() == a2
+        assert claim() == a3
+        assert claim() is None
+        assert c.execute("select count(*) from jobs where org_id=%s and status='running'", (a,)).fetchone()[0] == 3
+
+
+def test_0007_validates_0005_constraints(db):
+    with admin(db) as c:
+        rows = dict(c.execute("select conname, convalidated from pg_constraint where conname in "
+                              "('api_keys_prefix_shape', 'api_keys_scopes_known', 'datasets_storage_path_shape')"))
+    assert rows == {"api_keys_prefix_shape": True, "api_keys_scopes_known": True, "datasets_storage_path_shape": True}
+
+
+def apply(c, path):
+    with c.transaction():  # as gateway/migrate.py does: one transaction per file
+        c.execute(path.read_text())
+
+
+def test_migrations_in_production_order():
+    """Production applied 0006 before 0005; 0007 must apply cleanly on top of that (and be re-runnable)."""
+    mig = {f.name[:4]: f for f in (SUPA / "migrations").glob("*.sql")}
+    name = f"lorde_prod_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(URL, autocommit=True) as c:
+        c.execute(f"create database {name}")
+    url = URL.rsplit("/", 1)[0] + "/" + name
+    try:
+        notices: list[str] = []
+        with psycopg.connect(url, autocommit=True) as c:
+            c.add_notice_handler(lambda d: notices.append(d.message_primary))
+            apply(c, SUPA / "tests" / "supabase_shim.sql")
+            for n in ("0001", "0002", "0003", "0004", "0006"):
+                apply(c, mig[n])
+            org = c.execute("insert into orgs (name) values ('legacy') returning id").fetchone()[0]
+            c.execute("insert into api_keys (org_id, name, prefix, key_hash) values (%s, 'old', 'lorde_sk_legacy', 'h')",
+                      (org,))  # a key row from before 0005's prefix shape
+            apply(c, mig["0005"])
+
+            def cfg(fn):
+                return c.execute("select array_to_string(proconfig, ',') from pg_proc where proname=%s",
+                                 (fn,)).fetchone()[0] or ""
+
+            assert "search_path" not in cfg("expired_objects_by_retention")  # the N6 gap this order leaves
+            apply(c, mig["0007"])
+            for fn in ("expired_objects_by_retention", "expired_objects", "claim_job", "review_queue"):
+                assert "search_path=public" in cfg(fn), fn
+            assert any("api_keys_prefix_shape left NOT VALID" in m for m in notices), notices
+            valid = dict(c.execute("select conname, convalidated from pg_constraint where conname in "
+                                   "('api_keys_prefix_shape', 'api_keys_scopes_known')"))
+            assert valid == {"api_keys_prefix_shape": False, "api_keys_scopes_known": True}
+            c.execute("delete from api_keys where prefix = 'lorde_sk_legacy'")
+            apply(c, mig["0007"])  # re-runnable; with the row gone the constraint is validated
+            assert c.execute("select convalidated from pg_constraint where conname = 'api_keys_prefix_shape'"
+                             ).fetchone()[0] is True
+            # the queue works on the production-order schema
+            c.execute("insert into jobs (org_id, config) values (%s, '{}')", (org,))
+            assert c.execute("select count(*) from claim_job('w')").fetchone()[0] == 1
+            for fn in ("public.claim_job(text, int)", "public.expired_objects_by_retention()"):
+                assert not c.execute("select has_function_privilege('authenticated', %s, 'execute')",
+                                     (fn,)).fetchone()[0]
+            assert c.execute("select has_function_privilege('authenticated', 'public.review_queue(uuid, int)', "
+                             "'execute')").fetchone()[0]
+    finally:
+        with psycopg.connect(URL, autocommit=True) as c:
+            c.execute(f"drop database {name} with (force)")
