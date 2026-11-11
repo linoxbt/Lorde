@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -16,6 +17,11 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from .keys import CACHE_TTL_S, ApiKey, KeyStore, hash_key, prefix_of
+
+
+def dataset_path(org_id: str, dataset_id: str, name: str) -> str:
+    """Storage path of an uploaded dataset; the worker refuses any other shape."""
+    return f"{org_id}/{dataset_id}/{name}"
 
 
 def make_pool(url: str, min_size: int = 1, max_size: int = 10) -> AsyncConnectionPool:
@@ -139,13 +145,12 @@ class JobStore:
             ret = retention_days or (await (await c.execute("select retention_days from orgs where id=%s",
                                                             (org_id,))).fetchone() or {"retention_days": 30})[
                 "retention_days"]
+            # The path shape is enforced by the datasets_storage_path_shape constraint (0005_hardening.sql).
+            did = uuid.uuid4()
             r = await (await c.execute(
-                "insert into datasets (org_id, name, storage_path, format, bytes, expires_at) "
-                "values (%s, %s, '', %s, %s, now() + make_interval(days => %s)) returning *",
-                (org_id, name, fmt, size, ret))).fetchone()
-            path = f"{org_id}/{r['id']}/{name}"
-            await c.execute("update datasets set storage_path=%s where id=%s", (path, r["id"]))
-            r["storage_path"] = path
+                "insert into datasets (id, org_id, name, storage_path, format, bytes, expires_at) "
+                "values (%s, %s, %s, %s, %s, %s, now() + make_interval(days => %s)) returning *",
+                (did, org_id, name, dataset_path(org_id, str(did), name), fmt, size, ret))).fetchone()
         return r
 
     async def get_dataset(self, org_id: str, dataset_id: str) -> dict | None:

@@ -44,7 +44,7 @@ def env(tmp_path_factory):
     with psycopg.connect(db, autocommit=True) as c:
         for f in FILES:
             c.execute(f.read_text())
-        uid = c.execute("insert into auth.users (email) values ('ops@x.io') returning id").fetchone()[0]
+        uid = c.execute("insert into auth.users (email, email_confirmed_at) values ('ops@x.io', now()) returning id").fetchone()[0]
         org = c.execute("select org_id from org_members where user_id=%s", (uid,)).fetchone()[0]
         keys = {}
         for label, scopes in {"all": ["judge", "jobs:read", "jobs:write", "usage:read"], "judge": ["judge"]}.items():
