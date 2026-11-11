@@ -91,6 +91,20 @@ cat runs/lorde-v1/train_meta.json"""),
     ("save-model", None),
 ]
 
+# Downstream (step 8): train the three sets on both T4s at once, equal size and capped so the step fits a session
+# (~32 s per optimiser step at batch 1 x 16 on a T4), then generate and score on one GPU.
+DOWNSTREAM_ARGS = os.environ.get("DOWNSTREAM_ARGS", "--equal-size --max-rows 2000 --epochs 1 --max-len 1024")
+_DS = "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True envs/train/bin/python forge/08_downstream.py"
+DOWNSTREAM = f"""CUDA_VISIBLE_DEVICES=0 {_DS} train --sets ungated,teacher,lorde --only-sets ungated,lorde {DOWNSTREAM_ARGS} &
+p0=$!
+CUDA_VISIBLE_DEVICES=1 {_DS} train --sets ungated,teacher,lorde --only-sets teacher {DOWNSTREAM_ARGS} &
+p1=$!
+wait $p0
+wait $p1
+CUDA_VISIBLE_DEVICES=0 {_DS} generate --sets ungated,teacher,lorde --include-base {DOWNSTREAM_ARGS}
+CUDA_VISIBLE_DEVICES=0 {_DS} score --sets ungated,teacher,lorde --include-base {DOWNSTREAM_ARGS}
+cat results/downstream.md"""
+
 SESSION_C = [
     ("setup", SETUP),
     ("judge-eval", f"""{SERVE}
@@ -108,8 +122,7 @@ CUDA_VISIBLE_DEVICES=1 bash forge/00_serve.sh lorde
 bash forge/00_serve.sh stop && bash forge/00_serve.sh teacher
 {PY} forge/07_curatorkit_plugin.py --judge teacher=openai/teacher@http://localhost:8000/v1
 bash forge/00_serve.sh stop"""),
-    ("downstream", """CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True envs/train/bin/python forge/08_downstream.py all --sets ungated,teacher,lorde --include-base
-cat results/downstream.md"""),
+    ("downstream", DOWNSTREAM),
     ("publish-private", f"{PY} forge/09_publish.py --user {HF_USER}"),
 ]
 
@@ -135,12 +148,28 @@ def train_args() -> str:
     return f"--epochs 1 --max-samples {int(budget / per_row)}"
 
 
-SESSIONS = {"a": SESSION_A, "b": SESSION_B, "c": SESSION_C}
+# Session D: redo what Session C could not finish, keeping its judge-eval and plug-in results: cold, stratified
+# step-6 timings (predictions reused from the cache), downstream, private publish.
+SESSION_D = [
+    ("setup", SETUP),
+    ("judge-timing", f"""{SERVE}
+bash forge/00_serve.sh stop
+CUDA_VISIBLE_DEVICES=0 bash forge/00_serve.sh student
+CUDA_VISIBLE_DEVICES=1 bash forge/00_serve.sh lorde
+{PY} forge/06_judge_eval.py --judge base=openai/student@http://localhost:8001/v1 \\
+  --judge lorde=openai/lorde@http://localhost:8002/v1 --gpu-hourly base=0.50 --gpu-hourly lorde=0.50 --structured \\
+  --trust-legacy-cache
+bash forge/00_serve.sh stop"""),
+    ("downstream", DOWNSTREAM),
+    ("publish-private", f"{PY} forge/09_publish.py --user {HF_USER}"),
+]
+
+SESSIONS = {"a": SESSION_A, "b": SESSION_B, "c": SESSION_C, "d": SESSION_D}
 
 # Written by the label tool (labels) or by step 3 (key); pulled fresh before the steps that read them.
 HUMAN_FILES = ("human_labels.jsonl", "human_sample_key.jsonl")
 WRITES_HUMAN_SAMPLE = {"splits"}  # only after this step may the sample and its key be uploaded
-READS_HUMAN_LABELS = {"judge-eval", "publish-private"}
+READS_HUMAN_LABELS = {"judge-eval", "judge-timing", "publish-private"}
 TRAIN_STEPS = {"train-smoke", "train"}
 
 

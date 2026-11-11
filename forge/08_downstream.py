@@ -84,14 +84,21 @@ def stage_train(args) -> None:
     tok = AutoTokenizer.from_pretrained(args.base_model)
     sizes = {s: len(jsonl.read(config.DATA / "gated" / s / "passed.jsonl")) for s in args.sets}
     n_equal = min(sizes.values()) if args.equal_size else None
-    recipe = T.Recipe(epochs=args.epochs, batch_size=4, grad_accum=4, lr=2e-4, max_len=1536)
+    # Batch 1 x 16 like Lorde's own recipe: with Tiny Aya's 261k-token vocabulary, 4 sequences of logits do not fit
+    # on a 16 GB T4 (CUDA OOM at batch 4 x 4). Same effective batch of 16.
+    recipe = T.Recipe(epochs=args.epochs, batch_size=1, grad_accum=16, lr=2e-4, max_len=args.max_len)
     for s in args.sets:
+        if args.only_sets and s not in args.only_sets:
+            continue  # another process (GPU) trains this set; --sets still decides the equal size
         out = RUNS / s
         rows = jsonl.read(config.DATA / "gated" / s / "passed.jsonl")
         if not rows:
             sys.exit(f"no gated set for {s}: run forge/07_curatorkit_plugin.py first")
         if n_equal:
             rows = sorted(rows, key=lambda r: variants.rng_for("eq", r["uid"]).random())[:n_equal]
+        if args.max_rows and len(rows) > args.max_rows:
+            # Seeded, so every set is capped the same way and re-runs see the same rows.
+            rows = sorted(rows, key=lambda r: variants.rng_for("cap", r["uid"]).random())[:args.max_rows]
         sha = data_sha(rows)
         done, why = trained(out, sha, args.trust_legacy_cache)
         if done and not args.force:
@@ -267,6 +274,9 @@ def main() -> None:
     ap.add_argument("--engine", choices=["aligntune", "trl"], default="aligntune")
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--equal-size", action="store_true", help="subsample every set to the smallest size")
+    ap.add_argument("--only-sets", default="", help="train only these of --sets (e.g. one GPU per process)")
+    ap.add_argument("--max-rows", type=int, default=0, help="seeded cap on training rows per set (0 = no cap)")
+    ap.add_argument("--max-len", type=int, default=1536, help="drop training rows longer than this many tokens")
     ap.add_argument("--include-base", action="store_true", help="also score the untrained base model")
     ap.add_argument("--gen-batch", type=int, default=16)
     ap.add_argument("--max-new-tokens", type=int, default=128)
@@ -276,6 +286,7 @@ def main() -> None:
                     help="reuse trained sets and predictions written before fingerprints existed")
     args = ap.parse_args()
     args.sets = [s.strip() for s in args.sets.split(",") if s.strip()]
+    args.only_sets = [s.strip() for s in args.only_sets.split(",") if s.strip()]
     if args.stage in ("train", "all"):
         stage_train(args)
     if args.stage in ("generate", "all"):
