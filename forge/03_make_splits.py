@@ -41,7 +41,8 @@ def main() -> None:
     ap.add_argument("--blind-salt", default=None,
                     help="salt for the opaque human-sample ids (default: random; ids already in the key are kept)")
     ap.add_argument("--max-prompt-chars", type=int, default=7000,
-                    help="rough guard; step 5 drops rows over 2,048 tokens with the real tokenizer")
+                    help="rough guard; step 5 drops rows over 1,536 tokens (config.MAX_SEQ_LEN) with the real "
+                         "tokenizer")
     args = ap.parse_args()
 
     pool = {r["uid"]: r for r in jsonl.read(args.pool)}
@@ -49,20 +50,25 @@ def main() -> None:
     if not labels:
         sys.exit("no labels: run forge/02_teacher_label.py first")
 
-    rows, dropped = [], Counter()
+    rows, dropped, dropped_test = [], Counter(), Counter()
     for uid, lab in labels.items():
         item = pool[uid]
         j = contract.parse_reply(item["kind"], lab["raw"])
         target = canonical.canonical(j)
-        if target is None:
-            dropped["teacher_unparseable"] += 1
-            continue
+        why = "teacher_unparseable" if target is None else None
         prompt = contract.render(item)
-        if len(prompt) > args.max_prompt_chars:
-            dropped["too_long"] += 1
+        if why is None and len(prompt) > args.max_prompt_chars:
+            why = "too_long"
+        if why:
+            dropped[why] += 1
+            if splits.bucket(str(item["group"])) < args.test:  # would have been a test item
+                dropped_test[why] += 1
             continue
+        # The reference verdict is the canonical target's (what the student is trained to say), not the raw
+        # teacher verdict, which may be missing or misspelt where the target derives it from the score.
         rows.append({**item, "prompt_text": prompt, "target": target, "teacher_score": j.score,
-                     "teacher_raw": lab["raw"], "teacher_verdict": j.verdict})
+                     "teacher_raw": lab["raw"], "teacher_verdict": target.get("verdict"),
+                     "teacher_verdict_raw": j.verdict})
 
     parts = splits.grouped_split(rows, val=args.val, test=args.test)
 
@@ -77,6 +83,7 @@ def main() -> None:
         out.update({k: r[k] for k in ITEM_FIELDS if k in r})
         out.update({"prompt": r["prompt_text"], "teacher_score": r["teacher_score"],
                     "teacher_raw": r["teacher_raw"], "teacher_verdict": r["teacher_verdict"],
+                    "teacher_verdict_raw": r["teacher_verdict_raw"],
                     "teacher_decision": r["teacher_score"] >= config.THRESHOLD})
         return out
 
@@ -93,7 +100,7 @@ def main() -> None:
                       salt=args.blind_salt)
 
     stats = {
-        "labels": len(labels), "usable": len(rows), "dropped": dict(dropped),
+        "labels": len(labels), "usable": len(rows), "dropped": dict(dropped), "dropped_from_test": dict(dropped_test),
         "train": n_train, "val": n_val, "test": n_test, "human_sample": len(sample),
         "test_by_kind_lang": Counter(f"{t['kind']}:{t['lang']}" for t in test),
         "test_teacher_pass_rate": round(sum(t["teacher_decision"] for t in test) / max(1, n_test), 4),

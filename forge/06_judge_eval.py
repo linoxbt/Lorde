@@ -16,6 +16,11 @@ and per-variant breakdowns, agreement with human labels (the teacher's own
 human agreement is the ceiling), agreement with Aya Expanse 32B on the
 calibration slice, latency and throughput at fixed concurrency, cost per 1M
 judgments vs the API teacher, and AuditKIT paired-bootstrap significance tests.
+
+Latency and throughput are timed before any prediction, on a seeded random sample stratified by kind x
+language (proportional to the test set), so no timed prompt is in the server's cache from this run; the
+structured-outputs run of the same server gets a disjoint sample. The GPU is recorded (nvidia-smi, or
+``--hardware``) and reported next to every timing.
 ``--structured`` also runs every judge with vLLM structured outputs ("<name>+so").
 
 Writes results/judge_eval.{json,md} and results/preds/<judge>.jsonl (+ <judge>.meta.json).
@@ -34,11 +39,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import audit, config, contract, fingerprint, human, jsonl, llm, metrics  # noqa: E402
+from lorde_forge import audit, canonical, config, contract, fingerprint, human, jsonl, llm, metrics, splits  # noqa: E402
 from lorde_forge.judge import as_metric_row, cache_meta, error_counts, predict  # noqa: E402
 from lorde_forge.report import fmt, table  # noqa: E402
 
@@ -51,19 +57,54 @@ def kv(pairs: list[str]) -> dict[str, float]:
     return out
 
 
-def perf(ep: llm.Endpoint, items: list[dict], structured: bool, n: int, concurrency: int) -> dict:
+def detect_hardware() -> dict | None:
+    """The GPU(s) of this machine, as nvidia-smi (or torch) names them; None when there is none."""
+    import shutil
+    import subprocess
+
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True,
+                                 text=True, timeout=20).stdout
+            names = [x.strip() for x in out.splitlines() if x.strip()]
+            if names:
+                return {"name": names[0], "gpus_on_host": len(names), "source": "nvidia-smi"}
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return {"name": torch.cuda.get_device_name(0), "gpus_on_host": torch.cuda.device_count(),
+                    "source": "torch"}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def perf(ep: llm.Endpoint, sample: list[dict], structured: bool, concurrency: int, note: dict) -> dict:
     """Timed run at fixed concurrency (not cached), for latency and throughput."""
-    sample = items[:n]
     reqs = [llm.Request(uid=r["uid"], messages=[{"role": "user", "content": r["prompt"]}],
                         params=llm.judge_params(r["kind"], structured)) for r in sample]
     res, wall = llm.run(ep, reqs, concurrency=concurrency, desc=f"perf {ep.name}")
     ok = [r for r in res if r.error is None]
     s = metrics.latency_stats([r.latency_s for r in ok], wall, n_ok=len(ok),
                               completion_tokens=sum(r.completion_tokens for r in ok))
-    s.update({"n": len(sample), "concurrency": concurrency, "errors": len(res) - len(ok),
+    s.update({"n": len(sample), "concurrency": concurrency, "errors": len(res) - len(ok), "sample": note,
               "mean_prompt_tokens": round(sum(r.prompt_tokens for r in ok) / max(1, len(ok)), 1),
               "mean_completion_tokens": round(sum(r.completion_tokens for r in ok) / max(1, len(ok)), 1)})
     return s
+
+
+def excluded_from_test() -> dict:
+    """Items left out of the test set because the teacher's reply was unparseable (from step 3's summary)."""
+    s = json.loads((config.DATA / "splits_summary.json").read_text()) if (
+        config.DATA / "splits_summary.json").exists() else {}
+    dropped, in_test = s.get("dropped") or {}, s.get("dropped_from_test")
+    return {"teacher_unparseable_in_test_split": None if in_test is None else in_test.get("teacher_unparseable", 0),
+            "teacher_unparseable_all_splits": dropped.get("teacher_unparseable", 0) if s else None,
+            "too_long_all_splits": dropped.get("too_long", 0) if s else None,
+            "note": "the test set only holds items whose teacher reply CuratorKIT could parse"}
 
 
 def judge_models(eps: list[llm.Endpoint], args) -> dict[str, dict | None]:
@@ -113,7 +154,12 @@ def main() -> None:
                     help="private key mapping the blind sample's opaque ids to test uids")
     ap.add_argument("--calibration", default=str(config.DATA / "labels_32b.jsonl"))
     ap.add_argument("--concurrency", type=int, default=16)
-    ap.add_argument("--perf-n", type=int, default=256)
+    ap.add_argument("--min-lang-n", type=int, default=MIN_LANG_N,
+                    help="test items a language needs before the per-language criterion can judge it")
+    ap.add_argument("--perf-n", type=int, default=256, help="items timed per judge (stratified random sample)")
+    ap.add_argument("--perf-seed", type=int, default=0)
+    ap.add_argument("--hardware", default=None,
+                    help="GPU the timings were measured on (default: nvidia-smi; in --report-only: the previous report)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--out", default=str(config.RESULTS / "judge_eval"))
     args = ap.parse_args()
@@ -124,7 +170,9 @@ def main() -> None:
     if not test:
         sys.exit("empty test set: run forge/03_make_splits.py first")
     uids = [t["uid"] for t in test]
-    teacher = [{"ok": True, "score": t["teacher_score"], "verdict": t.get("teacher_verdict")} for t in test]
+    # Reference verdict = the canonical training target's verdict (test.jsonl from before the fix held the
+    # raw teacher verdict; it is canonicalised here, so old test sets give the same reference).
+    teacher = [{"ok": True, "score": t["teacher_score"], "verdict": canonical.reference_verdict(t)} for t in test]
     langs = [t["lang"] for t in test]
     kinds = [t["kind"] for t in test]
     variant_keys = [f"{t['kind']}:{t.get('variant', '?')}" for t in test]
@@ -143,8 +191,25 @@ def main() -> None:
     perf_stats: dict[str, dict] = {}
     cache_info: dict[str, dict] = {}
     previous = Path(args.out + ".json")
-    old_judges = json.loads(previous.read_text())["judges"] if args.report_only and previous.exists() else {}
+    old = json.loads(previous.read_text()) if args.report_only and previous.exists() else {}
+    old_judges = old.get("judges", {})
+    if args.hardware:
+        hardware = {"name": args.hardware, "source": "--hardware"}
+    else:
+        hardware = old.get("hardware") if args.report_only else detect_hardware()
     models = judge_models(eps, args)
+    if not args.report_only:
+        # Timings first, on a fresh server: no timed prompt was sent before in this run. Plain and structured
+        # runs of one server get disjoint samples; every judge is timed on the same items.
+        draws = splits.stratified_draws(test, args.perf_n, k=2 if args.structured else 1, seed=args.perf_seed)
+        for name, ep, structured in runs:
+            sample = draws[1 if structured else 0]
+            note = {"method": "seeded random sample, stratified by kind x lang", "seed": args.perf_seed,
+                    "by_stratum": dict(Counter(f"{t['kind']}:{t['lang']}" for t in sample)),
+                    "timed_before_predictions": True, "disjoint_from_other_timed_runs": True,
+                    "hardware": (hardware or {}).get("name")}
+            print(f"[eval] timing {name} on {len(sample)} items")
+            perf_stats[name] = perf(ep, sample, structured, args.concurrency, note)
     for name, ep, structured in runs:
         cache = config.RESULTS / "preds" / f"{name}.jsonl"
         meta = cache_meta(models[ep.name], test, structured)
@@ -162,10 +227,10 @@ def main() -> None:
         legacy = (fingerprint.read_meta(cache) or {}).get("legacy_trusted")
         cache_info[name] = {"status": "legacy, trusted by --trust-legacy-cache" if legacy else "fingerprinted",
                             "model": models[ep.name]}
-        perf_stats[name] = perf(ep, test, structured, args.perf_n, args.concurrency)
 
     rows = {name: [as_metric_row(preds[name].get(u)) for u in uids] for name in preds}
-    report: dict = {"n_test": len(test), "templates": contract.fingerprints(), "judges": {}}
+    report: dict = {"n_test": len(test), "templates": contract.fingerprints(), "hardware": hardware,
+                    "test_excluded": excluded_from_test(), "judges": {}}
     for name in rows:
         gpu = prices.get(name.removesuffix("+so"))
         api_price = api_prices.get(name.removesuffix("+so"))
@@ -237,48 +302,112 @@ def main() -> None:
                 sig[f"{cand} vs {base}"] = audit.decision_significance(uids, ref_dec, dec(base), dec(cand))
     report["significance_decision_agreement"] = sig
 
-    report["acceptance"] = acceptance(report, args.candidate)
+    report["acceptance"] = acceptance(report, args.candidate, args.min_lang_n)
+    report["promotable"] = promotable(report["acceptance"])
     jsonl.write_json(f"{args.out}.json", report)
     Path(f"{args.out}.md").write_text(render_md(report, args.candidate), encoding="utf-8")
     print(f"[eval] wrote {args.out}.md / .json")
     for c in report["acceptance"]:
-        print(f"  {'PASS' if c['met'] else 'FAIL' if c['met'] is False else ' -- '}  {c['criterion']}: {c['value']}")
+        print(f"  {'PASS' if c['met'] else 'FAIL' if c['met'] is False else ' -- '}  {c['criterion']}: {c['value']}"
+              + (f" ({c['reason']})" if c.get("reason") else ""))
+    print(f"  promotable: {report['promotable']}")
 
 
-def acceptance(r: dict, cand: str) -> list[dict]:
-    j = r["judges"].get(cand)
-    if not j:
-        return []
-    vt = j["vs_teacher"]
-    so = r["judges"].get(f"{cand}+so", {}).get("vs_teacher", {})
-    out = []
+MIN_LANG_N = 20  # a language with fewer test items cannot pass or fail the per-language criterion
 
-    def add(criterion, value, ok, blocking=True, fmt_pct=True):
-        out.append({"criterion": criterion, "value": fmt(value, pct=fmt_pct), "met": ok, "blocking": blocking})
 
-    add("Gate-usable rate, unconstrained ≥ 99.0%", vt["gate_usable_rate"], vt["gate_usable_rate"] >= 0.99)
-    if so:
-        add("Gate-usable rate, structured outputs = 100%", so["gate_usable_rate"], so["gate_usable_rate"] >= 1.0)
-    add("Decision agreement vs teacher ≥ 90%", vt["decision_agreement"], vt["decision_agreement"] >= 0.90)
-    add("Cohen's κ vs teacher ≥ 0.75", vt["kappa"], vt["kappa"] is not None and vt["kappa"] >= 0.75, fmt_pct=False)
-    add("Spearman ρ ≥ 0.80 (reported)", vt["spearman"], vt["spearman"] is not None and vt["spearman"] >= 0.80,
-        blocking=False, fmt_pct=False)
-    add("MAE ≤ 0.10 (reported)", vt["mae"], vt["mae"] is not None and vt["mae"] <= 0.10, blocking=False, fmt_pct=False)
-    g = j["by_kind"].get("grounding", {})
-    if g.get("verdict_accuracy") is not None:
-        add("Grounding verdict accuracy ≥ 85%", g["verdict_accuracy"], g["verdict_accuracy"] >= 0.85)
-    h = r.get("human")
-    if h and cand in h:
+def acceptance(r: dict, cand: str, min_lang_n: int = MIN_LANG_N) -> list[dict]:
+    """Every spec 9.2 criterion that step 6 can measure, always listed: ``met`` is True/False, or None with a
+    ``reason`` when its inputs are missing. Promotable = every blocking criterion met (none None)."""
+    j = r["judges"].get(cand) or {}
+    vt = j.get("vs_teacher") or {}
+    so = (r["judges"].get(f"{cand}+so") or {}).get("vs_teacher") or {}
+    out: list[dict] = []
+    missing_cand = None if j else f"no judge named {cand!r} was evaluated"
+
+    def add(criterion, value, ok, blocking=True, fmt_pct=True, reason=None):
+        reason = missing_cand or reason
+        if reason or value is None:
+            ok = None
+            reason = reason or "not measured"
+        out.append({"criterion": criterion, "value": fmt(value, pct=fmt_pct), "met": ok, "blocking": blocking,
+                    "reason": reason})
+
+    def ge(v, t):
+        return None if v is None else v >= t
+
+    add("Gate-usable rate, unconstrained ≥ 99.0%", vt.get("gate_usable_rate"), ge(vt.get("gate_usable_rate"), 0.99))
+    add("Gate-usable rate, structured outputs = 100%", so.get("gate_usable_rate"),
+        ge(so.get("gate_usable_rate"), 1.0), reason=None if so else "structured outputs not evaluated (--structured)")
+    add("Decision agreement vs teacher ≥ 90%", vt.get("decision_agreement"), ge(vt.get("decision_agreement"), 0.90))
+    add("Cohen's κ vs teacher ≥ 0.75", vt.get("kappa"), ge(vt.get("kappa"), 0.75), fmt_pct=False,
+        reason=None if vt.get("kappa") is not None else "κ undefined")
+    add("Spearman ρ ≥ 0.80 (reported)", vt.get("spearman"), ge(vt.get("spearman"), 0.80), blocking=False,
+        fmt_pct=False)
+    mae = vt.get("mae")
+    add("MAE ≤ 0.10 (reported)", mae, None if mae is None else mae <= 0.10, blocking=False, fmt_pct=False)
+    g = (j.get("by_kind") or {}).get("grounding", {})
+    add("Grounding verdict accuracy ≥ 85%", g.get("verdict_accuracy"), ge(g.get("verdict_accuracy"), 0.85),
+        reason=None if g.get("verdict_accuracy") is not None else "no grounding items with a teacher verdict")
+    h = r.get("human") or {}
+    if h.get(cand) and h.get("teacher"):
         ceiling = h["teacher"]["decision_agreement"]
-        add(f"Human decision agreement ≥ teacher's ({fmt(ceiling, True)}) − 3 pts",
+        add(f"Human decision agreement ≥ teacher's ({fmt(ceiling, True)}) − 3 pts (n = {h['n']})",
             h[cand]["decision_agreement"], h[cand]["decision_agreement"] >= ceiling - 0.03)
-    worst = min(((k, v["decision_agreement"]) for k, v in j["by_lang"].items()), key=lambda x: x[1])
-    add(f"Per-language decision agreement ≥ 85% (worst: {worst[0]})", worst[1], worst[1] >= 0.85)
-    p95 = j["perf"].get("p95_s")
-    out.append({"criterion": "p95 latency ≤ 1.5 s at 16 concurrent (production on L4; reported on this GPU)",
-                "value": f"{p95} s" if p95 is not None else "–", "met": p95 is not None and p95 <= 1.5,
-                "blocking": False})
+    else:
+        add("Human decision agreement ≥ teacher's − 3 pts", None, None,
+            reason="no human labels for test items (forge/04_label_tool.py)")
+    by_lang = j.get("by_lang") or {}
+    big = {k: v for k, v in by_lang.items() if v.get("n", 0) >= min_lang_n}
+    # every training language must be shown to pass; one with too few (or no) test items cannot be
+    small = sorted({*config.LANG_CODES, *by_lang} - set(big))
+    if big:
+        worst = min(big.items(), key=lambda kv: kv[1]["decision_agreement"])
+        reason = None
+        if worst[1]["decision_agreement"] < 0.85:
+            ok = False
+        elif small:
+            ok, reason = None, f"too few test items (< {min_lang_n}) in {', '.join(small)}"
+        else:
+            ok = True
+        add(f"Per-language decision agreement ≥ 85% (worst: {worst[0]}, n = {worst[1]['n']})",
+            worst[1]["decision_agreement"], ok, reason=reason)
+    else:
+        add("Per-language decision agreement ≥ 85%", None, None,
+            reason=f"no language has {min_lang_n} or more test items" if by_lang else None)
+    p95 = (j.get("perf") or {}).get("p95_s")
+    hw = (r.get("hardware") or {}).get("name") or "hardware not recorded"
+    out.append({"criterion": f"p95 latency ≤ 1.5 s at 16 concurrent (spec: 1× L4 in production; measured on {hw})",
+                "value": f"{p95} s" if p95 is not None else "–", "met": None if p95 is None else p95 <= 1.5,
+                "blocking": False, "reason": None if p95 is not None else "not timed"})
     return out
+
+
+def promotable(criteria: list[dict]) -> bool:
+    blocking = [c for c in criteria if c["blocking"]]
+    return bool(blocking) and all(c["met"] is True for c in blocking)
+
+
+def excluded_md(r: dict) -> str:
+    e = r.get("test_excluded") or {}
+    if e.get("teacher_unparseable_in_test_split") is not None:
+        return (f" Items whose teacher reply was unparseable have no reference and are excluded: "
+                f"{e['teacher_unparseable_in_test_split']} from the test split "
+                f"({e['teacher_unparseable_all_splits']} over all splits).")
+    if e.get("teacher_unparseable_all_splits") is not None:
+        return (f" Items whose teacher reply was unparseable have no reference and are excluded "
+                f"({e['teacher_unparseable_all_splits']} over all splits).")
+    return ""
+
+
+def timing_md(r: dict) -> str:
+    hw = (r.get("hardware") or {}).get("name")
+    perf = next((j.get("perf") for j in r["judges"].values() if j.get("perf")), {}) or {}
+    smp = perf.get("sample") or {}
+    where = f"measured on {hw}" if hw else "hardware not recorded"
+    how = (f"{perf.get('n')} items per judge, seeded random sample stratified by kind x language, timed before any "
+           "prediction" if smp else "the first test items, after the predictions (older run: cache may be warm)")
+    return f"{where}; {how}; {perf.get('concurrency', '?')} concurrent requests."
 
 
 def render_md(r: dict, cand: str) -> str:
@@ -286,7 +415,8 @@ def render_md(r: dict, cand: str) -> str:
     lines = [f"# Lorde Bench: judge evaluation\n\nHeld-out test set: **{r['n_test']}** items "
              f"(grouped by prompt / source passage, never seen in training). Reference: teacher "
              f"(Aya Expanse 8B) decisions at threshold {config.THRESHOLD}. Unparseable replies count as rejects, "
-             f"as in CuratorKIT.\n",
+             f"as in CuratorKIT.{excluded_md(r)}\n",
+             f"Timings: {timing_md(r)}\n",
              f"Templates: {', '.join(t['id'] for t in r['templates']['templates'].values())}\n"]
     head = ["Judge", "Gate-usable", "Decision agr.", "κ", "Spearman", "MAE", "Verdict acc.", "Pass rate",
             "p50 s", "p95 s", "judg/s", "$ / 1M"]
@@ -307,11 +437,22 @@ def render_md(r: dict, cand: str) -> str:
                   f"**${a['cost_per_1M_judgments']} per 1M judgments**.\n"]
         c = js.get(cand, {}).get("cost_per_1M")
         if c:
-            lines += [f"Lorde on this GPU: **${c} per 1M judgments**, {a['cost_per_1M_judgments'] / c:.0f}× cheaper.\n"]
+            hw = (r.get("hardware") or {}).get("name") or "the evaluation GPU (not recorded)"
+            lines += [f"Lorde on {hw}: **${c} per 1M judgments**, {a['cost_per_1M_judgments'] / c:.0f}× cheaper.\n"]
 
+    prom = r.get("promotable")
     lines += ["## Acceptance criteria (spec 9.2)\n",
-              table(["Criterion", "Value", "Met", "Blocking"],
-                    [[c["criterion"], c["value"], fmt(c["met"]), fmt(c["blocking"])] for c in r["acceptance"]]), ""]
+              f"**Promotable: {'yes' if prom else 'no'}**"
+              + ("" if prom else " (every blocking criterion must be met; unmeasured ones count as not met)") + "\n",
+              table(["Criterion", "Value", "Met", "Blocking", "Note"],
+                    [[c["criterion"], c["value"], "not measured" if c["met"] is None else fmt(c["met"]),
+                      fmt(c["blocking"]), c.get("reason") or ""] for c in r["acceptance"]]), ""]
+    errs = {n: j.get("errors") for n, j in js.items() if j.get("errors")}
+    if errs:
+        lines += ["Replies that failed: call errors (transport) are retried and never cached; parse failures are "
+                  "replies CuratorKIT could not read (counted as rejects above).\n",
+                  table(["Judge", "Call errors", "Parse failures", "Missing"],
+                        [[n, e["call_errors"], e["parse_failures"], e["missing"]] for n, e in errs.items()]), ""]
 
     langs = sorted(next(iter(js.values()))["by_lang"])
     lines += ["## Decision agreement by language\n",

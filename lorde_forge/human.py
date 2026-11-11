@@ -26,8 +26,8 @@ from . import jsonl
 
 ITEM_FIELDS = ("instruction", "response", "source_text", "question", "answer")
 SHOWN_FIELDS = ("uid", "kind", "lang", *ITEM_FIELDS)
-LEAKY_FIELDS = ("variant", "group", "teacher_score", "teacher_raw", "teacher_verdict", "teacher_decision",
-                "prompt", "chunk_id", "pid")
+LEAKY_FIELDS = ("variant", "group", "teacher_score", "teacher_raw", "teacher_verdict", "teacher_verdict_raw",
+                "teacher_decision", "prompt", "chunk_id", "pid")
 # Every name a variant can have (lorde_forge.variants and 01_build_pool); a uid ending in one is not blind.
 VARIANT_NAMES = ("gold", "student", "truncated", "off_topic", "wrong_language", "padded_repetition",
                  "swapped_answer", "fabricated_numbers", "closed_book")

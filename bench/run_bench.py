@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import config, jsonl, llm, metrics  # noqa: E402
+from lorde_forge import canonical, config, jsonl, llm, metrics  # noqa: E402
 from lorde_forge.judge import as_metric_row, predict  # noqa: E402
 from lorde_forge.report import fmt, table  # noqa: E402
 
@@ -46,7 +46,7 @@ def main() -> None:
     rows = [as_metric_row(pg.get(g["uid"])) for g in golden]
     res: dict = {"judge": name, "model": ep.model, "n_golden": len(golden), "n_adversarial": len(adv)}
     res["vs_teacher_8b"] = metrics.compare(rows, [{"ok": True, "score": g["teacher_score"],
-                                                   "verdict": g.get("teacher_verdict")} for g in golden])
+                                                   "verdict": canonical.reference_verdict(g)} for g in golden])
     for key, sk, vk in (("vs_32b", "ref_32b_score", "ref_32b_verdict"), ("vs_human", "human_score", "human_verdict")):
         idx = [i for i, g in enumerate(golden) if g.get(sk) is not None]
         if idx:

@@ -60,6 +60,8 @@ gate's reply to its JSON schema, and Bench measures the raw model too so the mod
 
 <!-- teacher_audit -->
 
+<!-- acceptance -->
+
 <!-- results:judge_eval -->
 
 <!-- results:plugin_eval -->
