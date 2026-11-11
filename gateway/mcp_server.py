@@ -2,7 +2,7 @@
 
 Tools: lorde_judge_reward, lorde_judge_grounding, lorde_judge_batch (<= 64 items), lorde_model_info
 (scope judge), lorde_create_gating_job (jobs:write) and lorde_job_status (jobs:read). Errors come back as
-tool errors whose text starts with the API error code, e.g. "not_found: no such job in this organization".
+tool errors whose text carries the API error code, e.g. "not_found: no such job in this organization".
 """
 
 from __future__ import annotations
