@@ -6,13 +6,24 @@ Deployed 10 Nov 2026 from branch `ccr-e4bea25f-7bzaqy`.
 |---|---|---|
 | Console + website | Vercel, team Linoxbt, project `lorde-console` | https://lorde-console.vercel.app |
 | Gateway + Job Worker (one service, `infra/Dockerfile.api`) | Railway project `lorde`, service `lorde-api` | https://lorde-api-production.up.railway.app |
-| Postgres (keys, jobs, judgments, usage, audit) | Railway `Postgres` (Supabase shim, `LORDE_DB_SHIM=1`) | private network |
+| Auth + Postgres (accounts, orgs, keys, jobs, judgments, usage, audit) | Supabase project `lorde` (us-east-1), ref `kmizhjblteiqsuwzbgvt`; the Gateway connects through the session pooler (`aws-1-us-east-1.pooler.supabase.com:5432`) | https://kmizhjblteiqsuwzbgvt.supabase.co |
 | Redis (rate limits) | Railway `Redis` | private network |
 | Dataset/result storage | Railway volume `lorde-data` at `/data` | served via signed Gateway URLs |
 | Model (staging Serve) | Railway `lorde-serve`: llama.cpp `ghcr.io/ggml-org/llama.cpp:server`, CPU, private network only, volume `lorde-models` | `http://lorde-serve.railway.internal:8080/v1` |
 
-Supabase was skipped: the organization is at the free plan's two-project limit. Without it the Console has no
-sign-in and shows demo data; the status page and the playground (with your own API key) use the live Gateway.
+Accounts (11 Nov): Supabase project `lorde` in a second Supabase account (the first is at the free plan's two-project
+limit). Migrations 0001-0004 were applied through the Management API; the Gateway moved from Railway Postgres to it
+(`LORDE_DB_SHIM=0`) and re-created the bootstrap org and admin key there. Auth settings: site URL
+https://lorde-console.vercel.app, redirect allow-list `https://lorde-console.vercel.app/**`, email confirmation on,
+passwords of 8+ characters. GitHub sign-in needs an OAuth app (callback
+`https://kmizhjblteiqsuwzbgvt.supabase.co/auth/v1/callback`) entered under Authentication → Providers → GitHub.
+Supabase's built-in mailer allows only a few emails per hour; add custom SMTP before real traffic. The Railway
+`Postgres` service is no longer used.
+
+Verified live with a temporary confirmed account (deleted afterwards): `/console/*` while signed out → `/signin`;
+wrong password → "Wrong email or password."; sign-in → the account's own organization (no demo banner); a key created in
+the Console authenticates at the Gateway (200); `/signin` while signed in → `/console`; sign-out → `/signin`. Keys
+revoked in the Console stop working at the Gateway within its 60 s lookup cache.
 
 ## What was verified live
 
