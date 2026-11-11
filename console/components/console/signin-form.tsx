@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { Button, LinkButton } from "@/components/ui";
+import { friendlyAuthError } from "@/lib/auth-errors";
 
 export type AuthMode = "signin" | "signup";
 type Method = "password" | "link";
@@ -29,6 +30,13 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
   const [email, setEmail] = useState(""), [password, setPassword] = useState(""), [confirm, setConfirm] = useState("");
   const [msg, setMsg] = useState<{ text: string; error?: boolean } | null>(null);
   const [busy, setBusy] = useState<string | null>(null), [slow, setSlow] = useState(false);
+  /** Address that may need its confirmation email again (after sign-up, or "email not confirmed" at sign-in). */
+  const [resendTo, setResendTo] = useState<string | null>(null), [cooldown, setCooldown] = useState(0);
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const t = setTimeout(() => setCooldown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [cooldown]);
   useEffect(() => {
     setSlow(false);
     if (!busy) return;
@@ -51,7 +59,8 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    setMsg(null);
+    if (busy) return;
+    setMsg(null); setResendTo(null);
     if (method === "password" && signup) {
       if (password.length < MIN_PASSWORD) return setMsg({ text: `Use at least ${MIN_PASSWORD} characters.`, error: true });
       if (password !== confirm) return setMsg({ text: "The passwords do not match.", error: true });
@@ -73,6 +82,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
           setMsg({ text: "An account with this email already exists. Sign in instead.", error: true });
         } else {
           setMsg({ text: "Check your email to confirm your address, then you are signed in." });
+          setResendTo(email); setCooldown(60);
         }
       } else {
         const { error } = await withTimeout(sb.auth.signInWithPassword({ email, password }), GIVE_UP_MS);
@@ -80,7 +90,25 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
         return router.replace(next);
       }
     } catch (err) {
-      setMsg({ text: friendly(err), error: true });
+      const f = friendly(err);
+      setMsg({ text: f.text, error: true });
+      if (f.unconfirmed) setResendTo(email);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function resend() {
+    if (!resendTo || busy || cooldown > 0) return;
+    setBusy("Sending email…");
+    setMsg(null);
+    try {
+      const { error } = await withTimeout((await client()).auth.resend({ type: "signup", email: resendTo, options: { emailRedirectTo: redirect() } }), GIVE_UP_MS);
+      if (error) throw error;
+      setMsg({ text: `Sent a new confirmation email to ${resendTo}. It can take a few minutes; check spam too.` });
+      setCooldown(60);
+    } catch (err) {
+      setMsg({ text: friendly(err).text, error: true });
     } finally {
       setBusy(null);
     }
@@ -88,6 +116,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
 
   async function forgot() {
     if (!email) return setMsg({ text: "Enter your email first, then choose “Forgot password”.", error: true });
+    if (busy) return;
     setBusy("Sending email…");
     setMsg(null);
     try {
@@ -95,7 +124,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
       if (error) throw error;
       setMsg({ text: "If that email has an account, a reset link is on its way." });
     } catch (err) {
-      setMsg({ text: friendly(err), error: true });
+      setMsg({ text: friendly(err).text, error: true });
     } finally {
       setBusy(null);
     }
@@ -103,7 +132,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
 
   async function github() {
     const { error } = await (await client()).auth.signInWithOAuth({ provider: "github", options: { redirectTo: redirect() } });
-    if (error) setMsg({ text: friendly(error), error: true });
+    if (error) setMsg({ text: friendly(error).text, error: true });
   }
 
   const other = signup ? "/signin" : "/signup";
@@ -159,6 +188,14 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
         </p>
       )}
       {msg && <p role={msg.error ? "alert" : "status"} className={clsx("text-sm", msg.error ? "text-reject" : "text-muted")}>{msg.text}</p>}
+      {resendTo && (
+        <p className="text-sm text-muted">
+          No email from us?{" "}
+          <button type="button" onClick={resend} disabled={!!busy || cooldown > 0} className="font-medium text-accent hover:underline disabled:text-faint disabled:no-underline">
+            {cooldown > 0 ? `Resend confirmation email (${cooldown} s)` : "Resend confirmation email"}
+          </button>
+        </p>
+      )}
       <p className="text-sm text-muted">
         {signup ? "Already have an account? " : "New to Lorde? "}
         <Link href={`${other}${nextQs}`} className="font-medium text-accent hover:underline">{signup ? "Sign in" : "Create an account"}</Link>
@@ -167,14 +204,9 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
   );
 }
 
-function friendly(err: unknown): string {
+function friendly(err: unknown) {
   if (err instanceof SlowEmail) {
-    return "No answer from the sign-in service yet. If an email arrives in the next few minutes, its link works; otherwise try again.";
+    return { text: "No answer from the sign-in service yet. If an email arrives in the next few minutes, its link works; otherwise try again." };
   }
-  const m = err instanceof Error ? err.message : String(err);
-  if (/invalid login credentials/i.test(m)) return "Wrong email or password.";
-  if (/email not confirmed/i.test(m)) return "Confirm your email first: open the link we sent you.";
-  if (/signups not allowed|otp.*disabled/i.test(m)) return "No account with this email yet. Create an account first.";
-  if (/rate limit|too many/i.test(m)) return "Email limit reached for now (a few emails per hour). Use the link already sent, sign in with GitHub, or try again later.";
-  return m;
+  return friendlyAuthError(err);
 }

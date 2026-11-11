@@ -30,8 +30,3 @@ export function AuthPage({ title, lead, error, children }: { title: string; lead
     </div>
   );
 }
-
-/** Only same-site Console paths are allowed as a post-sign-in destination. */
-export function safeNext(v: unknown): string {
-  return typeof v === "string" && v.startsWith("/console") && !v.startsWith("//") ? v : "/console";
-}

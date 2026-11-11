@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
 
-import { AuthPage, safeNext } from "@/components/console/auth-page";
+import { AuthPage } from "@/components/console/auth-page";
 import { SignInForm } from "@/components/console/signin-form";
 import { supabaseEnabled } from "@/lib/env";
+import { safeNext } from "@/lib/safe-next";
 
 export const metadata: Metadata = { title: "Create account" };
 

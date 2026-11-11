@@ -5,6 +5,7 @@ import { useState } from "react";
 
 import { MIN_PASSWORD } from "@/components/console/signin-form";
 import { Button } from "@/components/ui";
+import { friendlyAuthError } from "@/lib/auth-errors";
 
 const input = "h-11 w-full rounded-xl border border-line px-3.5 text-[15px]";
 
@@ -21,7 +22,7 @@ export function ResetForm() {
     const { supabaseBrowser } = await import("@/lib/supabase/client");
     const { error } = await supabaseBrowser().auth.updateUser({ password });
     setBusy(false);
-    if (error) return setMsg(/session/i.test(error.message) ? "This reset link has expired. Request a new one from the sign-in page." : error.message);
+    if (error) return setMsg(/session/i.test(error.message) ? "This reset link has expired. Request a new one from the sign-in page." : friendlyAuthError(error).text);
     router.replace("/console");
   }
   return (

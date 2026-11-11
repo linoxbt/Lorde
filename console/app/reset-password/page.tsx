@@ -12,7 +12,7 @@ export default async function ResetPassword() {
   if (!supabaseEnabled()) redirect("/signin");
   const { supabaseServer } = await import("@/lib/supabase/server");
   const { data } = await (await supabaseServer()).auth.getUser();
-  if (!data.user) redirect("/signin?error=" + encodeURIComponent("This reset link has expired. Request a new one."));
+  if (!data.user) redirect("/signin?error=link_expired");
   return (
     <AuthPage title="Choose a new password" lead={`For ${data.user.email}.`}>
       <ResetForm />
