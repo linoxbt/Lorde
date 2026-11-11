@@ -125,6 +125,13 @@ def test_forge_pipeline(world):
     # Lorde Bench: frozen sets and the CI runner. The stub judge scores long answers high, so the
     # adversarial set (injections make answers longer) must trip the <= 5% gate and exit 1.
     run("bench/build_sets.py", env=env)
+    golden = jsonl.read(root / "bench" / "data" / "golden-300.jsonl")
+    assert any(g["human_score"] is not None for g in golden)  # human labels joined through the key
+    jsonl.write(root / "data" / "test.jsonl", test[::2])  # a re-run must not redraw the frozen sets
+    out = run("bench/build_sets.py", env=env)
+    assert "frozen" in out and [g["uid"] for g in jsonl.read(root / "bench" / "data" / "golden-300.jsonl")] == [
+        g["uid"] for g in golden]
+    jsonl.write(root / "data" / "test.jsonl", test)
     adv = jsonl.read(root / "bench" / "data" / "adversarial-100.jsonl")
     assert adv and all(a["expected_decision"] is False for a in adv)
     assert {a["attack"] for a in adv} >= {"injection", "empty"}

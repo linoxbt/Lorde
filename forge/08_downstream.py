@@ -12,7 +12,7 @@ Tiny Aya Base learns to answer questions from a source passage (AlignTune, or
 (Wikipedia articles never used anywhere else), and AuditKIT scores the answers:
 ``f1_score`` against the reference answer and ``lexical_groundedness`` against
 the source. AuditKIT's paired bootstrap tests lorde vs ungated (should be better,
-p < 0.05) and lorde vs teacher (should be within 2% relative).
+p < 0.05) and lorde vs teacher (should be within ±2% relative; undefined if the teacher's F1 is 0).
 
 Writes runs/downstream/<set>/, results/downstream/preds_<set>.jsonl and
 results/downstream.{json,md}.
@@ -209,14 +209,22 @@ def stage_score(args) -> None:
                 m: audit.run_significance(runs[base], runs[cand], m) for m in ("f1_score", "lexical_groundedness")}
     if cand in report["metrics"] and "teacher" in report["metrics"]:
         t, c = report["metrics"]["teacher"]["f1_score"], report["metrics"][cand]["f1_score"]
-        report["f1_relative_to_teacher"] = round((c - t) / t, 4) if t else None
-        report["within_2pct_of_teacher"] = t == 0 or (c - t) / t >= -0.02
+        report["f1_relative_to_teacher"], report["within_2pct_of_teacher"] = within_2pct(t, c)
     s = report["significance"].get(f"{cand} vs ungated", {}).get("f1_score", {})
     if s:
         report["better_than_ungated_p05"] = bool(s.get("significant") and s.get("delta", 0) > 0)
     jsonl.write_json(config.RESULTS / "downstream.json", report)
     (config.RESULTS / "downstream.md").write_text(render_md(report), encoding="utf-8")
     print(f"[downstream] wrote {config.RESULTS / 'downstream.md'}")
+
+
+def within_2pct(teacher_f1: float, lorde_f1: float) -> tuple[float | None, bool | None]:
+    """(relative difference, criterion met). Two-sided ("within 2% relative"), and undefined, not vacuously
+    met, when the teacher-gated F1 is 0."""
+    if not teacher_f1:
+        return None, None
+    rel = (lorde_f1 - teacher_f1) / teacher_f1
+    return round(rel, 4), abs(rel) <= 0.02
 
 
 def render_md(r: dict) -> str:
@@ -228,9 +236,12 @@ def render_md(r: dict) -> str:
              table(["Training data", "Rows", "F1", "Groundedness"],
                    [[n, r["train_rows"].get(n, "–"), fmt(v.get("f1_score")), fmt(v.get("lexical_groundedness"))]
                     for n, v in m.items()]), ""]
-    if "f1_relative_to_teacher" in r:
+    if r.get("f1_relative_to_teacher") is not None:
         lines.append(f"Lorde-gated F1 relative to teacher-gated: **{r['f1_relative_to_teacher'] * 100:+.1f}%** "
-                     f"(criterion: within 2%; {'met' if r['within_2pct_of_teacher'] else 'not met'}).\n")
+                     f"(criterion: within ±2%; {'met' if r['within_2pct_of_teacher'] else 'not met'}).\n")
+    elif "f1_relative_to_teacher" in r:
+        lines.append("Lorde-gated F1 relative to teacher-gated: undefined (teacher-gated F1 is 0), so the "
+                     "within-2% criterion is not measured.\n")
     if "better_than_ungated_p05" in r:
         lines.append(f"Lorde-gated beats ungated with p < 0.05: **{fmt(r['better_than_ungated_p05'])}**.\n")
     if r["significance"]:

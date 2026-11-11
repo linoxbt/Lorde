@@ -124,3 +124,14 @@ def test_article_without_kappa_does_not_crash(tmp_path, monkeypatch):
     assert "κ undefined" in art.tldr()
     assert art.gpu_class("Tesla T4") == "t4" and art.gpu_class("NVIDIA L4") == "l4"
     assert art.gpu_class("NVIDIA A100-SXM4-40GB") is None
+
+
+def test_downstream_within_2pct_is_two_sided():
+    ds = load("forge/08_downstream.py")
+    assert ds.within_2pct(0.5, 0.505) == (0.01, True)
+    assert ds.within_2pct(0.5, 0.6)[1] is False  # better by 20% is not "within 2%"
+    assert ds.within_2pct(0.5, 0.48)[1] is False
+    assert ds.within_2pct(0.0, 0.3) == (None, None)  # not vacuously met
+    md = ds.render_md({"metrics": {}, "train_rows": {}, "significance": {}, "by_lang": {},
+                       "f1_relative_to_teacher": None, "within_2pct_of_teacher": None})
+    assert "undefined" in md
