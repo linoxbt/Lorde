@@ -1,6 +1,7 @@
 # Lorde · Kaggle kernel entry point (pushed with `kaggle kernels push -p forge/kaggle`).
 # Reads the HF token from the attached private dataset, clones the repo and runs forge/kaggle_driver.py.
-# SESSION is rewritten by forge/kaggle/push.sh before each push.
+# SESSION (and REPO / BRANCH when LORDE_REPO / LORDE_BRANCH are set) are rewritten by forge/kaggle/push.sh;
+# at run time the environment variables of the same name win.
 import glob
 import os
 import shutil
@@ -8,8 +9,8 @@ import subprocess
 import sys
 
 SESSION = "a"
-REPO = "https://github.com/linoxbt/Lorde.git"
-BRANCH = "ccr-e4bea25f-7bzaqy"
+REPO = os.environ.get("LORDE_REPO", "https://github.com/linoxbt/Lorde.git")
+BRANCH = os.environ.get("LORDE_BRANCH", "ccr-e4bea25f-7bzaqy")
 
 for name in ("hf_token", "cohere_api_key"):
     hits = glob.glob(f"/kaggle/input/**/{name}", recursive=True)

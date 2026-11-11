@@ -25,14 +25,21 @@ if [[ -z "${DTYPE:-}" ]]; then
   if [[ "$CC" -lt 8 ]]; then DTYPE=half; else DTYPE=bfloat16; fi
 fi
 
-KEY_ARGS=(); AUTH=()
-if [[ -n "${VLLM_API_KEY:-}" ]]; then
-  KEY_ARGS=(--api-key "$VLLM_API_KEY"); AUTH=(-H "Authorization: Bearer $VLLM_API_KEY")
-fi
+# The API key stays out of every command line (ps, logs): vLLM reads VLLM_API_KEY from the environment,
+# and curl gets the header from a process-substitution config file.
+export VLLM_API_KEY="${VLLM_API_KEY:-}"
+[[ -n "$VLLM_API_KEY" ]] || unset VLLM_API_KEY
+up() {  # port
+  if [[ -n "${VLLM_API_KEY:-}" ]]; then
+    curl -sf "http://localhost:$1/v1/models" -K <(printf 'header = "Authorization: Bearer %s"\n' "$VLLM_API_KEY") >/dev/null 2>&1
+  else
+    curl -sf "http://localhost:$1/v1/models" >/dev/null 2>&1
+  fi
+}
 
 start() {  # name port model extra...
   local name=$1 port=$2 model=$3; shift 3
-  if curl -sf "http://localhost:${port}/v1/models" "${AUTH[@]}" >/dev/null 2>&1; then
+  if up "$port"; then
     echo "[serve] ${name} already up on :${port}"; return
   fi
   echo "[serve] starting ${name} (${model}) on :${port} dtype=${DTYPE}"
@@ -40,10 +47,10 @@ start() {  # name port model extra...
     --served-model-name "$name" --port "$port" --dtype "$DTYPE" \
     --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "${GPU_UTIL:-0.90}" \
     --max-num-seqs "${MAX_NUM_SEQS:-64}" --generation-config vllm \
-    "${KEY_ARGS[@]}" "$@" ${VLLM_EXTRA_ARGS:-} > "logs/vllm_${name}.log" 2>&1 &
+    "$@" ${VLLM_EXTRA_ARGS:-} > "logs/vllm_${name}.log" 2>&1 &
   echo $! > "logs/vllm_${name}.pid"
   for i in $(seq 1 180); do
-    if curl -sf "http://localhost:${port}/v1/models" "${AUTH[@]}" >/dev/null 2>&1; then
+    if up "$port"; then
       echo "[serve] ${name} ready after $((i * 5))s"; return
     fi
     if ! kill -0 "$(cat "logs/vllm_${name}.pid")" 2>/dev/null; then
