@@ -6,10 +6,12 @@
     python forge/05_train_sft.py --max-samples 64 --epochs 1   # smoke test first
     python forge/05_train_sft.py --push <hf-user>/lorde-tiny-aya   # optional, private
 
-Recipe (spec Section 6): LoRA r=16, alpha=32, dropout=0.05 on all attention and
+Recipe (spec Section 6, adapted to a 16 GB T4): LoRA r=16, alpha=32, dropout=0.05 on all attention and
 MLP projections; lr 1e-4, cosine, 3% warmup, 2 epochs, effective batch 16
-(2 x 8 accumulation); loss on the assistant reply only; rows longer than 2,048
-tokens are dropped, never truncated. fp16 on T4, bf16 on L4/A100.
+(1 x 16 accumulation; the spec's 2 x 8 does not fit next to Tiny Aya's 261k-token logits); loss on the
+assistant reply only; rows longer than 1,536 tokens (the spec says 2,048) are dropped, never truncated.
+fp16 on T4, bf16 on L4/A100. Validation loss on data/sft/val.jsonl; a checkpoint every 200 steps, and a
+re-run resumes from the newest one. ``--max-samples`` takes a seeded random subset, not the first rows.
 
 Outputs runs/lorde-v1/{adapter,merged,train_meta.json}. Runs in the forge-train env.
 """
@@ -25,7 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import config, jsonl  # noqa: E402
+from lorde_forge import config, jsonl, splits  # noqa: E402
 from lorde_forge import train as T  # noqa: E402
 
 
@@ -40,7 +42,8 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--grad-accum", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--max-samples", type=int, default=0, help="smoke test on N rows")
+    ap.add_argument("--max-samples", type=int, default=0, help="train on a seeded random N rows (smoke test, budget cap)")
+    ap.add_argument("--seed", type=int, default=0, help="seed of the --max-samples subset")
     ap.add_argument("--skip-train", action="store_true", help="only merge an existing adapter")
     ap.add_argument("--push", default=None, help="HF repo id to push merged weights to (private)")
     args = ap.parse_args()
@@ -53,14 +56,16 @@ def main() -> None:
     adapter_dir, merged_dir = run / "adapter", run / "merged"
     run.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(args.base_model)
-    meta: dict = {"base_model": args.base_model, "engine": args.engine, "recipe": asdict(recipe)}
+    meta: dict = {"base_model": args.base_model, "engine": args.engine, "recipe": asdict(recipe),
+                  "max_samples": args.max_samples or None, "hardware": T.device_name(), "precision": T.precision()[0]}
 
     t0 = time.time()
     if not args.skip_train:
         paths = {}
         for name, src in (("train", args.train), ("val", args.val)):
             rows = jsonl.read(src)
-            if args.max_samples:
+            if args.max_samples:  # seeded shuffle first: the files are in language/kind order
+                rows = sorted(rows, key=lambda r: splits.bucket(str(r["uid"]), f"cap-{args.seed}"))
                 rows = rows[: args.max_samples if name == "train" else max(8, args.max_samples // 10)]
             keep, dropped = T.filter_by_tokens(rows, tok, recipe.max_len)
             dst = run / f"{name}.prompt_completion.jsonl"
@@ -69,7 +74,8 @@ def main() -> None:
             meta[f"{name}_rows"], meta[f"{name}_dropped_over_max_len"] = len(keep), dropped
             print(f"[train] {name}: {len(keep)} rows ({dropped} dropped for length)")
         if args.engine == "aligntune":
-            T.train_aligntune(args.base_model, paths["train"], adapter_dir, meta["train_rows"], recipe)
+            T.train_aligntune(args.base_model, paths["train"], adapter_dir, meta["train_rows"], recipe,
+                              val_path=paths["val"])
         else:
             T.train_trl(args.base_model, paths["train"], paths["val"], adapter_dir, meta["train_rows"], recipe)
         meta["train_seconds"] = round(time.time() - t0, 1)

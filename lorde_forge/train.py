@@ -1,7 +1,10 @@
 """LoRA SFT shared by step 5 (the judge) and step 8 (downstream models).
 
 AlignTune is the primary engine (TRL backend); plain TRL is the fallback. Both
-train on prompt/completion rows, so the loss covers the completion only.
+train on prompt/completion rows, so the loss covers the completion only, save a
+checkpoint every ``save_steps`` (the two newest are kept) and resume from the
+newest complete one when it exists, so a killed session loses little. Both
+report the validation loss when a validation file is given.
 Heavy imports are lazy: this module imports cleanly without torch.
 """
 
@@ -9,6 +12,7 @@ from __future__ import annotations
 
 import math
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +31,8 @@ class Recipe:
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     targets: list[str] = field(default_factory=lambda: list(LORA_TARGETS))
+    save_steps: int = 200
+    eval_steps: int = 200
 
     def warmup_steps(self, n_rows: int) -> int:
         steps = math.ceil(n_rows / (self.batch_size * self.grad_accum)) * self.epochs
@@ -44,6 +50,12 @@ def precision() -> tuple[str, bool, bool]:
     if torch.cuda.get_device_capability()[0] >= 8:
         return "bf16", False, True
     return "fp16", True, False
+
+
+def device_name() -> str | None:
+    import torch
+
+    return torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
 
 
 def torch_dtype():
@@ -93,15 +105,74 @@ def render_chat(rows: list[dict], tok) -> list[dict]:
     return out
 
 
-def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: int, r: Recipe) -> None:
+def latest_checkpoint(out_dir: Path) -> str | None:
+    """Newest complete checkpoint-N under ``out_dir`` (trainer_state.json is written last), or None."""
+    ckpts = [c for c in Path(out_dir).glob("checkpoint-*")
+             if c.name.split("-")[-1].isdigit() and (c / "trainer_state.json").exists()]
+    return str(max(ckpts, key=lambda c: int(c.name.split("-")[-1]))) if ckpts else None
+
+
+@contextmanager
+def resume_trl_from(checkpoint: str | None):
+    """AlignTune 0.1.32 calls ``trl.SFTTrainer.train()`` without arguments and has no resume option; while
+    this is active, that call resumes from ``checkpoint`` (an explicit argument still wins)."""
+    if not checkpoint:
+        yield
+        return
+    import trl
+
+    cls = trl.SFTTrainer
+    original = cls.train
+
+    def train(self, resume_from_checkpoint=None, *args, **kwargs):
+        return original(self, resume_from_checkpoint or checkpoint, *args, **kwargs)
+
+    cls.train = train
+    try:
+        yield
+    finally:
+        cls.train = original
+
+
+def attach_validation(trainer, train_path: Path, val_path: Path) -> bool:
+    """Give an AlignTune trainer our validation split (processed exactly like the training rows) as its eval
+    set. AlignTune only splits off random validation rows itself; ours is grouped by prompt like the test set."""
+    ds_cfg = trainer.config.dataset
+    try:
+        if getattr(trainer, "model", None) is None:
+            trainer.setup_model()
+        ds_cfg.name = str(val_path)
+        trainer.setup_data()
+        val = trainer.train_dataset
+        ds_cfg.name = str(train_path)
+        trainer.setup_data()
+        trainer.dataset, trainer.eval_dataset = trainer.train_dataset, val
+        print(f"[train] validation loss on {len(val)} rows every eval step")
+        return True
+    except Exception as e:  # noqa: BLE001  (AlignTune internals: never lose the training run over eval)
+        print(f"[train] no validation loss with AlignTune ({type(e).__name__}: {e}); training without it")
+        ds_cfg.name = str(train_path)
+        trainer.dataset = trainer.eval_dataset = None
+        return False
+
+
+def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: int, r: Recipe,
+                    val_path: Path | None = None) -> None:
     from aligntune.core.backend_factory import create_sft_trainer
     from transformers import AutoTokenizer
 
     from . import jsonl
 
+    tok = AutoTokenizer.from_pretrained(base_model)
     rendered = train_path.with_name(train_path.stem + ".rendered.jsonl")
-    jsonl.write(rendered, render_chat(jsonl.read(train_path), AutoTokenizer.from_pretrained(base_model)))
+    jsonl.write(rendered, render_chat(jsonl.read(train_path), tok))
     train_path = rendered
+    if val_path is not None and jsonl.read(val_path):
+        val_rendered = val_path.with_name(val_path.stem + ".rendered.jsonl")
+        jsonl.write(val_rendered, render_chat(jsonl.read(val_path), tok))
+        val_path = val_rendered
+    else:
+        val_path = None
     prec, fp16, bf16 = precision()
     trainer = create_sft_trainer(
         model_name=base_model, dataset_name=str(train_path), backend="trl", output_dir=str(out_dir),
@@ -110,10 +181,17 @@ def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: in
         warmup_steps=r.warmup_steps(n_rows), max_seq_length=r.max_len, use_peft=True, lora_r=r.lora_r,
         lora_alpha=r.lora_alpha, lora_dropout=r.lora_dropout, lora_target_modules=r.targets,
         precision=prec, fp16=fp16, bf16=bf16, gradient_checkpointing=True, completion_only_loss=True,
-        packing=False, eval_strategy="no", load_best_model_at_end=False, save_interval=200,
+        packing=False, eval_strategy="steps" if val_path else "no", eval_interval=r.eval_steps,
+        load_best_model_at_end=False, save_interval=r.save_steps, save_total_limit=2,
         logging_steps=10, seed=42,
     )
-    trainer.train()
+    if val_path is not None:
+        attach_validation(trainer, train_path, val_path)
+    last = latest_checkpoint(out_dir)
+    if last:
+        print(f"[train] resuming from {last}")
+    with resume_trl_from(last):
+        trainer.train()
     trainer.save_model(str(out_dir))
 
 
@@ -133,16 +211,15 @@ def train_trl(base_model: str, train_path: Path, val_path: Path | None, out_dir:
         per_device_eval_batch_size=r.batch_size, gradient_accumulation_steps=r.grad_accum, learning_rate=r.lr,
         lr_scheduler_type="cosine", warmup_steps=r.warmup_steps(n_rows), max_length=r.max_len,
         completion_only_loss=True, packing=False, fp16=fp16, bf16=bf16, gradient_checkpointing=True,
-        logging_steps=10, eval_strategy="steps" if val_path else "no", eval_steps=100, save_strategy="steps",
-        save_steps=200, save_total_limit=2, report_to="none", seed=42,
+        logging_steps=10, eval_strategy="steps" if val_path else "no", eval_steps=r.eval_steps,
+        save_strategy="steps", save_steps=r.save_steps, save_total_limit=2, report_to="none", seed=42,
         model_init_kwargs={"dtype": torch_dtype()},
     )
     peft_cfg = LoraConfig(r=r.lora_r, lora_alpha=r.lora_alpha, lora_dropout=r.lora_dropout,
                           target_modules=r.targets, task_type="CAUSAL_LM")
     trainer = SFTTrainer(model=base_model, args=cfg, train_dataset=ds["train"],
                          eval_dataset=ds.get("validation"), peft_config=peft_cfg)
-    ckpts = sorted(out_dir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
-    last = str(ckpts[-1]) if ckpts else None
+    last = latest_checkpoint(out_dir)
     if last:
         print(f"[train] resuming from {last}")
     trainer.train(resume_from_checkpoint=last)
