@@ -32,12 +32,17 @@ def _lang(row: dict) -> str | None:
 
 
 def stamp_ids(src: Path, fmt: str, dst_dir: Path, max_rows: int | None = None,
-              langs: dict[int, str] | None = None) -> tuple[Path, int]:
+              langs: dict[int, str] | None = None, keep: int | None = None) -> tuple[Path, int]:
     """Copy the dataset with an ``id`` per row (CuratorKIT keeps it), so judgments map back to rows.
 
     Streams row by row (Parquet: batch by batch), so the input is never held in memory; stops with
     TooManyRows past ``max_rows``; records each row's ``lang`` (or ``language``) field into ``langs``.
+    With ``keep`` only the first ``keep`` rows are copied (the org's daily quota allows no more); the rest
+    are still counted. Returns (copy, rows in the input).
     """
+    def kept(n: int) -> bool:
+        return keep is None or n < keep
+
     def check(n: int) -> None:
         if max_rows is not None and n > max_rows:
             raise TooManyRows(f"dataset has more than {max_rows} rows (LORDE_JOB_MAX_ROWS); "
@@ -58,8 +63,9 @@ def stamp_ids(src: Path, fmt: str, dst_dir: Path, max_rows: int | None = None,
                 row = json.loads(line)
                 if isinstance(row, dict):
                     row["id"] = f"row-{n}"
-                note(n, row)
-                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if kept(n):
+                    note(n, row)
+                    out.write(json.dumps(row, ensure_ascii=False) + "\n")
                 n += 1
         return dst, n
     if fmt == "csv":
@@ -73,8 +79,9 @@ def stamp_ids(src: Path, fmt: str, dst_dir: Path, max_rows: int | None = None,
             for row in rd:
                 check(n + 1)
                 row["id"] = f"row-{n}"
-                note(n, row)
-                w.writerow(row)
+                if kept(n):
+                    note(n, row)
+                    w.writerow(row)
                 n += 1
         return dst, n
     if fmt == "parquet":
@@ -97,10 +104,13 @@ def stamp_ids(src: Path, fmt: str, dst_dir: Path, max_rows: int | None = None,
                         for i, v in enumerate(t.column(col).to_pylist()):
                             note(n + i, {"lang": v})
                 t = t.append_column("id", pa.array([f"row-{n + i}" for i in range(t.num_rows)]))
+                rows = t.num_rows
+                if keep is not None:
+                    t = t.slice(0, max(0, keep - n))
                 if writer is None:
                     writer = pq.ParquetWriter(dst, t.schema)
                 writer.write_table(t)
-                n += t.num_rows
+                n += rows
         finally:
             if writer is not None:
                 writer.close()
@@ -136,16 +146,19 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     max_rows = job.get("max_rows")
+    quota_rows = job.get("quota_rows")  # the org's daily quota allows judging only this many rows
     langs: dict[int, str] = {}
     if job.get("input_path"):
         try:
-            stamped, n_rows = stamp_ids(Path(job["input_path"]), job.get("format", "jsonl"), job_dir, max_rows, langs)
+            stamped, n_rows = stamp_ids(Path(job["input_path"]), job.get("format", "jsonl"), job_dir, max_rows, langs,
+                                        keep=quota_rows)
         except TooManyRows as e:
             print(f"error: {e}", file=sys.stderr)
             sys.exit(3)
         dataset = str(stamped)
     else:
         dataset, n_rows = job["hf_dataset"], -1  # Hub datasets: CuratorKIT reads at most max_rows samples
+    samples = max_rows if quota_rows is None else min(x for x in (max_rows, quota_rows) if x is not None)
     concurrency = max(1, int(job.get("judge_concurrency") or 16))
 
     judge: Any = {"model": f"openai/{job['served_model']}", "api_base": job["vllm_base_url"],
@@ -163,7 +176,7 @@ def main() -> None:
         hallucination_llm=cast(Any, {"extra_body": {"response_format": response_format("grounding")}}),
         judge_on_error="reject",
         judge_concurrency=concurrency,
-        max_samples=max_rows,
+        max_samples=samples,
         pii_pseudonymize=bool(opts.get("pii")),
         dedup=opts.get("dedup", "exact"),
         clean=False,
@@ -222,6 +235,12 @@ def main() -> None:
                "rejection_reasons": dict(reasons),
                "judge_errors": sum(v for k, v in reasons.items() if k.startswith("judge_error")),
                "wall_s": round(res.wall_clock_seconds, 1), "gates": gates, "options": opts}
+    if quota_rows is not None and (n_rows > quota_rows or (n_rows < 0 and total >= quota_rows)):
+        skipped = n_rows - quota_rows if n_rows >= 0 else None
+        summary.update({"quota_rows": quota_rows, "not_evaluated": skipped, "notice": (
+            f"{skipped if skipped is not None else 'Any further'} rows beyond the first {quota_rows} were not "
+            "evaluated: the organization's daily judgment quota (LORDE_ORG_DAILY_JUDGMENTS) allowed no more "
+            "today. They are in neither passed.jsonl nor rejected.jsonl; resubmit them after 00:00 UTC.")})
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     (out_dir / "report.md").write_text(report_md(job, summary, res), encoding="utf-8")
     for name in ("manifest.json", "lexsi_provenance.json"):
@@ -239,8 +258,10 @@ def report_md(job: dict, s: dict, res) -> str:
              f"| rows in | {s['rows_in'] if s['rows_in'] >= 0 else '–'} |", f"| evaluated | {s['evaluated']} |",
              f"| passed | {s['passed']} |", f"| rejected | {s['rejected']} |",
              f"| pass rate | {s['pass_rate'] * 100:.1f}% |" if s["pass_rate"] is not None else "| pass rate | – |",
-             f"| judge errors | {s['judge_errors']} |", "", "## Rejection reasons\n", "| reason | count |",
-             "|---|---|"]
+             f"| judge errors | {s['judge_errors']} |", ""]
+    if s.get("notice"):
+        lines += [f"> **Not evaluated:** {s['notice']}", ""]
+    lines += ["## Rejection reasons\n", "| reason | count |", "|---|---|"]
     lines += [f"| `{k}` | {v} |" for k, v in sorted(s["rejection_reasons"].items(), key=lambda x: -x[1])]
     lines += ["", "## Stage counts\n", "```", json.dumps(res.stage_counts, indent=2), "```", "",
               "Files: `passed.jsonl` (rows that cleared every gate, with scores), `rejected.jsonl` (with "

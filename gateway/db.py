@@ -199,6 +199,14 @@ class JobStore:
                                        (org_id,))).fetchone()
         return r["n"]
 
+    async def judgments_today(self, org_id: str) -> int:
+        """Judgments metered for the org since 00:00 UTC (API, MCP and jobs): the daily quota's durable view."""
+        async with self.pool.connection() as c:
+            r = await (await c.execute(
+                "select coalesce(sum(judgments), 0)::bigint as n from usage_events where org_id = %s and "
+                "created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'", (org_id,))).fetchone()
+        return int(r["n"])
+
     async def job_by_idempotency_key(self, org_id: str, key: str) -> dict | None:
         async with self.pool.connection() as c:
             return await (await c.execute("select * from jobs where org_id=%s and idempotency_key=%s",

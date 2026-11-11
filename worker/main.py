@@ -6,10 +6,22 @@ records judgments (scores only; judged text stays in the org's storage), meters 
 (source 'job'), and marks the job succeeded or failed. Every minute it re-queues jobs whose worker
 vanished; every six hours it purges data past each org's retention.
 
+Fairness (audit N1): claim_job takes jobs round-robin across orgs (0007_fairness.sql). Job judgments count
+against the org's daily quota (LORDE_ORG_DAILY_JUDGMENTS, gateway/quota.py): a job claimed when the quota is
+used up fails at once; otherwise its rows are capped to what the quota still allows (rows x enabled gates),
+the rest are reported as not evaluated in counts (``not_evaluated``, ``notice``), and the judgments made are
+added to the counter when the job finishes. Today's use is the larger of the Redis counter and the day's
+usage_events, so a Redis outage cannot reset it.
+
+Finishing (audit N5): judgments are inserted and the job marked succeeded in one transaction, and only if no
+cancel or data deletion was requested meanwhile; if one was, the job ends cancelled, no judgments are stored,
+and the uploaded result files are expired (results_expire_at = now()) so the retention purge deletes them.
+
 Isolation between tenants (audit S4/S10): one job may run for at most LORDE_JOB_MAX_SECONDS and judge
 at most LORDE_JOB_MAX_ROWS rows; inputs over LORDE_JOB_MAX_INPUT_BYTES are refused; the child calls Serve
-with LORDE_WORKER_JUDGE_CONCURRENCY (default LORDE_UPSTREAM_CONCURRENCY) and gets a minimal environment
-with no database URL, pepper, service key or HF token. Every status write is guarded by locked_by, so a
+with LORDE_WORKER_JUDGE_CONCURRENCY (default 1: the worker shares Serve with the Gateway, which leaves that
+many of LORDE_UPSTREAM_CONCURRENCY to it; see gateway/settings.py) and gets a minimal environment with no
+database URL, pepper, service key or HF token. Every status write is guarded by locked_by, so a
 worker that lost its lease cannot overwrite the job. SIGTERM stops claiming, ends the running job's child
 and puts the job back in the queue without counting the attempt.
 
@@ -38,6 +50,7 @@ from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from gateway.quota import make_quota  # noqa: E402
 from gateway.settings import Settings  # noqa: E402
 from gateway.storage import from_settings  # noqa: E402
 
@@ -96,6 +109,7 @@ class Worker:
         if self.storage is None:
             raise RuntimeError("storage is required (SUPABASE_URL + key, or LORDE_STORAGE_DIR)")
         self.poll_s, self.heartbeat_s = poll_s, heartbeat_s
+        self.quota = make_quota(self.s.redis_url)
         self.conn: Any = None  # psycopg.AsyncConnection with dict rows
         self._last_requeue = 0.0
         self._last_purge = 0.0
@@ -248,10 +262,33 @@ class Worker:
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
 
+    # ------------------------------------------------------------------ daily quota (audit N1b)
+    async def used_today(self, org: str) -> int:
+        r = await self.q("select coalesce(sum(judgments), 0)::bigint as n from usage_events where org_id = %s "
+                         "and created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'", (org,))
+        db = int(r[0]["n"]) if r else 0
+        return max(db, await self.quota.used(org)) if self.s.redis_url else db
+
+    async def quota_rows(self, job: dict) -> int | None:
+        """Rows this job may judge under the org's daily quota (None: no cap below LORDE_JOB_MAX_ROWS).
+        Raises InputRejected when not even one row fits."""
+        limit = self.s.org_daily_judgments
+        if limit <= 0:
+            return None
+        gates = max(1, sum(1 for v in (job["config"].get("gates") or {}).values() if v is not None))
+        left = max(0, limit - await self.used_today(str(job["org_id"])))
+        rows = left // gates
+        if rows < 1:
+            raise InputRejected(f"the organization's daily quota of {limit} judgments (LORDE_ORG_DAILY_JUDGMENTS) "
+                                "is used up; nothing was judged. Submit the job again after 00:00 UTC")
+        return rows if rows < self.s.job_max_rows else None
+
     async def _run(self, job: dict, jid: str, org: str, job_dir: Path) -> None:
+        quota_rows = await self.quota_rows(job)
         spec = {"id": jid, "config": job["config"], "served_model": self.s.served_model,
                 "vllm_base_url": self.s.vllm_base_url, "model_revision": job.get("model_revision") or self.s.model_label,
-                "judge_concurrency": self.s.worker_judge_concurrency, "max_rows": self.s.job_max_rows}
+                "judge_concurrency": self.s.worker_judge_concurrency, "max_rows": self.s.job_max_rows,
+                "quota_rows": quota_rows}
         spec.update(await self.fetch_input(job, job_dir))
         (job_dir / "job.json").write_text(json.dumps(spec, default=str))
         if not await self.q("update jobs set counts = counts || %s where id=%s and locked_by=%s returning id",
@@ -325,28 +362,59 @@ class Worker:
                 ctype = "text/markdown" if name.endswith(".md") else "application/json"
                 await self.storage.upload("results", path, out / name, ctype)
                 results[name.split(".")[0]] = path
-        org_row = (await self.q("select store_content from orgs where id=%s", (org,)))[0]
-        n_judg = 0
-        batch: list[tuple] = []
+        with (out / "judgments.jsonl").open(encoding="utf-8") as f:
+            n_judg = sum(1 for line in f if line.strip())
+        status = await self.finish_succeeded(job, {**summary, "progress": "done"}, results, out / "judgments.jsonl")
+        if status in ("succeeded", "cancelled"):  # the model did the work either way: meter and count it
+            await self.meter(job, n_judg, int((time.monotonic() - t0) * 1000))
+            if self.s.org_daily_judgments > 0 and self.s.redis_url:
+                await self.quota.add(org, n_judg)
+
+    async def finish_succeeded(self, job: dict, counts: dict, results: dict, judgments: Path) -> str:
+        """Store the judgments and mark the job succeeded in one transaction, unless a cancel or a data deletion
+        was requested while it ran: then mark it cancelled, store no judgments and expire the uploaded results
+        for the purge. Returns 'succeeded', 'cancelled' or 'lost' (this worker no longer holds the job)."""
+        jid, org = str(job["id"]), str(job["org_id"])
         sql = ("insert into judgments (job_id, row_idx, gate, lang, score, decision, verdict, parsed) "
                "values (%s, %s, %s, %s, %s, %s, %s, %s) on conflict (job_id, row_idx, gate) do nothing")
-        with (out / "judgments.jsonl").open(encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                j = json.loads(line)
-                batch.append((jid, j["row_idx"], j["gate"], j.get("lang"), j["score"], j["decision"],
-                              j.get("verdict"), Jsonb(parsed(j)) if org_row["store_content"] else None))
-                n_judg += 1
-                if len(batch) >= 1000:
+        async with self.conn.transaction():
+            done = await self.q(
+                "update jobs set status='succeeded', error=null, counts = counts || %s, results = %s, "
+                "finished_at=now(), locked_by=null where id=%s and locked_by=%s and not cancel_requested returning id",
+                (Jsonb(counts), Jsonb(results), jid, self.id))
+            if done:
+                store = (await self.q("select store_content from orgs where id=%s", (org,)))[0]["store_content"]
+                batch: list[tuple] = []
+                with judgments.open(encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        j = json.loads(line)
+                        batch.append((jid, j["row_idx"], j["gate"], j.get("lang"), j["score"], j["decision"],
+                                      j.get("verdict"), Jsonb(parsed(j)) if store else None))
+                        if len(batch) >= 1000:
+                            async with self.conn.cursor() as cur:
+                                await cur.executemany(sql, batch)
+                            batch = []
+                if batch:
                     async with self.conn.cursor() as cur:
                         await cur.executemany(sql, batch)
-                    batch = []
-        if batch:
-            async with self.conn.cursor() as cur:
-                await cur.executemany(sql, batch)
-        if await self.finish(job, "succeeded", counts={**summary, "progress": "done"}, results=results):
-            await self.meter(job, n_judg, int((time.monotonic() - t0) * 1000))
+                status, detail = "succeeded", {}
+            else:
+                stopped = await self.q(
+                    "update jobs set status='cancelled', counts = counts || %s, results = %s, "
+                    "results_expire_at = now(), finished_at=now(), locked_by=null "
+                    "where id=%s and locked_by=%s and cancel_requested returning id",
+                    (Jsonb({"progress": "cancelled"}), Jsonb(results), jid, self.id))
+                if not stopped:
+                    log.warning("job %s: not marked succeeded, this worker no longer holds it", jid)
+                    return "lost"
+                status, detail = "cancelled", {"reason": "cancel or deletion requested while finishing",
+                                               "results": "expired for the purge"}
+            await self.q("insert into audit_log (org_id, actor, action, target, detail) values (%s, %s, %s, %s, %s)",
+                         (org, f"worker:{self.id}", f"job.{status}", jid, Jsonb(detail)))
+        log.info("job %s %s", jid, status)
+        return status
 
     async def meter(self, job: dict, n: int, latency_ms: int) -> None:
         """One usage_events row per finished job (source 'job'), so job judgments count like API calls."""
