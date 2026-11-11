@@ -68,6 +68,12 @@ export default async function JobDetail(props: PageProps<"/console/jobs/[id]">) 
       </Card>
       {done && page && (
         <>
+          {(c.notice || (c.not_evaluated ?? 0) > 0) && (
+            <p role="status" className="rounded-xl border border-accent-soft bg-accent-wash p-4 text-sm text-accent-ink">
+              {c.notice ?? "Some rows were not evaluated."}
+              {(c.not_evaluated ?? 0) > 0 && ` ${nf.format(c.not_evaluated!)} rows were not evaluated.`}
+            </p>
+          )}
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <Kpi label="Rows in" value={nf.format(c.rows_in ?? 0)} />
             <Kpi label="Passed" value={nf.format(c.passed ?? 0)} hint={pct(c.pass_rate)} />

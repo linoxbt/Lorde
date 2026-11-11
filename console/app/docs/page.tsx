@@ -34,7 +34,7 @@ const ERRORS = [
   ["403", "forbidden", "Key revoked or lacks the scope"], ["404", "not_found", "Job or upload not in this org"],
   ["409", "conflict", "Job already finished or cancelled"], ["413", "payload_too_large", "Field, batch or upload over the limit"],
   ["422", "judge_unparseable", "The reply failed the contract (≈ 0 with structured outputs)"],
-  ["429", "rate_limited", "Token bucket empty; Retry-After is set"], ["503", "model_unavailable", "Serve unhealthy; retry with backoff"],
+  ["429", "rate_limited", "Rate limit hit, or the model is busy (\"model busy\"); Retry-After is set"], ["429", "quota_exceeded", "Daily per-organization judgment quota used up; resets 00:00 UTC (Retry-After)"], ["503", "model_unavailable", "Serve unhealthy; retry with backoff"],
 ];
 
 function H2({ id, children }: { id: string; children: React.ReactNode }) {

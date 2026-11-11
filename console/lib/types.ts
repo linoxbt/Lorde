@@ -11,6 +11,7 @@ export type Dataset = {
 export type JobCounts = {
   rows_in?: number; evaluated?: number; passed?: number; rejected?: number; pass_rate?: number | null;
   rejection_reasons?: Record<string, number>; judge_errors?: number; progress?: string; wall_s?: number;
+  notice?: string; not_evaluated?: number; quota_rows?: number;
 };
 export type Job = {
   id: string; status: JobStatus; dataset_id: string | null; dataset_name?: string;

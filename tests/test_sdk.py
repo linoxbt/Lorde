@@ -165,3 +165,23 @@ def test_sdk_does_not_resend_posts_that_may_have_run(monkeypatch):
     http, seen = scripted([httpx.ReadTimeout("slow"), httpx.Response(200, json=job)])
     assert Lorde(api_key="k", http_client=http).jobs.create(dataset_url="hf://datasets/a/b").id == "j1"
     assert len(seen) == 2 and seen[0][2] and seen[0][2] == seen[1][2]
+
+
+def test_sdk_does_not_retry_a_used_up_daily_quota(monkeypatch):
+    """A 429 quota_exceeded only resets at 00:00 UTC, so it is raised at once; other 429s are still retried."""
+    import httpx
+    import lorde.client as lc
+
+    monkeypatch.setattr(lc.time, "sleep", lambda s: None)
+    quota = httpx.Response(429, headers={"retry-after": "3600"},
+                           json={"error": {"code": "quota_exceeded", "message": "daily quota used up", "request_id": "r"}})
+    http, seen = scripted([quota])
+    with pytest.raises(LordeAPIError) as e:
+        Lorde(api_key="k", http_client=http).judge.reward("a", "b")
+    assert e.value.status == 429 and len(seen) == 1
+    busy = httpx.Response(429, headers={"retry-after": "1"},
+                          json={"error": {"code": "rate_limited", "message": "model busy, retry later", "request_id": "r"}})
+    ok = httpx.Response(200, json={"overall_score": 0.8, "decision": "pass", "threshold": 0.7, "model": "m",
+                                   "template": "t", "latency_ms": 1, "request_id": "r"})
+    http, seen = scripted([busy, ok])
+    assert Lorde(api_key="k", http_client=http).judge.reward("a", "b").passed and len(seen) == 2

@@ -28,7 +28,7 @@ async function forward(req: NextRequest, ctx: RouteContext<"/api/gateway/[...pat
   try {
     r = await fetch(`${env.gatewayUrl}/${p}${req.nextUrl.search}`, {
       method: req.method,
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      headers: relayHeaders(req, key),
       body: req.method === "GET" ? undefined : await req.text(),
       cache: "no-store",
       signal: AbortSignal.timeout(timeoutFor(p)),
@@ -50,3 +50,16 @@ async function forward(req: NextRequest, ctx: RouteContext<"/api/gateway/[...pat
 }
 
 export { forward as GET, forward as POST };
+
+/** The caller's key, plus (with a relay secret) the end user's IP so the Gateway's per-IP limit applies per user. */
+function relayHeaders(req: NextRequest, key: string): Record<string, string> {
+  const h: Record<string, string> = { authorization: `Bearer ${key}`, "content-type": "application/json" };
+  if (env.relaySecret) {
+    const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0]!.trim() || req.headers.get("x-real-ip") || "";
+    if (ip) {
+      h["x-lorde-relay-secret"] = env.relaySecret;
+      h["x-lorde-client-ip"] = ip;
+    }
+  }
+  return h;
+}

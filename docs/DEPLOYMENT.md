@@ -90,7 +90,13 @@ Migrations `0005_hardening.sql` and `0006_console.sql` were applied by the Gatew
 
 New Gateway settings (defaults): `LORDE_PUBLIC_DOCS=0`, `LORDE_ACCESS_LOG=1`, `LORDE_MODEL_REGISTRY=1`,
 `LORDE_JOB_MAX_SECONDS=3600`, `LORDE_JOB_MAX_ROWS=50000`, `LORDE_JOB_MAX_INPUT_BYTES=209715200`,
-`LORDE_WORKER_JUDGE_CONCURRENCY` (= `LORDE_UPSTREAM_CONCURRENCY`). Set in production: `LORDE_METRICS_TOKEN`.
+`LORDE_WORKER_JUDGE_CONCURRENCY=1`, `LORDE_WORKER_SHARES_UPSTREAM=1`, `LORDE_ORG_UPSTREAM_CONCURRENCY=1`,
+`LORDE_UPSTREAM_QUEUE_TIMEOUT_S=30`, `LORDE_UPSTREAM_MAX_WAITERS=32`, `LORDE_ORG_DAILY_JUDGMENTS=5000`, `LORDE_IP_RPM=300`,
+`LORDE_TRUSTED_PROXIES` (empty), `LORDE_RELAY_SECRET` (unset). Set in production (CPU llama.cpp, ~20 s per judgment,
+about 4,300 judgments a day in total): `LORDE_METRICS_TOKEN`, `LORDE_UPSTREAM_QUEUE_TIMEOUT_S=60`,
+`LORDE_UPSTREAM_MAX_WAITERS=4`, `LORDE_ORG_DAILY_JUDGMENTS=500`, `LORDE_IP_RPM=300`, `LORDE_WORKER_JUDGE_CONCURRENCY=1`,
+and `LORDE_RELAY_SECRET` (same value on Vercel, so the Console relay passes each user's IP). Migration
+`0007_fairness.sql` adds round-robin job claiming across organizations.
 Promote a model with `python -m gateway.models_cli promote <repo> <revision>`.
 
 Label service (`lorde-label`, `infra/Dockerfile.label`): `LABEL_HUB_REPO=Oxlino/lorde-work`, `LABEL_PASSWORD`,

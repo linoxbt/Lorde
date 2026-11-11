@@ -46,10 +46,18 @@ def _retry_transport(e: httpx.TransportError, method: str, idempotent: bool) -> 
 
 def _retry_status(r: httpx.Response, method: str, idempotent: bool) -> bool:
     if r.status_code == 429:
-        return True  # refused before any work was done
+        # refused before any work was done; but a used-up daily quota only resets at 00:00 UTC
+        return _error_code(r) != "quota_exceeded"
     if r.status_code == 503:
         return method == "GET" or idempotent or "retry-after" in r.headers
     return r.status_code in (502, 504) and (method == "GET" or idempotent)
+
+
+def _error_code(r: httpx.Response) -> str | None:
+    try:
+        return (r.json().get("error") or {}).get("code")
+    except Exception:  # noqa: BLE001 - non-JSON error bodies just have no code
+        return None
 
 
 def _delay(attempt: int, r: httpx.Response | None) -> float:
