@@ -12,6 +12,11 @@ Creates
   collections "Lorde models" and "Lorde datasets" (the submission form asks for both)
 
 Needs HF_TOKEN with write scope (use it only here, never in serving).
+
+The release tag is immutable: if it already exists and points at another commit than the one just
+published, the step fails; publish a new version with ``--tag v1.0.1``. Human labels are published without
+labeller names or notes. The repos stay un-gated (the hackathon requires it); the licence (CC-BY-NC-4.0) and
+the Cohere Labs Acceptable Use Policy are stated in the card metadata and at the top of every card.
 """
 
 from __future__ import annotations
@@ -25,9 +30,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import config, contract  # noqa: E402
+from lorde_forge import config, contract, human, jsonl  # noqa: E402
 
 LANG_NAMES = ", ".join(v["name"] for v in config.LANGS.values())
+LICENCE_URL = "https://cohere.com/c4ai-cc-by-nc-license"
+AUP_URL = "https://docs.cohere.com/docs/c4ai-acceptable-use-policy"
+LICENCE_BOX = f"""> **Licence: [CC-BY-NC-4.0]({LICENCE_URL}) and the [Cohere Labs Acceptable Use Policy]({AUP_URL}).**
+> Lorde is derived from Tiny Aya Global and trained on Aya Expanse outputs, so both terms apply to it:
+> non-commercial use only, and every use must follow the Acceptable Use Policy. The repository is
+> un-gated for the Lexsi hackathon; downloading it means accepting these terms."""
 
 
 def load(path: Path) -> dict:
@@ -56,15 +67,18 @@ def model_card(user: str, tag: str) -> str:
     templates = "\n".join(f"- `{t['id']}` sha256 `{t['sha256']}`" for t in fp["templates"].values())
     return f"""---
 license: cc-by-nc-4.0
+license_link: {LICENCE_URL}
 base_model: {config.STUDENT_MODEL}
 library_name: transformers
 pipeline_tag: text-generation
 language: [{", ".join(config.LANG_CODES)}]
-tags: [llm-judge, data-curation, curatorkit, aligntune, auditkit, lexsi-hackathon, tiny-aya]
+tags: [llm-judge, data-curation, curatorkit, aligntune, auditkit, lexsi-hackathon, tiny-aya, non-commercial]
 datasets: [{user}/lorde-data]
 ---
 
 # Lorde: a 3B judge for trustworthy training data
+
+{LICENCE_BOX}
 
 Lorde is **Tiny Aya Global (3.35B)** fine-tuned to run the two LLM-judge quality gates of
 [CuratorKIT](https://github.com/Lexsi-Labs/CuratorKIT): **RewardGate** (helpfulness, honesty,
@@ -132,8 +146,9 @@ Trained on these CuratorKIT templates (variable slots removed, SHA-256):
 
 ## Licence
 
-CC-BY-NC-4.0, inherited from Tiny Aya Global (and subject to the Cohere Labs Acceptable Use Policy).
-Non-commercial use only. CuratorKIT and AuditKIT are licensed under Lexsi Labs' LSAL; AlignTune is MIT.
+[CC-BY-NC-4.0]({LICENCE_URL}), inherited from Tiny Aya Global, and the
+[Cohere Labs Acceptable Use Policy]({AUP_URL}). Non-commercial use only.
+CuratorKIT and AuditKIT are licensed under Lexsi Labs' LSAL; AlignTune is MIT.
 """
 
 
@@ -142,13 +157,18 @@ def data_card(user: str) -> str:
     splits = load(config.DATA / "splits_summary.json")
     return f"""---
 license: other
-license_name: mixed-see-card
+license_name: cc-by-nc-4.0-and-cohere-aup-mixed
+license_link: {LICENCE_URL}
 language: [{", ".join(config.LANG_CODES)}]
-tags: [llm-judge, data-curation, curatorkit, lexsi-hackathon]
+tags: [llm-judge, data-curation, curatorkit, lexsi-hackathon, non-commercial]
 pretty_name: Lorde judge data
 ---
 
 # Lorde judge data
+
+> **Licence: non-commercial.** Teacher labels and generated QA come from Aya Expanse
+> ([CC-BY-NC-4.0]({LICENCE_URL}) + [Cohere Labs Acceptable Use Policy]({AUP_URL})); Wikipedia passages are
+> CC BY-SA 4.0; details below. Un-gated for the Lexsi hackathon; using the data means accepting these terms.
 
 Everything needed to reproduce [{user}/lorde-tiny-aya](https://huggingface.co/{user}/lorde-tiny-aya):
 the judge pool, teacher labels, grouped splits, human labels, the CuratorKIT plug-in runs with their
@@ -161,7 +181,7 @@ manifests and `lexsi_provenance.json`, the downstream sets, golden sets and ever
 | `labels_32b.jsonl` | Aya Expanse 32B (Cohere API) calibration slice |
 | `sft/train.jsonl`, `sft/val.jsonl` | {splits.get('train', '?')} / {splits.get('val', '?')} SFT rows (canonical JSON targets) |
 | `test.jsonl` | {splits.get('test', '?')} held-out items with teacher labels (grouped by prompt / passage) |
-| `human_sample.jsonl`, `human_labels.jsonl` | items hand-labeled with the gate rubric |
+| `human_sample.jsonl`, `human_labels.jsonl` | blind sample (opaque ids) and its hand labels with the gate rubric, keyed by test uid (labeller names and notes removed) |
 | `downstream_raw.jsonl`, `downstream_eval.jsonl` | downstream QA set and its held-out eval set |
 | `gated/<judge>/` | CuratorKIT outputs per judge: passed/rejected, manifest, `lexsi_provenance.json` |
 | `bench/` | golden-300 and adversarial-100 |
@@ -176,6 +196,17 @@ manifests and `lexsi_provenance.json`, the downstream sets, golden sets and ever
 """
 
 
+def tag_commit(api, repo_id: str, tag: str) -> str | None:
+    """The commit a tag points at, or None if the tag does not exist."""
+    refs = api.list_repo_refs(repo_id)
+    return next((t.target_commit for t in refs.tags if t.name == tag), None)
+
+
+def bump(tag: str) -> str:
+    head, _, last = tag.rpartition(".")
+    return f"{head}.{int(last) + 1}" if last.isdigit() else f"{tag}.1"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--user", required=True)
@@ -183,7 +214,8 @@ def main() -> None:
     ap.add_argument("--data-repo", default="lorde-data")
     ap.add_argument("--space-repo", default="lorde-demo")
     ap.add_argument("--model-dir", default=str(config.RUNS / config.RUN_NAME / "merged"))
-    ap.add_argument("--tag", default="v1.0.0")
+    ap.add_argument("--tag", "--version", dest="tag", default="v1.0.0",
+                    help="release tag; an existing tag is never moved (bump it to publish new weights)")
     ap.add_argument("--space", action="store_true", help="also publish space/ as a Gradio Space")
     ap.add_argument("--public", action="store_true", help="make every repo and collection public")
     ap.add_argument("--skip-model", action="store_true")
@@ -220,6 +252,11 @@ def main() -> None:
         if not (model_dir / "config.json").exists():
             sys.exit(f"no merged model at {model_dir}: run forge/05_train_sft.py")
         api.create_repo(model_id, private=private, exist_ok=True)
+        tagged = tag_commit(api, model_id, args.tag)
+        head = api.model_info(model_id).sha
+        if tagged and tagged != head:
+            sys.exit(f"[publish] tag {args.tag} already points at {tagged[:12]}, not at the head of {model_id} "
+                     f"({str(head)[:12]}). Tags are never moved: publish with a new version, e.g. --tag {bump(args.tag)}.")
         with tempfile.TemporaryDirectory() as tmp:
             stage = Path(tmp)
             shutil.copy(cards / "model_README.md", stage / "README.md")
@@ -229,10 +266,13 @@ def main() -> None:
                 shutil.copy(meta, stage / "train_meta.json")
             api.upload_folder(repo_id=model_id, folder_path=str(model_dir), commit_message=f"Lorde {args.tag} weights")
             api.upload_folder(repo_id=model_id, folder_path=str(stage), commit_message="Model card and fingerprints")
-        try:
-            api.create_tag(model_id, tag=args.tag, tag_message=f"Lorde {args.tag}")
-        except Exception as e:  # noqa: BLE001  (tag exists)
-            print(f"[publish] tag {args.tag}: {e}")
+        head = api.model_info(model_id).sha
+        if tagged is None:
+            api.create_tag(model_id, tag=args.tag, revision=head, tag_message=f"Lorde {args.tag}")
+        elif tagged != head:
+            sys.exit(f"[publish] these weights/card are on main ({str(head)[:12]}) but tag {args.tag} still points at "
+                     f"{tagged[:12]}: the card's `--revision {args.tag}` would serve the old model. Re-run with "
+                     f"--tag {bump(args.tag)}.")
         visibility(model_id, "model")
         print(f"[publish] model -> https://huggingface.co/{model_id} (revision {args.tag})")
 
@@ -242,10 +282,12 @@ def main() -> None:
         stage = Path(tmp)
         shutil.copy(cards / "data_README.md", stage / "README.md")
         for name in ("pool.jsonl", "labels.jsonl", "labels_32b.jsonl", "test.jsonl", "human_sample.jsonl",
-                     "human_labels.jsonl", "downstream_raw.jsonl", "downstream_eval.jsonl", "pool_stats.json",
-                     "splits_summary.json"):
+                     "downstream_raw.jsonl", "downstream_eval.jsonl", "pool_stats.json", "splits_summary.json"):
             if (config.DATA / name).exists():
                 shutil.copy(config.DATA / name, stage / name)
+        if (config.DATA / "human_labels.jsonl").exists():  # scores and verdicts only: no names, no notes
+            jsonl.write(stage / "human_labels.jsonl", human.public_labels(
+                jsonl.read(config.DATA / "human_labels.jsonl"), config.DATA / "human_sample_key.jsonl"))
         for sub in ("sft", "gated"):
             if (config.DATA / sub).exists():
                 shutil.copytree(config.DATA / sub, stage / sub, ignore=shutil.ignore_patterns("_input", "*.tmp"))
