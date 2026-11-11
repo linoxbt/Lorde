@@ -8,7 +8,7 @@ LORDE_TEST_PG_URL=postgresql://postgres@127.0.0.1:54329/postgres
 import json
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -45,7 +45,8 @@ def as_user(conn, uid):
 
 def signup(url, email):
     with admin(url) as c:
-        uid = c.execute("insert into auth.users (email) values (%s) returning id", (email,)).fetchone()[0]
+        uid = c.execute("insert into auth.users (email, email_confirmed_at) values (%s, now()) returning id",
+                        (email,)).fetchone()[0]  # orgs are created once the email is confirmed (0005)
         org = c.execute("select org_id from org_members where user_id = %s", (uid,)).fetchone()[0]
     return uid, org
 
@@ -58,8 +59,9 @@ def add_member(url, org, uid, role):
 def seed_org(url, org):
     """A finished job with results and judgments, a queued and a running job, a dataset and usage."""
     with admin(url) as c:
-        did = c.execute("insert into datasets (org_id, storage_path, name) values (%s, %s, 'd.jsonl') returning id",
-                        (org, f"{org}/d/d.jsonl")).fetchone()[0]
+        did = uuid.uuid4()  # storage_path must be org_id/id/name (0005 datasets_storage_path_shape)
+        c.execute("insert into datasets (id, org_id, storage_path, name) values (%s, %s, %s, 'd.jsonl')",
+                  (did, org, f"{org}/{did}/d.jsonl"))
         done = c.execute(
             "insert into jobs (org_id, dataset_id, config, status, finished_at, results) values "
             "(%s, %s, '{}', 'succeeded', now(), %s) returning id",
@@ -123,7 +125,7 @@ def test_owner_deletion_removes_content_and_reaches_the_purge(db):
         # the other org is untouched
         assert n("select count(*) from judgments j join jobs b on b.id=j.job_id where b.org_id=%s", org_b) == 4
         rows = c.execute("select kind, id, path from expired_objects() where org_id=%s", (org,)).fetchall()
-        assert ("dataset", did, f"{org}/d/d.jsonl") in rows
+        assert ("dataset", did, f"{org}/{did}/d.jsonl") in rows
         assert {r[2] for r in rows if r[0] == "result"} == {f"{org}/j/passed.jsonl", f"{org}/j/report.md"}
         assert c.execute("select count(*) from expired_objects() where org_id=%s", (org_b,)).fetchone()[0] == 0
         # what the worker does next: delete the files, then finish_purge removes rows and records it
@@ -140,8 +142,9 @@ def test_owner_deletion_removes_content_and_reaches_the_purge(db):
 def test_retention_purge_still_works_through_the_wrapper(db):
     _, org = signup(db, "ret@x.io")
     with admin(db) as c:
-        did = c.execute("insert into datasets (org_id, storage_path, expires_at) values "
-                        "(%s, 'r/x.jsonl', now() - interval '1 day') returning id", (org,)).fetchone()[0]
+        did = uuid.uuid4()
+        c.execute("insert into datasets (id, org_id, storage_path, name, expires_at) values "
+                  "(%s, %s, %s, 'x.jsonl', now() - interval '1 day')", (did, org, f"{org}/{did}/x.jsonl"))
         rows = c.execute("select kind, id from expired_objects() where org_id=%s", (org,)).fetchall()
         assert rows == [("dataset", did)]
     with admin(db) as c:
@@ -153,7 +156,7 @@ def test_retention_purge_still_works_through_the_wrapper(db):
 def test_usage_daily_fills_days_and_isolates_orgs(db):
     a, org = signup(db, "use@x.io")
     b, _ = signup(db, "use2@x.io")
-    today = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+    today = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
     with admin(db) as c:
         for d, j in [(0, 5), (0, 2), (3, 7), (20, 100)]:
             c.execute("insert into usage_events (org_id, judgments, prompt_tokens, completion_tokens, created_at) "
