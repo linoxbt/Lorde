@@ -1,13 +1,18 @@
 """Lorde Gateway (FastAPI): ``uvicorn gateway.app:app``.
 
 Routes (spec Section 11): POST /v1/judge/{reward,grounding,batch}, POST /v1/chat/completions (OpenAI-
-compatible, for CuratorKIT and LiteLLM), GET /v1/models, /mcp (MCP Streamable HTTP), /healthz, /readyz,
-/metrics. Every response carries x-request-id; judge responses also carry x-lorde-model and
-x-lorde-template. Jobs and uploads arrive with the worker and Supabase in Phase 1/2.
+compatible, for CuratorKIT and LiteLLM), GET /v1/models, /mcp (MCP Streamable HTTP), the jobs API
+(gateway/jobs.py), /healthz, /readyz, /metrics. Every response carries x-request-id; judge responses also
+carry x-lorde-model and x-lorde-template.
+
+Request order (RequestContext): request id -> API key check for /v1/* and /mcp (malformed keys never reach
+the database; revoked keys are 403) -> body size limit while streaming (5 MB; the signed storage route
+/v1/_storage/* allows the 200 MB upload limit and streams to disk) -> route -> one JSON access log line.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -18,7 +23,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -28,17 +33,20 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from lorde_forge import contract
 
 from . import API_MAJOR, __version__
+from . import logs as lorde_logs
 from .errors import (
     Forbidden,
+    InternalError,
     InvalidRequest,
     LordeError,
     NotFound,
     PayloadTooLarge,
     RateLimited,
     Unauthenticated,
+    Unavailable,
     body,
 )
-from .keys import ApiKey, KeyStore
+from .keys import KEY_FORMAT, ApiKey, KeyStore
 from .limits import make_buckets
 from .mcp_server import build as build_mcp
 from .mcp_server import load_bench
@@ -50,7 +58,18 @@ from .settings import Settings
 from .upstream import Upstream
 
 log = logging.getLogger("lorde.gateway")
+access_log = logging.getLogger("lorde.access")
 _RID = re.compile(r"^[A-Za-z0-9_.-]{6,64}$")
+STORAGE_PREFIX = "/v1/_storage/"
+
+
+def _db_error(e: BaseException) -> bool:
+    try:
+        import psycopg
+        import psycopg_pool
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(e, psycopg.OperationalError | psycopg.InterfaceError | psycopg_pool.PoolTimeout)
 
 
 class Gateway:
@@ -66,31 +85,51 @@ class Gateway:
             from .db import JobStore, PgKeyStore, PgUsageSink, make_pool
 
             self.pool = make_pool(s.database_url)
-            self.keys = PgKeyStore(self.pool, s.key_pepper)
-            self.usage = PgUsageSink(self.pool)
+            self.keys = PgKeyStore(self.pool, s.key_pepper, s.key_cache_size)
+            self.usage = PgUsageSink(self.pool, s.usage_queue_max)
             self.jobs = JobStore(self.pool)
         else:
-            self.keys = KeyStore(s.keys_file, s.key_pepper)
+            self.keys = KeyStore(s.keys_file, s.key_pepper, s.key_cache_size)
             self.usage = UsageSink(s.usage_file)
         self.storage = from_settings(s)
         self.buckets = make_buckets(s.redis_url)
         self.metrics = Metrics()
         self.upstream = Upstream(s, transport)
         self.service = JudgeService(s, self.upstream, self.metrics)
-        self._ready: tuple[float, bool] = (0.0, False)
+        self._ready: tuple[float, dict[str, Any]] = (0.0, {})
+        self._model_task: asyncio.Task | None = None
 
-    async def authenticate(self, headers: Mapping[str, str], scope: str = "judge") -> ApiKey:
+    async def resolve_key(self, headers: Mapping[str, str]) -> ApiKey:
+        """The caller's key, or 401 (missing, malformed, unknown) / 403 (revoked) / 503 (key store down)."""
         auth = headers.get("authorization") or headers.get("Authorization") or ""
-        if not auth.lower().startswith("bearer "):
+        if not auth[:7].lower() == "bearer ":
             raise Unauthenticated("missing API key: send Authorization: Bearer lorde_sk_...")
-        key = await self.keys.averify(auth[7:].strip())
+        token = auth[7:].strip()
+        if not KEY_FORMAT.match(token):
+            raise Unauthenticated("malformed API key")
+        try:
+            key = await self.keys.alookup(token)
+        except Exception as e:
+            if _db_error(e):
+                raise Unavailable("the key store is unreachable; retry shortly", headers={"Retry-After": "5"}) from e
+            raise
         if key is None:
-            raise Unauthenticated("unknown or revoked API key")
-        if scope not in key.scopes:
+            raise Unauthenticated("unknown API key")
+        if key.revoked_at:
+            raise Forbidden("this API key has been revoked")
+        return key
+
+    async def authenticate(self, headers: Mapping[str, str], scope: str | None = "judge",
+                           state: Mapping[str, Any] | None = None) -> ApiKey:
+        key = (state or {}).get("api_key") or await self.resolve_key(headers)
+        if scope and scope not in key.scopes:
             raise Forbidden(f"this key lacks the '{scope}' scope")
         return key
 
     async def rate_limit(self, key: ApiKey, cost: int = 1) -> None:
+        if cost > key.rpm:  # can never succeed, so not a 429: the request itself is too big for this key
+            raise PayloadTooLarge(f"{cost} judgments exceed this key's limit of {key.rpm} judgments/minute; "
+                                  "send smaller batches")
         wait = await self.buckets.atake(key.prefix, key.rpm, cost)
         if wait:
             self.metrics.rate_limited.inc()
@@ -102,11 +141,68 @@ class Gateway:
                 "api_version": API_MAJOR, "gateway_version": __version__,
                 "bench": load_bench(_env_bench()), **contract.fingerprints()}
 
-    async def ready(self) -> bool:
+    # ------------------------------------------------------------------ model registry (spec FR-12)
+    async def load_active_model(self) -> bool:
+        """Adopt model_versions' active row (state='active') as the served revision; env stays the fallback."""
+        if self.pool is None or not self.s.model_registry:
+            return False
+        try:
+            async with self.pool.connection() as c:
+                r = await (await c.execute("select hf_repo, revision from model_versions where state = 'active' "
+                                           "order by promoted_at desc nulls last limit 1")).fetchone()
+        except Exception:  # noqa: BLE001
+            log.warning("could not read model_versions; keeping %s", self.s.model_label, exc_info=True)
+            return False
+        if not r:
+            return False
+        repo, rev = r["hf_repo"] or self.s.model_repo, r["revision"]
+        if (repo, rev) != (self.s.model_repo, self.s.model_revision):
+            log.info("active model from registry: %s@%s", repo, rev)
+            self.s.model_repo, self.s.model_revision = repo, rev
+        return True
+
+    def start_model_refresh(self, every_s: float = 60.0) -> None:
+        if self.pool is None or not self.s.model_registry:
+            return
+
+        async def loop():
+            while True:
+                await asyncio.sleep(every_s)
+                await self.load_active_model()
+
+        self._model_task = asyncio.create_task(loop())
+
+    # ------------------------------------------------------------------ readiness (DB, Redis, Serve)
+    async def ready(self) -> dict[str, Any]:
         now = time.monotonic()
-        if now - self._ready[0] > 5:
-            self._ready = (now, await self.upstream.ready())
-        return self._ready[1]
+        if now - self._ready[0] <= 5:
+            return self._ready[1]
+
+        async def db() -> bool | None:
+            if self.pool is None:
+                return None
+            try:
+                async with asyncio.timeout(3):
+                    async with self.pool.connection(timeout=3) as c:
+                        await c.execute("select 1")
+                return True
+            except Exception:  # noqa: BLE001
+                return False
+
+        async def redis() -> bool | None:
+            if not self.s.redis_url:
+                return None
+            try:
+                async with asyncio.timeout(3):
+                    return await self.buckets.ping()
+            except Exception:  # noqa: BLE001
+                return False
+
+        serve, d, r = await asyncio.gather(self.upstream.ready(), db(), redis())
+        checks = {"serve": serve, "database": d, "redis": r, "breaker_open": self.upstream.breaker.is_open}
+        checks["ok"] = bool(serve) and d is not False and r is not False and not checks["breaker_open"]
+        self._ready = (now, checks)
+        return checks
 
 
 def _env_bench() -> str | None:
@@ -115,42 +211,116 @@ def _env_bench() -> str | None:
     return os.environ.get("LORDE_BENCH_FILE")
 
 
+class _Disconnected(Exception):
+    pass
+
+
 class RequestContext:
-    """Pure ASGI middleware: request ids, body-size limit, latency metrics. Safe for MCP streaming."""
+    """Pure ASGI middleware (safe for MCP streaming): request ids, early key check, streaming body limit,
+    a catch-all error envelope, latency metrics and one JSON access log line per request."""
 
     def __init__(self, app: Any, gw: Gateway) -> None:
         self.app, self.gw = app, gw
 
+    @staticmethod
+    def needs_key(method: str, path: str) -> bool:
+        if method == "OPTIONS":
+            return False
+        return (path.startswith("/v1/") and not path.startswith(STORAGE_PREFIX)) or path.rstrip("/") == "/mcp"
+
+    @staticmethod
+    async def _buffer(receive, limit: int):
+        """Read the whole body (at most ``limit`` bytes, however it is framed), then replay it."""
+        chunks, total = [], 0
+        while True:
+            msg = await receive()
+            if msg["type"] == "http.disconnect":
+                raise _Disconnected
+            if msg["type"] == "http.request":
+                chunk = msg.get("body", b"")
+                total += len(chunk)
+                if total > limit:
+                    raise PayloadTooLarge(f"request body over {limit // (1024 * 1024)} MB")
+                chunks.append(chunk)
+                if not msg.get("more_body"):
+                    break
+        data, sent = b"".join(chunks), False
+
+        async def replay():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": data, "more_body": False}
+            return await receive()
+
+        return replay
+
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+        s = self.gw.s
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
         rid = headers.get("x-request-id", "")
         rid = rid if _RID.match(rid) else "req_" + secrets.token_hex(10)
-        scope.setdefault("state", {})["request_id"] = rid
-        route = scope["path"] if scope["path"].startswith(("/v1/judge", "/v1/chat", "/mcp")) else "other"
+        state = scope.setdefault("state", {})
+        state["request_id"] = rid
+        path, method = scope["path"], scope["method"]
+        route = path if path.startswith(("/v1/judge", "/v1/chat", "/mcp")) else "other"
         t0 = time.perf_counter()
-        status_holder = {"status": 500}
+        status_holder = {"status": 500, "started": False}
 
         async def send_wrapper(msg):
             if msg["type"] == "http.response.start":
-                status_holder["status"] = msg["status"]
+                status_holder["status"], status_holder["started"] = msg["status"], True
                 msg["headers"] = [*msg.get("headers", []), (b"x-request-id", rid.encode())]
             await send(msg)
 
-        cl = headers.get("content-length")
-        if cl and cl.isdigit() and int(cl) > self.gw.s.max_body_bytes:
-            err = PayloadTooLarge(f"request body over {self.gw.s.max_body_bytes // (1024 * 1024)} MB")
-            resp = JSONResponse(body(err, rid), status_code=err.status)
-            await resp(scope, receive, send_wrapper)
-        else:
+        async def reply(err: LordeError) -> None:
+            if not status_holder["started"]:
+                resp = JSONResponse(body(err, rid), status_code=err.status, headers=err.headers)
+                await resp(scope, receive, send_wrapper)
+
+        try:
+            if self.needs_key(method, path):
+                key = await self.gw.resolve_key(headers)
+                state["api_key"] = key
+            storage = path.startswith(STORAGE_PREFIX)
+            limit = s.max_upload_bytes if storage else s.max_body_bytes
+            cl = headers.get("content-length")
+            if cl and cl.isdigit() and int(cl) > limit:
+                raise PayloadTooLarge(f"request body over {limit // (1024 * 1024)} MB")
+            if not storage and method in ("POST", "PUT", "PATCH", "DELETE"):
+                receive = await self._buffer(receive, limit)
             await self.app(scope, receive, send_wrapper)
-        self.gw.metrics.requests.labels(route, str(status_holder["status"])).inc()
-        self.gw.metrics.latency.labels(route).observe(time.perf_counter() - t0)
+        except _Disconnected:
+            status_holder["status"] = 499
+        except LordeError as e:
+            await reply(e)
+        except Exception as e:  # noqa: BLE001  (the error envelope, whatever failed)
+            if _db_error(e):
+                await reply(Unavailable("a backing service is unreachable; retry shortly",
+                                        headers={"Retry-After": "5"}))
+            else:
+                if not status_holder["started"]:
+                    log.exception("unhandled error", extra={"fields": {"request_id": rid}})
+                await reply(InternalError("internal error; quote the request_id if you report it"))
+        finally:
+            dt = time.perf_counter() - t0
+            status = str(status_holder["status"])
+            self.gw.metrics.requests.labels(route, status).inc()
+            self.gw.metrics.latency.labels(route).observe(dt)
+            if s.access_log:
+                key = state.get("api_key")
+                tmpl = getattr(scope.get("route"), "path", None)
+                access_log.info("request", extra={"fields": {
+                    "method": method, "route": tmpl or ("/v1/_storage/{token}" if path.startswith(STORAGE_PREFIX)
+                                                        else route if route != "other" else path[:100]),
+                    "status": int(status), "duration_ms": round(dt * 1000, 1), "request_id": rid,
+                    "org_id": key.org_id if key else None, "key_prefix": key.prefix if key else None}})
 
 
 class McpAuth:
-    """Rejects /mcp requests without a valid key before they reach the MCP transport."""
+    """Only /mcp reaches the MCP transport (the key was checked by RequestContext; tools check scopes)."""
 
     def __init__(self, app: Any, gw: Gateway) -> None:
         self.app, self.gw = app, gw
@@ -161,9 +331,9 @@ class McpAuth:
             if scope["path"].rstrip("/") != "/mcp":
                 err = NotFound("no such route")
                 return await JSONResponse(body(err, rid), status_code=404)(scope, receive, send)
-            headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
             try:
-                await self.gw.authenticate(headers, scope="judge")
+                await self.gw.authenticate(headers, scope=None, state=scope.get("state"))
             except LordeError as e:
                 resp = JSONResponse(body(e, rid), status_code=e.status, headers=e.headers)
                 return await resp(scope, receive, send)
@@ -173,11 +343,13 @@ class McpAuth:
 def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
     s = s or Settings()
     s.check()
+    lorde_logs.setup()
     gw = Gateway(s, transport)
     mcp = build_mcp(gw)
     from mcp.server.transport_security import TransportSecuritySettings
 
-    security = (TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=s.mcp_allowed_hosts)
+    security = (TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=s.mcp_allowed_hosts,
+                                          allowed_origins=s.allowed_origins)
                 if s.mcp_allowed_hosts else TransportSecuritySettings(enable_dns_rebinding_protection=False))
     mcp_app = mcp.streamable_http_app(streamable_http_path="/mcp", stateless_http=True, json_response=True,
                                       transport_security=security)
@@ -186,20 +358,22 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
     async def lifespan(app: FastAPI):
         if gw.pool is not None:
             await gw.pool.open()
+            await gw.load_active_model()
+            gw.start_model_refresh()
         gw.usage.start()
         async with mcp.session_manager.run():
             yield
+        if gw._model_task:
+            gw._model_task.cancel()
         await gw.usage.stop()
         await gw.upstream.close()
         if gw.pool is not None:
             await gw.pool.close()
 
+    docs = {} if s.public_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
     app = FastAPI(title="Lorde Gateway", version=__version__, lifespan=lifespan,
-                  description="A 3B judge for CuratorKIT's quality gates.")
+                  description="A 3B judge for CuratorKIT's quality gates.", **docs)
     app.state.gw = gw
-    if s.allowed_origins:
-        app.add_middleware(CORSMiddleware, allow_origins=s.allowed_origins, allow_methods=["GET", "POST"],
-                           allow_headers=["Authorization", "Content-Type", "X-Request-Id"])
 
     def rid(request: Request) -> str:
         return request.scope.get("state", {}).get("request_id", "")
@@ -223,68 +397,87 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
             err.status = e.status_code
         return JSONResponse(body(err, rid(request)), status_code=err.status)
 
-    async def auth(request: Request, scope: str = "judge") -> ApiKey:
-        return await gw.authenticate(request.headers, scope)
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, e: Exception):
+        if _db_error(e):
+            err: LordeError = Unavailable("a backing service is unreachable; retry shortly",
+                                          headers={"Retry-After": "5"})
+        else:
+            log.exception("unhandled error", exc_info=e, extra={"fields": {"request_id": rid(request)}})
+            err = InternalError("internal error; quote the request_id if you report it")
+        return JSONResponse(body(err, rid(request)), status_code=err.status, headers=err.headers)
+
+    def need(scope: str):
+        async def dep(request: Request) -> ApiKey:  # runs before the body is validated
+            return await gw.authenticate(request.headers, scope, request.scope.get("state"))
+        return dep
 
     def headers(kind: str) -> dict[str, str]:
         return {"x-lorde-model": s.model_label, "x-lorde-template": contract.template_id(kind)}
 
-    def meter(key: ApiKey, route: str, n: int, status: int, usage: dict | None = None) -> None:
+    def meter(key: ApiKey, route: str, n: int, status: int, t0: float, usage: dict | None = None) -> None:
         gw.usage.record(org_id=key.org_id, api_key_id=key.id, key_prefix=key.prefix, route=route, judgments=n,
-                        status=status, model_revision=s.model_label, **(usage or {}))
+                        status=status, model_revision=s.model_label,
+                        latency_ms=int((time.perf_counter() - t0) * 1000), **(usage or {}))
 
-    async def run_judge(request: Request, kind: str, req: RewardRequest | GroundingRequest):
-        key = await auth(request)
+    async def run_judge(request: Request, key: ApiKey, kind: str, req: RewardRequest | GroundingRequest):
+        t0 = time.perf_counter()
         await gw.rate_limit(key)
         fields = req.model_dump(exclude={"threshold"})
         try:
             res, usage = await gw.service.judge(kind, fields, req.threshold, rid(request))
         except LordeError as e:
-            meter(key, f"/v1/judge/{kind}", 0, e.status)
+            meter(key, f"/v1/judge/{kind}", 0, e.status, t0)
             raise
-        meter(key, f"/v1/judge/{kind}", 1, 200, usage)
+        meter(key, f"/v1/judge/{kind}", 1, 200, t0, usage)
         return JSONResponse(res.model_dump(), headers=headers(kind))
 
     @app.post("/v1/judge/reward")
-    async def judge_reward(request: Request, req: RewardRequest):
-        return await run_judge(request, "reward", req)
+    async def judge_reward(request: Request, req: RewardRequest, key: ApiKey = Depends(need("judge"))):
+        return await run_judge(request, key, "reward", req)
 
     @app.post("/v1/judge/grounding")
-    async def judge_grounding(request: Request, req: GroundingRequest):
-        return await run_judge(request, "grounding", req)
+    async def judge_grounding(request: Request, req: GroundingRequest, key: ApiKey = Depends(need("judge"))):
+        return await run_judge(request, key, "grounding", req)
 
     @app.post("/v1/judge/batch")
-    async def judge_batch(request: Request, req: BatchRequest):
-        key = await auth(request)
+    async def judge_batch(request: Request, req: BatchRequest, key: ApiKey = Depends(need("judge"))):
+        t0 = time.perf_counter()
         if len(req.items) > s.max_batch:
             raise PayloadTooLarge(f"batch of {len(req.items)} exceeds {s.max_batch} items")
         await gw.rate_limit(key, len(req.items))
         res, usage = await gw.service.batch(req.kind, req.items, req.threshold, rid(request))
-        meter(key, "/v1/judge/batch", res.summary["total"] - res.summary["errors"], 200, usage)
+        meter(key, "/v1/judge/batch", res.summary["total"] - res.summary["errors"], 200, t0, usage)
         return JSONResponse(res.model_dump(), headers=headers(req.kind))
 
     @app.post("/v1/chat/completions")
-    async def chat(request: Request):
-        key = await auth(request)
-        await gw.rate_limit(key)
+    async def chat(request: Request, key: ApiKey = Depends(need("judge"))):
+        t0 = time.perf_counter()
         try:
             payload = json.loads(await request.body())
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise InvalidRequest("body is not JSON") from e
         if not isinstance(payload, dict):
             raise InvalidRequest("body must be a JSON object")
+        gw.service.sanitize_chat(payload)  # 400 before spending a rate-limit token
+        await gw.rate_limit(key)
         resp, template = await gw.service.chat(payload)
-        meter(key, "/v1/chat/completions", 1, 200, resp.get("usage") and {
+        meter(key, "/v1/chat/completions", 1, 200, t0, resp.get("usage") and {
             "prompt_tokens": resp["usage"].get("prompt_tokens", 0),
             "completion_tokens": resp["usage"].get("completion_tokens", 0)})
         resp["model"] = s.served_model
         return JSONResponse(resp, headers={"x-lorde-model": s.model_label, "x-lorde-template": template})
 
     @app.get("/v1/models")
-    async def models(request: Request):
-        await auth(request)
+    async def models(key: ApiKey = Depends(need(None))):  # any valid key
         return {"object": "list", "data": [{"id": s.served_model, "object": "model", "owned_by": "lorde",
                                             "revision": s.model_label}]}
+
+    @app.get("/v1/models/{model_id}")
+    async def model(model_id: str, key: ApiKey = Depends(need(None))):
+        if model_id != s.served_model:
+            raise NotFound(f"no model '{model_id}'; this Gateway serves '{s.served_model}'")
+        return {"id": s.served_model, "object": "model", "owned_by": "lorde", **gw.model_info()}
 
     @app.get("/healthz")
     async def healthz():
@@ -292,23 +485,30 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
 
     @app.get("/readyz")
     async def readyz():
-        up = await gw.ready()
-        ok = up and not gw.upstream.breaker.is_open
-        return JSONResponse({"status": "ready" if ok else "not_ready", "serve": up,
-                             "breaker_open": gw.upstream.breaker.is_open}, status_code=200 if ok else 503)
+        c = await gw.ready()
+        return JSONResponse({"status": "ready" if c["ok"] else "not_ready",
+                             **{k: v for k, v in c.items() if k != "ok"}}, status_code=200 if c["ok"] else 503)
 
     @app.get("/metrics")
     async def metrics(request: Request):
-        if s.metrics_token and request.headers.get("authorization") != f"Bearer {s.metrics_token}":
+        if s.metrics_token and not secrets.compare_digest(request.headers.get("authorization", ""),
+                                                          f"Bearer {s.metrics_token}"):
             raise NotFound("no such route")
         return PlainTextResponse(generate_latest(gw.metrics.registry).decode(),
                                  media_type="text/plain; version=0.0.4")
 
     from .jobs import build_router
 
-    app.include_router(build_router(gw))
+    app.include_router(build_router(gw, need))
     app.mount("/", McpAuth(mcp_app, gw))  # after every route: only /mcp reaches the MCP transport
-    return RequestContext(app, gw)  # type: ignore[return-value]
+    outer: Any = RequestContext(app, gw)
+    if s.allowed_origins:  # outermost, so errors raised by RequestContext (401, 413) carry CORS headers too
+        outer = CORSMiddleware(outer, allow_origins=s.allowed_origins, allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+                               allow_headers=["Authorization", "Content-Type", "X-Request-Id", "Idempotency-Key"],
+                               expose_headers=["x-request-id", "retry-after", "x-lorde-model", "x-lorde-template"],
+                               max_age=600)
+    outer.gw = gw
+    return outer  # type: ignore[no-any-return]
 
 
 def __getattr__(name: str):  # lazy module-level app for `uvicorn gateway.app:app`

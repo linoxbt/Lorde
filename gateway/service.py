@@ -8,6 +8,7 @@ decision means exactly what CuratorKIT would decide. Structured outputs are alwa
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from typing import Any
 
@@ -100,26 +101,90 @@ class JudgeService:
                            template=contract.template_id(kind), request_id=request_id), tokens
 
     # --------------------------------------------------------- OpenAI-compatible proxy
+    def sanitize_chat(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Allow-list and clamp an OpenAI chat request so the proxy stays a judge, not a general LLM.
+
+        Kept: messages, temperature (finite, clamped to [0, 0.3]), top_p, max_tokens (<= 512; also read from
+        max_completion_tokens), stop, seed, response_format and vLLM's structured_outputs / guided_json.
+        n must be 1 and stream false. Every other field (logit_bias, tools, llama.cpp sampler knobs, ...) is
+        dropped. Wrong types are 400 invalid_request.
+        """
+        if body.get("stream") not in (None, False):
+            raise InvalidRequest("streaming is not supported; send stream=false")
+        if body.get("n") not in (None, 1):
+            raise InvalidRequest("n must be 1")
+        msgs = body.get("messages")
+        if not isinstance(msgs, list) or not msgs:
+            raise InvalidRequest("messages must be a non-empty list")
+        chars = 0
+        clean_msgs = []
+        for i, m in enumerate(msgs):
+            if not isinstance(m, dict) or m.get("role") not in ("system", "user", "assistant"):
+                raise InvalidRequest(f"messages[{i}] must be an object with role system, user or assistant")
+            content = m.get("content")
+            if isinstance(content, list):  # OpenAI content parts: text only
+                if not all(isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)
+                           for p in content):
+                    raise InvalidRequest(f"messages[{i}].content parts must be text")
+                content = "".join(p["text"] for p in content)
+            if not isinstance(content, str):
+                raise InvalidRequest(f"messages[{i}].content must be a string")
+            chars += len(content)
+            clean_msgs.append({"role": m["role"], "content": content})
+        if chars > self.s.max_chat_chars:
+            from .errors import PayloadTooLarge
+
+            raise PayloadTooLarge(f"messages are limited to {self.s.max_chat_chars} characters in total")
+
+        def number(name: str, default: float | None, lo: float, hi: float) -> float | None:
+            v = body.get(name)
+            if v is None:
+                return default
+            if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v):
+                raise InvalidRequest(f"{name} must be a finite number")
+            return min(max(float(v), lo), hi)
+
+        out: dict[str, Any] = {"model": self.s.served_model, "messages": clean_msgs,
+                               "temperature": number("temperature", JUDGE_TEMPERATURE, 0.0, self.s.max_temperature)}
+        top_p = number("top_p", None, 0.0, 1.0)
+        if top_p is not None:
+            out["top_p"] = top_p if top_p > 0 else 1.0
+        mt = body.get("max_tokens", body.get("max_completion_tokens"))
+        if mt is not None and (isinstance(mt, bool) or not isinstance(mt, int) or mt < 1):
+            raise InvalidRequest("max_tokens must be a positive integer")
+        out["max_tokens"] = min(mt or self.s.max_chat_tokens, self.s.max_chat_tokens)
+        stop = body.get("stop")
+        if stop is not None:
+            if isinstance(stop, str):
+                stop = [stop]
+            if not (isinstance(stop, list) and len(stop) <= 4 and all(isinstance(x, str) and len(x) <= 64
+                                                                        for x in stop)):
+                raise InvalidRequest("stop must be a string or up to 4 strings")
+            out["stop"] = stop
+        seed = body.get("seed")
+        if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise InvalidRequest("seed must be an integer")
+            out["seed"] = seed
+        for k in ("response_format", "structured_outputs", "guided_json"):
+            if body.get(k) is not None:
+                if not isinstance(body[k], dict | str):
+                    raise InvalidRequest(f"{k} must be an object")
+                out[k] = body[k]
+        return out
+
     async def chat(self, body: dict[str, Any]) -> tuple[dict[str, Any], str]:
         """Pass-through for CuratorKIT/LiteLLM. Judge-shaped prompts get the gate's schema.
 
         Returns (upstream response, template id or "unknown").
         """
-        if body.get("stream"):
-            raise InvalidRequest("streaming is not supported; send stream=false")
-        msgs = body.get("messages")
-        if not isinstance(msgs, list) or not msgs:
-            raise InvalidRequest("messages must be a non-empty list")
-        out = dict(body)
-        out["model"] = self.s.served_model
-        temp = out.get("temperature")
-        out["temperature"] = min(float(temp), self.s.max_temperature) if temp is not None else JUDGE_TEMPERATURE
-        last = msgs[-1].get("content") if isinstance(msgs[-1], dict) else None
-        match = contract.match_template(last) if isinstance(last, str) else None
+        out = self.sanitize_chat(body)
+        last = out["messages"][-1]["content"]
+        match = contract.match_template(last)
         if match:
             kind = match[0]
             template = contract.template_id(kind)
-            if "response_format" not in out and "structured_outputs" not in (out.get("extra_body") or {}):
+            if not any(k in out for k in ("response_format", "structured_outputs", "guided_json")):
                 out["response_format"] = response_format(kind)
             self.m.template.labels("known").inc()
         else:

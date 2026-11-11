@@ -10,20 +10,33 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import shutil
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Protocol
 
 import httpx
 
 SIGNED_URL_TTL_S = 15 * 60
+CHUNK = 1024 * 1024
+
+
+class TooLarge(ValueError):
+    """An object is bigger than the caller allows."""
+
+
+async def _chunks(src: Path) -> AsyncIterator[bytes]:
+    with src.open("rb") as f:
+        while chunk := f.read(CHUNK):
+            yield chunk
 
 
 class Storage(Protocol):
     async def signed_upload(self, bucket: str, path: str) -> dict: ...
     async def signed_download(self, bucket: str, path: str) -> str: ...
-    async def download(self, bucket: str, path: str, dest: Path) -> int: ...
+    async def download(self, bucket: str, path: str, dest: Path, max_bytes: int | None = None) -> int: ...
     async def upload(self, bucket: str, path: str, src: Path, content_type: str = "application/octet-stream") -> None: ...
     async def delete(self, bucket: str, paths: list[str]) -> None: ...
 
@@ -47,7 +60,7 @@ class SupabaseStorage:
         r.raise_for_status()
         return self.base + r.json()["signedURL"]
 
-    async def download(self, bucket: str, path: str, dest: Path) -> int:
+    async def download(self, bucket: str, path: str, dest: Path, max_bytes: int | None = None) -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         n = 0
         async with self.client.stream("GET", f"{self.base}/object/{bucket}/{path}") as r:
@@ -55,13 +68,15 @@ class SupabaseStorage:
             with dest.open("wb") as f:
                 async for chunk in r.aiter_bytes():
                     n += len(chunk)
+                    if max_bytes is not None and n > max_bytes:
+                        raise TooLarge(f"object is larger than {max_bytes} bytes")
                     f.write(chunk)
         return n
 
     async def upload(self, bucket: str, path: str, src: Path, content_type: str = "application/octet-stream") -> None:
-        with src.open("rb") as f:
-            r = await self.client.post(f"{self.base}/object/{bucket}/{path}", content=f.read(),
-                                       headers={"x-upsert": "true", "content-type": content_type})
+        r = await self.client.post(f"{self.base}/object/{bucket}/{path}", content=_chunks(src),
+                                   headers={"x-upsert": "true", "content-type": content_type,
+                                            "content-length": str(src.stat().st_size)})
         r.raise_for_status()
 
     async def delete(self, bucket: str, paths: list[str]) -> None:
@@ -110,8 +125,10 @@ class LocalStorage:
     async def signed_download(self, bucket: str, path: str) -> str:
         return f"{self.public_base}/v1/_storage/{self.token('get', bucket, path)}"
 
-    async def download(self, bucket: str, path: str, dest: Path) -> int:
+    async def download(self, bucket: str, path: str, dest: Path, max_bytes: int | None = None) -> int:
         src = self._file(bucket, path)
+        if max_bytes is not None and src.stat().st_size > max_bytes:
+            raise TooLarge(f"object is larger than {max_bytes} bytes")
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dest)
         return dest.stat().st_size
@@ -124,6 +141,24 @@ class LocalStorage:
     async def delete(self, bucket: str, paths: list[str]) -> None:
         for p in paths:
             self._file(bucket, p).unlink(missing_ok=True)
+
+    async def write_stream(self, bucket: str, path: str, chunks: AsyncIterator[bytes], max_bytes: int) -> int:
+        """Stream an upload to disk (never whole in memory); the object appears only once complete."""
+        dst = self._file(bucket, path)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(f".{dst.name}.{os.getpid()}.{time.monotonic_ns()}.part")
+        n = 0
+        try:
+            with tmp.open("wb") as f:
+                async for chunk in chunks:
+                    n += len(chunk)
+                    if n > max_bytes:
+                        raise TooLarge(f"upload over {max_bytes} bytes")
+                    f.write(chunk)
+            tmp.replace(dst)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return n
 
     def write_bytes(self, bucket: str, path: str, data: bytes) -> None:
         dst = self._file(bucket, path)
