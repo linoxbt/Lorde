@@ -52,7 +52,10 @@ test("sign-in errors: only fixed messages, never text from the URL", async ({ pa
 });
 
 test("sign-in form maps Supabase errors and offers to resend the confirmation", async ({ page }) => {
-  await page.goto("/signin", { waitUntil: "networkidle" });
+  const cspErrors: string[] = [];
+  page.on("console", (m) => { if (/Content Security Policy/i.test(m.text())) cspErrors.push(m.text()); });
+  const res = await page.goto("/signin", { waitUntil: "networkidle" });
+  expect(res?.headers()["content-security-policy"]).toContain("frame-ancestors 'none'");
   await page.getByLabel("Email").fill("someone@example.com");
   await page.getByLabel("Password").fill("wrong-password");
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
@@ -64,6 +67,7 @@ test("sign-in form maps Supabase errors and offers to resend the confirmation", 
   await expect(page.getByRole("status").filter({ hasText: "Sent a new confirmation email" })).toBeVisible();
   const resend = (await calls()).find((c) => c.path === "/auth/v1/resend");
   expect(resend?.body).toMatchObject({ type: "signup", email: "unconfirmed@example.com" });
+  expect(cspErrors).toEqual([]);
 });
 
 test("email links: token_hash is verified with verifyOtp, then the user lands on next", async ({ request }) => {
@@ -100,6 +104,9 @@ test("a signed-in user in no organization sees the onboarding page, not a crash"
     await page.goto(path);
     await expect(page).toHaveURL(/\/welcome$/);
   }
+  await page.getByRole("button", { name: "Sign out" }).click();  // a form POST: allowed by the CSP's form-action
+  await expect(page).toHaveURL(/\/signin$/);
+  expect((await calls()).some((c) => c.path === "/auth/v1/logout" && c.query.scope === "local")).toBe(true);
 });
 
 test("signed in: /signin forwards to next with its query string", async ({ context, baseURL, page }) => {
