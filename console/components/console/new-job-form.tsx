@@ -6,8 +6,10 @@ import { useMemo, useState } from "react";
 import { ConnectKey } from "@/components/console/connect-key";
 import { Button, Card } from "@/components/ui";
 import { pct } from "@/lib/format";
-import { gatewayFetch } from "@/lib/gateway-client";
+import { errorMessage, gatewayFetch, getKey } from "@/lib/gateway-client";
 import type { Dataset, Judgment } from "@/lib/types";
+
+type Basis = { rows: number; sameDataset: boolean; name: string; jobId: string } | null;
 
 function Gate({ id, label, desc, on, setOn, thr, setThr, rate }:
   { id: string; label: string; desc: string; on: boolean; setOn: (b: boolean) => void; thr: number; setThr: (n: number) => void; rate: number | null }) {
@@ -33,10 +35,11 @@ function Gate({ id, label, desc, on, setOn, thr, setThr, rate }:
   );
 }
 
-export function NewJobForm({ datasets, sample, demo, preselect, sampleFrom }:
-  { datasets: Dataset[]; sample: Judgment[]; demo: boolean; preselect?: string; sampleFrom?: string }) {
+export function NewJobForm({ datasets, sample, demo, selected, basis }:
+  { datasets: Dataset[]; sample: Pick<Judgment, "gate" | "score">[]; demo: boolean; selected?: string; basis: Basis }) {
   const router = useRouter();
-  const [ds, setDs] = useState(preselect ?? datasets[0]?.id ?? "");
+  const [ds, setDs] = useState(selected ?? "");
+  const pick = (id: string) => { setDs(id); router.replace(`/console/jobs/new?dataset=${encodeURIComponent(id)}`, { scroll: false }); };
   const [g, setG] = useState(true), [gt, setGt] = useState(0.7);
   const [r, setR] = useState(true), [rt, setRt] = useState(0.7);
   const [pii, setPii] = useState(false), [dedup, setDedup] = useState("exact");
@@ -52,26 +55,38 @@ export function NewJobForm({ datasets, sample, demo, preselect, sampleFrom }:
   }, [g, gt, r, rt, sample]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function submit() {
+    if (busy) return;
     if (!g && !r) return setMsg("Enable at least one gate.");
-    setBusy(true); setMsg("");
+    if (!ds) return setMsg("Upload a dataset first.");
     const body = { upload_id: ds, gates: { grounding: g ? gt : null, reward: r ? rt : null }, options: { pii, dedup } };
-    if (demo) { setBusy(false); return setMsg(`Demo: would POST /v1/jobs ${JSON.stringify(body)}`); }
-    const res = await gatewayFetch("/v1/jobs", { method: "POST", body: JSON.stringify(body) });
-    const j = await res.json().catch(() => ({}));
-    setBusy(false);
-    if (!res.ok) return setMsg(j.error?.message ?? `Failed (${res.status})`);
-    router.push(`/console/jobs/${j.id}`);
+    if (demo) return setMsg(`Demo: would POST /v1/jobs ${JSON.stringify(body)}`);
+    if (!getKey()) return setMsg("Connect an API key with the jobs:write scope first.");
+    setBusy(true); setMsg("");
+    try {
+      const res = await gatewayFetch("/v1/jobs", { method: "POST", body: JSON.stringify(body) });
+      if (!res.ok) return setMsg(`Could not start the job: ${await errorMessage(res)}`);
+      const j = await res.json() as { id: string };
+      router.push(`/console/jobs/${j.id}`);
+    } catch {
+      setMsg("Could not reach the Console. Check your connection and try again.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
     <div className="grid gap-6 xl:grid-cols-[1fr_340px]">
       <div className="space-y-4">
-        {!demo && <ConnectKey />}
+        {!demo && <ConnectKey need={["jobs:write"]} />}
         <Card className="p-5">
           <label htmlFor="ds" className="font-medium">Dataset</label>
-          <select id="ds" value={ds} onChange={(e) => setDs(e.target.value)} className="mt-3 h-11 w-full rounded-xl border border-line bg-white px-3 text-[14px]">
-            {datasets.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
-          </select>
+          {datasets.length ? (
+            <select id="ds" value={ds} onChange={(e) => pick(e.target.value)} className="mt-3 h-11 w-full rounded-xl border border-line bg-white px-3 text-[14px]">
+              {datasets.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+            </select>
+          ) : (
+            <p className="mt-3 text-sm text-muted">No datasets yet. <a href="/console/datasets" className="text-accent hover:underline">Upload one</a> first.</p>
+          )}
         </Card>
         <div className="grid gap-4 md:grid-cols-2">
           <Gate id="g" label="Grounding gate" desc="Is every claim supported by the row's input (source)?" on={g} setOn={setG} thr={gt} setThr={setGt} rate={g ? rate("grounding", gt) : null} />
@@ -96,7 +111,9 @@ export function NewJobForm({ datasets, sample, demo, preselect, sampleFrom }:
           <p className="tnum mt-3 text-[40px] font-medium tracking-[-0.04em]">{pct(both)}</p>
           <p className="text-sm text-muted">of rows would pass both gates</p>
           <p className="mt-4 text-[12px] leading-relaxed text-muted">
-            Estimated on {sample.length || "no"} judged rows{sampleFrom ? ` from your last job (${sampleFrom})` : ""}. The real pass rate depends on your data.
+            {basis
+              ? <>Estimated on {basis.rows} judgments from {basis.sameDataset ? "the most recent job on this dataset" : <>your most recent job (on {basis.name}), not on this dataset</>}. The real pass rate depends on your data.</>
+              : "No finished job yet to estimate from: the preview appears after your first job."}
           </p>
           <Button className="mt-6 w-full" size="lg" onClick={submit} disabled={busy || !ds}>{busy ? "Starting…" : "Start job"}</Button>
           {msg && <p role="status" className="mt-3 break-words text-[12px] text-muted">{msg}</p>}

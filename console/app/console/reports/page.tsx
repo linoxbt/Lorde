@@ -3,21 +3,18 @@ import Link from "next/link";
 
 import { JobStatusBadge, PageHeader, Table } from "@/components/console/bits";
 import { Badge, Card, LinkButton } from "@/components/ui";
-import { getWorkspace } from "@/lib/data";
+import { getWorkspace, listJobs } from "@/lib/data";
 import { pct, when } from "@/lib/format";
 
 export const metadata = { title: "Reports" };
 
-const CRITERIA = [
-  ["Gate-usable rate, unconstrained", "≥ 99.0%"], ["Gate-usable rate, structured outputs", "100%"],
-  ["Decision agreement vs teacher", "≥ 90%"], ["Cohen's κ vs teacher", "≥ 0.75"], ["Grounding verdict accuracy", "≥ 85%"],
-  ["Human agreement", "≥ teacher's − 3 points"], ["Per-language agreement", "≥ 85% everywhere"],
-  ["Downstream F1 vs teacher-gated", "within 2%"], ["Adversarial-100 pass rate", "≤ 5%"],
-];
+const met = (m: boolean | null) => (m === null ? <Badge>Not measured</Badge> : m ? <Badge tone="pass">Met</Badge> : <Badge tone="reject">Not met</Badge>);
 
 export default async function Reports() {
-  const ws = await getWorkspace();
-  const done = ws.jobs.filter((j) => j.status === "succeeded");
+  const [ws, jobs] = await Promise.all([getWorkspace(), listJobs(0, { status: "succeeded" })]);
+  const done = jobs.rows;
+  const m = ws.activeModel;
+  const acceptance = Array.isArray(m?.bench?.acceptance) ? m.bench.acceptance : [];
   return (
     <>
       <PageHeader title="Reports" lead="Evidence you can hand to a reviewer: the active model's Bench report, job reports, and CuratorKIT provenance." />
@@ -25,21 +22,27 @@ export default async function Reports() {
         <Card className="p-6">
           <div className="flex items-start justify-between gap-4">
             <div>
-              <h2 className="font-medium">Lorde Bench · {ws.activeModel.repo}@{ws.activeModel.revision}</h2>
-              <p className="mt-1 text-sm text-muted">Acceptance criteria for the active revision.</p>
+              <h2 className="font-medium">Lorde Bench{m ? ` · ${m.repo ?? m.name ?? "model"}@${m.revision}` : ""}</h2>
+              <p className="mt-1 text-sm text-muted">Acceptance criteria measured for the active model revision.</p>
             </div>
             <LinkButton href="/bench" variant="secondary" size="sm">Method</LinkButton>
           </div>
-          <ul className="mt-5 divide-y divide-line text-sm">
-            {CRITERIA.map(([c, t]) => (
-              <li key={c} className="flex items-center justify-between gap-3 py-2.5">
-                <span>{c}</span>
-                <span className="flex items-center gap-2"><span className="font-mono text-[12px] text-muted">{t}</span>
-                  <Badge tone="neutral">Published with release</Badge></span>
-              </li>
-            ))}
-          </ul>
-          <p className="mt-4 text-[12px] text-muted">Measured values appear here once forge/06 and bench/run_bench.py publish results for this revision.</p>
+          {acceptance.length ? (
+            <ul className="mt-5 divide-y divide-line text-sm">
+              {acceptance.map((c) => (
+                <li key={c.criterion} className="flex items-center justify-between gap-3 py-2.5">
+                  <span>{c.criterion}{c.blocking === false && <span className="ml-1 text-[12px] text-muted">(advisory)</span>}</span>
+                  <span className="flex items-center gap-2"><span className="font-mono text-[12px] text-muted">{c.value}</span>{met(c.met)}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-5 rounded-xl bg-wash p-4 text-sm text-muted">
+              {m ? "No Bench results are recorded for this revision yet." : "No model revision is registered as active yet."}{" "}
+              Results appear here once forge/06 and bench/run_bench.py publish them to the model registry. The criteria every
+              release must meet are on the <a href="/bench" className="text-accent hover:underline">Bench page</a>.
+            </p>
+          )}
         </Card>
         <Card className="p-6">
           <h2 className="font-medium">Provenance</h2>
@@ -52,6 +55,7 @@ export default async function Reports() {
         </Card>
       </div>
       <h2 className="mb-3 mt-10 text-[18px] font-medium">Job reports</h2>
+      {jobs.total > done.length && <p className="mb-2 text-[12px] text-muted">Showing the {done.length} newest of {jobs.total} succeeded jobs.</p>}
       <Table head={["Job", "Dataset", "Status", "Pass rate", "Judge errors", "Finished", ""]} minWidth={760}>
         {done.map((j) => (
           <tr key={j.id} className="hover:bg-wash/60">

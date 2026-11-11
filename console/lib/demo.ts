@@ -107,7 +107,7 @@ export const demoReview: ReviewItem[] = [
 export function demoWorkspace(): Workspace {
   return {
     mode: "demo", org: { id: "org-demo", name: "Demo workspace", retention_days: 30, store_content: false },
-    me: { email: "you@example.com", role: "owner" }, datasets: demoDatasets, jobs: demoJobs, keys: demoKeys,
-    usage: demoUsage(), members: demoMembers, activeModel: { revision: "v1.0.0", repo: "lorde-tiny-aya" },
+    me: { id: "u1", email: "you@example.com", role: "owner" },
+    activeModel: { name: "Lorde (demo)", repo: "lorde-tiny-aya", revision: "v1.0.0", promoted_at: ago(400), bench: null },
   };
 }

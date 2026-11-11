@@ -29,7 +29,10 @@ export function ConsoleShell({ ws, children }: { ws: Workspace; children: ReactN
           {consoleNav.map((l) => <NavItem key={l.href} href={l.href} label={l.label} icon={ICONS[l.href]} />)}
         </nav>
         <div className="space-y-2 p-4 text-[12px] text-muted">
-          <p className="flex items-center gap-2"><BarChart3 className="size-3.5" /> Model <span className="font-mono text-ink-2">{ws.activeModel.repo}@{ws.activeModel.revision}</span></p>
+          <p className="flex items-center gap-2"><BarChart3 className="size-3.5" /> Model{" "}
+            {ws.activeModel
+              ? <span className="truncate font-mono text-ink-2">{ws.activeModel.repo ?? ws.activeModel.name}@{ws.activeModel.revision}</span>
+              : <Link href="/status" className="hover:text-ink">see Status</Link>}</p>
           <Link href="/docs" className="block hover:text-ink">Docs</Link>
           {ws.mode === "live" && <SignOut className="flex items-center gap-2 hover:text-ink" />}
         </div>

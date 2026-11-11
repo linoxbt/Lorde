@@ -2,55 +2,80 @@
 
 import { UploadCloud } from "lucide-react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 
 import { Table } from "@/components/console/bits";
 import { ConnectKey } from "@/components/console/connect-key";
 import { Badge, Card } from "@/components/ui";
 import { ago, bytes, nf } from "@/lib/format";
-import { gatewayFetch } from "@/lib/gateway-client";
+import { errorMessage, gatewayFetch, getKey } from "@/lib/gateway-client";
 import type { Dataset } from "@/lib/types";
 
 const OK = /\.(jsonl|json|csv|parquet)$/i;
+const MAX_BYTES = 200 * 1024 * 1024;
+type Upload = { upload_id: string; upload_url: string; method?: string; headers?: Record<string, string>; format: Dataset["format"] };
 
-export function DatasetsView({ initial, demo }: { initial: Dataset[]; demo: boolean }) {
-  const [rows, setRows] = useState(initial);
-  const [msg, setMsg] = useState("");
+/**
+ * Upload a dataset: the Gateway's POST /v1/uploads creates the dataset row and returns a signed URL plus the method
+ * and headers to use; the browser sends the file there directly. The Console never writes dataset rows itself.
+ */
+export function DatasetsView({ rows, total, demo, apiBase }: { rows: Dataset[]; total: number; demo: boolean; apiBase: string }) {
+  const router = useRouter();
+  const [local, setLocal] = useState<Dataset[]>([]);
+  const [msg, setMsg] = useState<{ text: string; error?: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
   const [over, setOver] = useState(false);
   const input = useRef<HTMLInputElement>(null);
 
   async function upload(f: File) {
-    if (!OK.test(f.name)) return setMsg("Upload a .jsonl, .csv or .parquet file.");
-    if (f.size > 200 * 1024 * 1024) return setMsg("Uploads are limited to 200 MB.");
-    setBusy(true); setMsg("");
+    if (busy) return;
+    if (!OK.test(f.name)) return setMsg({ text: "Upload a .jsonl, .csv or .parquet file.", error: true });
+    if (f.size > MAX_BYTES) return setMsg({ text: "Uploads are limited to 200 MB.", error: true });
+    if (f.size === 0) return setMsg({ text: "That file is empty.", error: true });
+    const fmt = (/\.parquet$/i.test(f.name) ? "parquet" : /\.csv$/i.test(f.name) ? "csv" : "jsonl") as Dataset["format"];
+    if (demo) {
+      setLocal((l) => [{ id: `local-${Date.now()}`, name: f.name, format: fmt, rows: null, bytes: f.size,
+        created_at: new Date().toISOString(), expires_at: null }, ...l]);
+      return setMsg({ text: "Demo: the file stayed in your browser. In a live workspace it uploads to private storage." });
+    }
+    if (!getKey()) return setMsg({ text: "Connect an API key with the jobs:write scope first.", error: true });
+    setBusy(true); setMsg({ text: `Uploading ${f.name}…` });
     try {
-      const fmt = f.name.split(".").pop()!.toLowerCase().replace("json", "jsonl").replace("jsonll", "jsonl") as Dataset["format"];
-      let rowCount: number | null = null;
-      if (fmt === "jsonl" && f.size < 50 * 1024 * 1024) rowCount = (await f.text()).split("\n").filter((l) => l.trim()).length;
-      if (demo) {
-        setRows([{ id: `local-${Date.now()}`, name: f.name, format: fmt, rows: rowCount, bytes: f.size,
-          created_at: new Date().toISOString(), expires_at: null }, ...rows]);
-        setMsg("Demo: the file stayed in your browser. In a live workspace it uploads to private storage.");
-        return;
-      }
       const r = await gatewayFetch("/v1/uploads", { method: "POST", body: JSON.stringify({ filename: f.name, bytes: f.size }) });
-      const u = await r.json();
-      if (!r.ok) throw new Error(u.error?.message ?? r.statusText);
-      // Signed URLs are absolute for Supabase Storage, relative to the Gateway for its local storage backend.
-      const target = u.upload_url.startsWith("http") ? u.upload_url : `${process.env.NEXT_PUBLIC_LORDE_API_URL ?? ""}${u.upload_url}`;
-      const put = await fetch(target, { method: "PUT", body: f });
-      if (!put.ok) throw new Error(`upload failed (${put.status})`);
-      setRows([{ id: u.upload_id, name: f.name, format: u.format, rows: rowCount, bytes: f.size, created_at: new Date().toISOString(), expires_at: null }, ...rows]);
-      setMsg("Uploaded. Start a job with it from New job.");
-    } catch (e) {
-      setMsg(`Upload failed: ${(e as Error).message}`);
-    } finally { setBusy(false); }
+      if (!r.ok) return setMsg({ text: `Upload not started: ${await errorMessage(r)}`, error: true });
+      const u = await r.json() as Upload;
+      // Signed URLs are absolute for Supabase Storage; the Gateway's local storage may return a path on the Gateway.
+      let target: string;
+      try {
+        target = new URL(u.upload_url, apiBase || undefined).toString();
+      } catch {
+        return setMsg({ text: "Upload not started: the Gateway's public URL is not configured for this Console.", error: true });
+      }
+      let put: Response;
+      try {
+        put = await fetch(target, { method: u.method || "PUT", headers: u.headers ?? {}, body: f });
+      } catch {
+        return setMsg({ text: "Upload failed: the storage server could not be reached. Try again.", error: true });
+      }
+      if (!put.ok) {
+        const reason = put.status === 413 ? "the file is larger than the server accepts" : put.status === 404 || put.status === 403
+          ? "the upload link expired or was rejected" : `the storage server answered ${put.status}`;
+        return setMsg({ text: `Upload failed: ${reason}. Try again.`, error: true });
+      }
+      setMsg({ text: `Uploaded ${f.name}. Start a job with it from New job.` });
+      router.refresh();
+    } catch {
+      setMsg({ text: "Upload failed: could not reach the Console. Check your connection and try again.", error: true });
+    } finally {
+      setBusy(false);
+    }
   }
 
+  const all = [...local, ...rows];
   return (
     <div className="space-y-6">
-      {!demo && <ConnectKey />}
+      {!demo && <ConnectKey need={["jobs:write"]} />}
       <Card
         onDragOver={(e) => { e.preventDefault(); setOver(true); }} onDragLeave={() => setOver(false)}
         onDrop={(e) => { e.preventDefault(); setOver(false); const f = e.dataTransfer.files[0]; if (f) upload(f); }}
@@ -64,21 +89,27 @@ export function DatasetsView({ initial, demo }: { initial: Dataset[]; demo: bool
         </button>
         <input ref={input} type="file" accept=".jsonl,.json,.csv,.parquet" className="sr-only" aria-label="Choose a dataset file"
           onChange={(e) => { const f = e.target.files?.[0]; if (f) upload(f); e.target.value = ""; }} />
-        {msg && <p role="status" className="mt-4 text-[13px] text-muted">{msg}</p>}
+        {msg && <p role={msg.error ? "alert" : "status"} className={`mt-4 text-[13px] ${msg.error ? "text-reject" : "text-muted"}`}>{msg.text}</p>}
       </Card>
-      <Table head={["Name", "Format", "Rows", "Size", "Uploaded", "Expires", ""]} minWidth={760}>
-        {rows.map((d) => (
-          <tr key={d.id} className="hover:bg-wash/60">
-            <td className="max-w-[300px] truncate px-4 py-3 font-medium">{d.name}</td>
-            <td className="px-4 py-3"><Badge>{d.format}</Badge></td>
-            <td className="px-4 py-3">{d.rows !== null ? nf.format(d.rows) : "–"}</td>
-            <td className="px-4 py-3">{bytes(d.bytes)}</td>
-            <td className="px-4 py-3 text-muted">{ago(d.created_at)}</td>
-            <td className="px-4 py-3 text-muted">{d.expires_at ? new Date(d.expires_at).toISOString().slice(0, 10) : "–"}</td>
-            <td className="px-4 py-3 text-right"><Link href={`/console/jobs/new?dataset=${d.id}`} className="text-[13px] font-medium text-accent hover:underline">Gate it</Link></td>
-          </tr>
-        ))}
-      </Table>
+      {all.length === 0 ? (
+        <p className="text-sm text-muted">No datasets yet.</p>
+      ) : (
+        <Table head={["Name", "Format", "Rows", "Size", "Uploaded", "Expires", ""]} minWidth={760}>
+          {all.map((d) => (
+            <tr key={d.id} className="hover:bg-wash/60">
+              <td className="max-w-[300px] truncate px-4 py-3 font-medium">{d.name}</td>
+              <td className="px-4 py-3"><Badge>{d.format}</Badge></td>
+              <td className="px-4 py-3">{d.rows !== null ? nf.format(d.rows) : "–"}</td>
+              <td className="px-4 py-3">{bytes(d.bytes)}</td>
+              <td className="px-4 py-3 text-muted">{ago(d.created_at)}</td>
+              <td className="px-4 py-3 text-muted">{d.expires_at ? new Date(d.expires_at).toISOString().slice(0, 10) : "–"}</td>
+              <td className="px-4 py-3 text-right"><Link href={`/console/jobs/new?dataset=${d.id}`} className="text-[13px] font-medium text-accent hover:underline">Gate it</Link></td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {total > rows.length && <p className="text-[12px] text-muted">Showing the {rows.length} newest of {total} datasets.</p>}
+      {!demo && <p className="text-[12px] text-muted">Row counts are not recorded at upload; each job reports the rows it read.</p>}
     </div>
   );
 }

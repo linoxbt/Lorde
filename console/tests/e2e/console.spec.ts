@@ -43,7 +43,10 @@ test("new job: threshold changes the preview", async ({ page }) => {
 
 test("job detail filters rows", async ({ page }) => {
   await page.goto("/console/jobs/2b8e4d70-5a9c-4f13-8e62-1d7c3b9a0f02");
+  await page.waitForLoadState("networkidle");
   await page.getByLabel("Decision").selectOption("reject");
+  await expect(page).toHaveURL(/decision=reject/);  // filters run on the server: wait for the filtered page
+  await expect(page.getByText("Loading…")).toHaveCount(0);
   const decisions = page.locator("tbody td:nth-child(5)");
   await expect(decisions.first()).toContainText("Reject");
   expect(await decisions.filter({ hasText: "Pass" }).count()).toBe(0);
