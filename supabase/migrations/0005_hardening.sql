@@ -153,13 +153,17 @@ begin
   return new;
 end $$;
 
-drop trigger if exists on_auth_user_created on auth.users;
-create trigger on_auth_user_created after insert on auth.users
-  for each row when (new.email_confirmed_at is not null) execute function public.handle_new_user();
-drop trigger if exists on_auth_user_confirmed on auth.users;
-create trigger on_auth_user_confirmed after update of email_confirmed_at on auth.users
-  for each row when (old.email_confirmed_at is null and new.email_confirmed_at is not null)
-  execute function public.handle_new_user();
+-- 0003's on_auth_user_created (AFTER INSERT) stays as it is: the function above now returns early for
+-- unconfirmed users. Only a new trigger is added (DROP TRIGGER on auth.users needs table ownership,
+-- which the migration role may not have on Supabase; CREATE TRIGGER needs only the TRIGGER privilege).
+do $$ begin
+  if not exists (select 1 from pg_trigger where tgname = 'on_auth_user_confirmed'
+                 and tgrelid = 'auth.users'::regclass) then
+    create trigger on_auth_user_confirmed after update of email_confirmed_at on auth.users
+      for each row when (old.email_confirmed_at is null and new.email_confirmed_at is not null)
+      execute function public.handle_new_user();
+  end if;
+end $$;
 
 -- --------------------------------------------------------------------------------------------- B8
 -- One judgment per (job, row, gate): a retried or crashed job cannot duplicate rows.
