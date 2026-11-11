@@ -18,8 +18,11 @@ with an existing tag compares the local weights with the files the tag points at
 ids): when they are the same, only the card and side files on main are updated and the tag stays where it is,
 then the data repo, collections and visibility are published as usual (so private first, then ``--public``,
 works under one tag). When they differ, the step fails before uploading anything; publish the new weights
-with a new version, e.g. ``--tag v1.0.1``. Human labels are published without labeller names or notes. The repos stay un-gated (the hackathon requires it); the licence (CC-BY-NC-4.0) and
-the Cohere Labs Acceptable Use Policy are stated in the card metadata and at the top of every card.
+with a new version, e.g. ``--tag v1.0.1``. Visibility is set on every run, so ``--public`` alone flips it.
+
+Human labels are published without labeller names or notes. The repos stay un-gated (the hackathon requires
+it); the licence (CC-BY-NC-4.0) and the Cohere Labs Acceptable Use Policy are stated in the card metadata and
+at the top of every card.
 """
 
 from __future__ import annotations
