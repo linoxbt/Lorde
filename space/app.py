@@ -4,10 +4,15 @@ Backends
   LORDE_ENDPOINT set  -> any OpenAI-compatible server running Lorde (e.g. vLLM); supports structured outputs
   otherwise           -> transformers on ZeroGPU (or CPU, slowly), model LORDE_MODEL @ LORDE_REVISION
 LORDE_COMPARE_BASE=1 also loads Tiny Aya Global (needs HF_TOKEN with access to the gated base) to compare.
+
+LORDE_REVISION is the release tag to serve (default: DEFAULT_REVISION, never 'main'). At start the app compares
+CuratorKIT's current template fingerprints with the model's template_fingerprints.json at that revision and
+shows a warning if they differ (the prompts would be out of distribution for Lorde).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -21,8 +26,12 @@ from lorde_forge import contract  # noqa: E402
 from lorde_forge.config import JUDGE_MAX_TOKENS, JUDGE_TEMPERATURE, STUDENT_MODEL  # noqa: E402
 from lorde_forge.schemas import response_format  # noqa: E402
 
+DEFAULT_REVISION = "v1.0.0"  # the published release tag (forge/09_publish.py --tag)
 MODEL = os.environ.get("LORDE_MODEL", "lorde/lorde-tiny-aya")
-REVISION = os.environ.get("LORDE_REVISION", "main")
+REVISION = os.environ.get("LORDE_REVISION") or DEFAULT_REVISION
+if REVISION == "main":  # a moving branch: the demo could silently serve weights nobody evaluated
+    print(f"[space] LORDE_REVISION=main is not allowed; serving {DEFAULT_REVISION}", flush=True)
+    REVISION = DEFAULT_REVISION
 ENDPOINT = os.environ.get("LORDE_ENDPOINT")
 DATA_REPO = os.environ.get("LORDE_DATA")
 COMPARE = os.environ.get("LORDE_COMPARE_BASE") == "1"
@@ -77,6 +86,32 @@ def _generate_endpoint(prompt: str, kind: str, structured: bool) -> str:
                                        messages=[{"role": "user", "content": prompt}],
                                        temperature=JUDGE_TEMPERATURE, max_tokens=JUDGE_MAX_TOKENS, extra_body=extra)
     return r.choices[0].message.content or ""
+
+
+def template_warning(trained: dict | None = None) -> str:
+    """Markdown warning if CuratorKIT's templates here differ from the ones Lorde was trained on ('' if equal)."""
+    now = contract.fingerprints()
+    if trained is None:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            trained = json.loads(Path(hf_hub_download(MODEL, "template_fingerprints.json", revision=REVISION))
+                                 .read_text())
+        except Exception as e:  # noqa: BLE001  (offline, private repo, older release)
+            return (f"**Warning:** could not read `template_fingerprints.json` of `{MODEL}` @ `{REVISION}` "
+                    f"({type(e).__name__}), so the prompt templates are not verified.")
+    diff = [k for k in contract.KINDS
+            if (trained.get("templates", {}).get(k) or {}).get("sha256") != now["templates"][k]["sha256"]]
+    if not diff:
+        return ""
+    return (f"**Warning: template mismatch** for {', '.join(diff)}. Lorde was trained on CuratorKIT "
+            f"{trained.get('curatorkit_version', '?')} templates; this Space renders CuratorKIT "
+            f"{now['curatorkit_version']}. Its judgments here are out of distribution.")
+
+
+TEMPLATE_WARNING = template_warning()
+if TEMPLATE_WARNING:
+    print(f"[space] {TEMPLATE_WARNING}", flush=True)
 
 
 def explain(kind: str, raw: str, threshold: float) -> str:
@@ -137,6 +172,8 @@ with gr.Blocks(title="Lorde: a 3B judge for trustworthy training data") as demo:
     gr.Markdown("# Lorde\nTiny Aya Global (3.35B) fine-tuned to run CuratorKIT's **RewardGate** and "
                 "**HallucinationGate**. Enter an item: Lorde judges it with CuratorKIT's exact prompt, and you see "
                 "what CuratorKIT would do with the reply.")
+    if TEMPLATE_WARNING:
+        gr.Markdown(TEMPLATE_WARNING)
     with gr.Tab("Playground"):
         kind = gr.Radio(["Grounding", "Reward"], value="Grounding", label="Gate")
         with gr.Group(visible=True) as g_box:
