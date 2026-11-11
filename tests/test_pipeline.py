@@ -139,7 +139,7 @@ def test_forge_pipeline(world):
     outs = {"ungated": lambda r: "I am not sure.", "teacher": lambda r: r["answer"], "lorde": lambda r: r["answer"]}
     for name, f in outs.items():
         jsonl.write(root / "results" / "downstream" / f"preds_{name}.jsonl", [{**r, "output": f(r)} for r in ev])
-    run("08_downstream.py", "score", env=env)
+    run("08_downstream.py", "score", "--trust-legacy-cache", env=env)  # preds written without a meta file
     down = json.loads((root / "results" / "downstream.json").read_text())
     assert down["metrics"]["lorde"]["f1_score"] == 1.0 and down["within_2pct_of_teacher"] is True
 

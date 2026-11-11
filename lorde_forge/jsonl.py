@@ -44,11 +44,12 @@ def write(path: str | Path, rows: Iterable[dict[str, Any]]) -> int:
 class Appender:
     """Append rows one by one and flush, so progress survives a crash."""
 
-    def __init__(self, path: str | Path, key: str = "uid") -> None:
+    def __init__(self, path: str | Path, key: str = "uid", skip=None) -> None:
+        """``skip(row)``: rows already in the file that do not count as done (e.g. failed calls)."""
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.key = key
-        self.done: set[str] = {str(r.get(key)) for r in iter_rows(self.path)}
+        self.done: set[str] = {str(r.get(key)) for r in iter_rows(self.path) if not (skip and skip(r))}
         self._f = self.path.open("a", encoding="utf-8")
 
     def __contains__(self, uid: object) -> bool:

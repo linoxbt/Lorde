@@ -18,7 +18,15 @@ calibration slice, latency and throughput at fixed concurrency, cost per 1M
 judgments vs the API teacher, and AuditKIT paired-bootstrap significance tests.
 ``--structured`` also runs every judge with vLLM structured outputs ("<name>+so").
 
-Writes results/judge_eval.{json,md} and results/preds/<judge>.jsonl.
+Writes results/judge_eval.{json,md} and results/preds/<judge>.jsonl (+ <judge>.meta.json).
+
+Prediction caches are keyed by model identity and test set: results/preds/<judge>.meta.json records the
+fingerprint of the weights the endpoint serves (hash of the local directory vLLM reports as the model root,
+the Hub sha of a model id, or ``--model-sha``), the structured flag, the template fingerprints and a hash of
+the test prompts. A cache that does not match is moved aside (<judge>.jsonl.stale) and recomputed. Caches
+from before fingerprints existed have no meta file; they are reused only with ``--trust-legacy-cache``:
+
+    python forge/06_judge_eval.py --judge base=... --judge lorde=... --structured --report-only --trust-legacy-cache
 """
 
 from __future__ import annotations
@@ -30,8 +38,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import audit, config, contract, human, jsonl, llm, metrics  # noqa: E402
-from lorde_forge.judge import as_metric_row, predict  # noqa: E402
+from lorde_forge import audit, config, contract, fingerprint, human, jsonl, llm, metrics  # noqa: E402
+from lorde_forge.judge import as_metric_row, cache_meta, error_counts, predict  # noqa: E402
 from lorde_forge.report import fmt, table  # noqa: E402
 
 
@@ -58,6 +66,27 @@ def perf(ep: llm.Endpoint, items: list[dict], structured: bool, n: int, concurre
     return s
 
 
+def judge_models(eps: list[llm.Endpoint], args) -> dict[str, dict | None]:
+    """Model identity per endpoint, for the cache keys. Report-only runs ask no server: only the flags count."""
+    shas, paths = dict(p.split("=", 1) for p in args.model_sha), dict(p.split("=", 1) for p in args.model_path)
+    out: dict[str, dict | None] = {}
+    for e in eps:
+        if args.report_only:
+            if e.name in shas:
+                out[e.name] = {"sha": shas[e.name], "source": "--model-sha"}
+            elif e.name in paths:
+                out[e.name] = dict(zip(("sha", "source"), fingerprint.model_sha(paths[e.name], config.ROOT)))
+            else:
+                out[e.name] = None
+            continue
+        out[e.name] = fingerprint.endpoint_model(e.base_url, e.model, e.api_key, shas.get(e.name),
+                                                 paths.get(e.name), config.ROOT)
+        if not out[e.name].get("sha"):
+            print(f"[eval] WARNING: no weights fingerprint for {e.name} ({out[e.name].get('source')}); its cache "
+                  "is keyed by test set and templates only. Pass --model-sha or --model-path.", flush=True)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--judge", action="append", required=True, help="name=openai/model@base_url")
@@ -70,6 +99,12 @@ def main() -> None:
     ap.add_argument("--report-only", action="store_true",
                     help="rebuild the report from cached predictions and timings (no model calls), e.g. after "
                          "adding human labels")
+    ap.add_argument("--model-sha", action="append", default=[],
+                    help="name=SHA: the judge's model identity, overriding the served-weights fingerprint")
+    ap.add_argument("--model-path", action="append", default=[],
+                    help="name=PATH_OR_HUB_ID of the weights the judge serves (default: the root vLLM reports)")
+    ap.add_argument("--trust-legacy-cache", action="store_true",
+                    help="reuse prediction caches written before fingerprints existed (no <judge>.meta.json)")
     ap.add_argument("--candidate", default="lorde")
     ap.add_argument("--baseline", default="base")
     ap.add_argument("--test", default=str(config.DATA / "test.jsonl"))
@@ -106,18 +141,27 @@ def main() -> None:
 
     preds: dict[str, dict[str, dict]] = {}
     perf_stats: dict[str, dict] = {}
+    cache_info: dict[str, dict] = {}
     previous = Path(args.out + ".json")
     old_judges = json.loads(previous.read_text())["judges"] if args.report_only and previous.exists() else {}
+    models = judge_models(eps, args)
     for name, ep, structured in runs:
         cache = config.RESULTS / "preds" / f"{name}.jsonl"
+        meta = cache_meta(models[ep.name], test, structured)
         if args.report_only:
-            if not cache.exists():
-                sys.exit(f"--report-only: no cached predictions for {name} ({cache})")
-            preds[name] = {r["uid"]: r for r in jsonl.read(cache)}
+            usable, status = fingerprint.check(cache, meta, args.trust_legacy_cache)
+            if not usable:
+                sys.exit(f"--report-only: cached predictions for {name} are not usable: {status} ({cache})")
+            preds[name] = {r["uid"]: r for r in jsonl.read(cache)}  # the latest row per uid wins
             perf_stats[name] = old_judges.get(name, {}).get("perf", {})
+            cache_info[name] = {"status": status, "model": (fingerprint.read_meta(cache) or {}).get("model")}
             continue
         print(f"[eval] judge {name} ({ep.model} @ {ep.base_url}, structured={structured})")
-        preds[name] = predict(ep, test, structured, cache, args.concurrency)
+        preds[name] = predict(ep, test, structured, cache, args.concurrency, meta=meta,
+                              trust_legacy=args.trust_legacy_cache)
+        legacy = (fingerprint.read_meta(cache) or {}).get("legacy_trusted")
+        cache_info[name] = {"status": "legacy, trusted by --trust-legacy-cache" if legacy else "fingerprinted",
+                            "model": models[ep.name]}
         perf_stats[name] = perf(ep, test, structured, args.perf_n, args.concurrency)
 
     rows = {name: [as_metric_row(preds[name].get(u)) for u in uids] for name in preds}
@@ -139,6 +183,9 @@ def main() -> None:
             "gpu_hourly": gpu,
             "api_price_per_1M_tokens": api_price,
             "cost_per_1M": cost,
+            # unparseable replies count as rejects; transport failures are reported apart from them
+            "errors": error_counts(preds[name], uids),
+            "cache": cache_info.get(name),
         }
 
     # Human agreement: teacher is the ceiling.
