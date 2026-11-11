@@ -27,10 +27,13 @@ export function SiteHeader({ announcement = true }: { announcement?: boolean }) 
             ))}
           </nav>
           <div className="flex items-center gap-2">
-            <Link href="/console" className={buttonClass("primary", "sm", "hidden h-9 px-4 sm:inline-flex")}>
-              Open console
+            <Link href="/signin" className={buttonClass("ghost", "sm", "hidden h-9 px-4 sm:inline-flex")}>
+              Sign in
             </Link>
-            <HamburgerMenu groups={siteNav} />
+            <Link href="/signup" className={buttonClass("primary", "sm", "hidden h-9 px-4 sm:inline-flex")}>
+              Create account
+            </Link>
+            <HamburgerMenu groups={siteNav} cta={{ label: "Create account", href: "/signup" }} />
           </div>
         </div>
       </header>

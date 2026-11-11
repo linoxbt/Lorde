@@ -16,8 +16,9 @@ pnpm test:e2e            # Playwright: desktop and phone projects
 
 - **Demo** (no env): every page runs on deterministic, clearly labelled sample data; the playground uses a transparent
   heuristic labelled "Simulated". Nothing is saved.
-- **Live**: set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` (see `.env.example`). Sign-in is Supabase
-  Auth (magic link, GitHub); `proxy.ts` protects `/console`; pages read through the user's own session, so the RLS
+- **Live**: set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` (see `.env.example`). An account is required: `/signup` creates one (email + password with
+  email confirmation, a one-time email link, or GitHub; the user picks), `/signin` signs in, "Forgot password" leads to
+  `/reset-password`, and `proxy.ts` sends signed-out visitors from `/console` to `/signin`; pages read through the user's own session, so the RLS
   policies in `../supabase/migrations` decide what is visible. Keys are created server-side with `LORDE_KEY_PEPPER`
   (same hash as the Gateway) and inserted under RLS, so only owners and admins can create or revoke them; a database
   trigger audits every change.

@@ -2,12 +2,16 @@ import { NextResponse } from "next/server";
 
 import { supabaseEnabled } from "@/lib/env";
 
-/** Supabase redirects here after a magic link or GitHub sign-in; exchange the code for a session. */
+const ALLOWED = ["/console", "/reset-password"];
+
+/** Supabase redirects here after email confirmation, a magic link, a password reset or GitHub; exchange the code for a session. */
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const code = url.searchParams.get("code");
   const next = url.searchParams.get("next") ?? "/console";
-  const safeNext = next.startsWith("/console") ? next : "/console";
+  const safeNext = ALLOWED.some((p) => next === p || next.startsWith(`${p}/`)) ? next : "/console";
+  const oauthError = url.searchParams.get("error_description");
+  if (oauthError) return NextResponse.redirect(new URL(`/signin?error=${encodeURIComponent(oauthError)}`, url.origin));
   if (code && supabaseEnabled()) {
     const { supabaseServer } = await import("@/lib/supabase/server");
     const sb = await supabaseServer();

@@ -1,4 +1,4 @@
-import { BarChart3, Database, FileText, FlaskConical, Gauge, KeyRound, ListChecks, PlusCircle, Settings, UserCheck } from "lucide-react";
+import { BarChart3, LogOut, Database, FileText, FlaskConical, Gauge, KeyRound, ListChecks, PlusCircle, Settings, UserCheck } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
 
@@ -31,6 +31,7 @@ export function ConsoleShell({ ws, children }: { ws: Workspace; children: ReactN
         <div className="space-y-2 p-4 text-[12px] text-muted">
           <p className="flex items-center gap-2"><BarChart3 className="size-3.5" /> Model <span className="font-mono text-ink-2">{ws.activeModel.repo}@{ws.activeModel.revision}</span></p>
           <Link href="/docs" className="block hover:text-ink">Docs</Link>
+          {ws.mode === "live" && <SignOut className="flex items-center gap-2 hover:text-ink" />}
         </div>
       </aside>
       <div className="min-w-0">
@@ -44,6 +45,7 @@ export function ConsoleShell({ ws, children }: { ws: Workspace; children: ReactN
           <div className="lg:hidden"><Logo href="/console" /></div>
           <p className="hidden text-sm text-muted lg:block">Lorde Console</p>
           <div className="flex items-center gap-2">
+            {ws.mode === "live" && <SignOut className="flex h-9 items-center gap-2 rounded-full px-3 text-[13px] text-muted hover:bg-wash hover:text-ink lg:hidden" />}
             <Link href="/console/jobs/new" className="hidden h-9 items-center rounded-full bg-accent px-4 text-[13px] font-medium text-white hover:bg-accent-hover sm:inline-flex">New job</Link>
             <div className="lg:hidden"><HamburgerMenu links={consoleNav} title="Console" cta={{ label: "New job", href: "/console/jobs/new" }} /></div>
           </div>
@@ -51,5 +53,13 @@ export function ConsoleShell({ ws, children }: { ws: Workspace; children: ReactN
         <main className="px-5 py-8 lg:px-8 lg:py-10">{children}</main>
       </div>
     </div>
+  );
+}
+
+function SignOut({ className }: { className: string }) {
+  return (
+    <form action="/auth/signout" method="post">
+      <button type="submit" className={className}><LogOut className="size-3.5" /> Sign out</button>
+    </form>
   );
 }
