@@ -140,7 +140,9 @@ class KeyStore:
 
     def create(self, name: str, org_id: str, scopes: list[str] | None = None, rpm: int = 600) -> tuple[str, ApiKey]:
         key = KEY_PREFIX + _b62()
-        rec = ApiKey(prefix=prefix_of(key), key_hash=hash_key(key, self.pepper), name=name, org_id=org_id,
+        prefix = prefix_of(key)
+        assert prefix
+        rec = ApiKey(prefix=prefix, key_hash=hash_key(key, self.pepper), name=name, org_id=org_id,
                      scopes=scopes or list(DEFAULT_SCOPES), rpm=rpm)
         with self._lock:
             keys = self._load()

@@ -79,8 +79,10 @@ class Gateway:
         from .storage import from_settings
 
         self.s = s
-        self.pool = None
-        self.jobs = None
+        self.pool: Any = None
+        self.jobs: Any = None
+        self.keys: Any
+        self.usage: Any
         if s.database_url:
             from .db import JobStore, PgKeyStore, PgUsageSink, make_pool
 
@@ -148,7 +150,7 @@ class Gateway:
             return False
         try:
             async with self.pool.connection() as c:
-                r = await (await c.execute("select hf_repo, revision from model_versions where state = 'active' "
+                r: Any = await (await c.execute("select hf_repo, revision from model_versions where state = 'active' "
                                            "order by promoted_at desc nulls last limit 1")).fetchone()
         except Exception:  # noqa: BLE001
             log.warning("could not read model_versions; keeping %s", self.s.model_label, exc_info=True)
@@ -370,7 +372,7 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
         if gw.pool is not None:
             await gw.pool.close()
 
-    docs = {} if s.public_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    docs: dict[str, Any] = {} if s.public_docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
     app = FastAPI(title="Lorde Gateway", version=__version__, lifespan=lifespan,
                   description="A 3B judge for CuratorKIT's quality gates.", **docs)
     app.state.gw = gw
@@ -407,7 +409,7 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
             err = InternalError("internal error; quote the request_id if you report it")
         return JSONResponse(body(err, rid(request)), status_code=err.status, headers=err.headers)
 
-    def need(scope: str):
+    def need(scope: str | None):
         async def dep(request: Request) -> ApiKey:  # runs before the body is validated
             return await gw.authenticate(request.headers, scope, request.scope.get("state"))
         return dep

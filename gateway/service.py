@@ -56,7 +56,7 @@ class JudgeService:
             raise JudgeUnparseable("the model reply failed the judge contract", extra={"raw": raw[:2000]})
         decision = "pass" if j.decision(thr) else "reject"
         self.m.judgments.labels(kind, decision).inc()
-        meta = {"decision": decision, "threshold": thr, "model": self.s.model_label,
+        meta: dict[str, Any] = {"decision": decision, "threshold": thr, "model": self.s.model_label,
                 "template": contract.template_id(kind), "latency_ms": latency_ms, "request_id": request_id}
         # the decision uses CuratorKIT's own score; canonical() only normalizes the other fields
         if kind == "reward":

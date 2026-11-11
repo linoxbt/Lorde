@@ -15,6 +15,7 @@ import time
 import uuid
 from typing import Any
 
+from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
@@ -27,15 +28,19 @@ def dataset_path(org_id: str, dataset_id: str, name: str) -> str:
     return f"{org_id}/{dataset_id}/{name}"
 
 
-def make_pool(url: str, min_size: int = 1, max_size: int = 10) -> AsyncConnectionPool:
-    return AsyncConnectionPool(url, min_size=min_size, max_size=max_size, open=False,
-                               kwargs={"autocommit": True, "row_factory": dict_row})
+Pool = AsyncConnectionPool[AsyncConnection[dict[str, Any]]]  # connections return dict rows
+
+
+def make_pool(url: str, min_size: int = 1, max_size: int = 10) -> Pool:
+    pool: Any = AsyncConnectionPool(url, min_size=min_size, max_size=max_size, open=False,
+                                    kwargs={"autocommit": True, "row_factory": dict_row})
+    return pool
 
 
 class PgKeyStore(KeyStore):
     """api_keys table; same bounded cache and constant-time check as the file store."""
 
-    def __init__(self, pool: AsyncConnectionPool, pepper: str, cache_size: int = 10_000) -> None:
+    def __init__(self, pool: Pool, pepper: str, cache_size: int = 10_000) -> None:
         self.pool, self.pepper = pool, pepper
         self._cache = KeyCache(cache_size)
         self._touched: dict[str, float] = {}  # only valid keys land here, so it stays small
@@ -109,7 +114,7 @@ class PgUsageSink:
     COLS = ("org_id", "api_key_id", "key_prefix", "route", "judgments", "prompt_tokens", "completion_tokens",
             "latency_ms", "status", "model_revision", "source")
 
-    def __init__(self, pool: AsyncConnectionPool, max_queue: int = 10_000) -> None:
+    def __init__(self, pool: Pool, max_queue: int = 10_000) -> None:
         self.pool = pool
         self.max_queue = max_queue
         self.queue: list[dict[str, Any]] = []
@@ -166,7 +171,7 @@ class PgUsageSink:
 
 
 class JobStore:
-    def __init__(self, pool: AsyncConnectionPool) -> None:
+    def __init__(self, pool: Pool) -> None:
         self.pool = pool
 
     async def create_dataset(self, org_id: str, name: str, fmt: str, size: int | None, retention_days: int | None,

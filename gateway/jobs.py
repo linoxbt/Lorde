@@ -60,7 +60,8 @@ class JobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     upload_id: uuid.UUID | None = None
     dataset_url: str | None = Field(None, description="hf://datasets/<owner>/<name>[/<file>]")
-    gates: Gates = Gates()
+    # defaults come from Field(); mypy runs without the pydantic plugin, hence the ignore
+    gates: Gates = Gates()  # type: ignore[call-arg]
     options: Options = Options()
 
     @model_validator(mode="after")

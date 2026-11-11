@@ -26,7 +26,7 @@ from .errors import InvalidRequest, LordeError, NotFound, PayloadTooLarge
 if TYPE_CHECKING:
     from .app import Gateway
 
-READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+READ_ONLY = ToolAnnotations.model_validate({"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
 
 
 def _api_errors(fn):
@@ -54,6 +54,7 @@ def build(gw: Gateway) -> MCPServer:
         key = await gw.authenticate(ctx.headers or {}, scope="judge")
         await gw.rate_limit(key, cost)
         rid = "req_" + secrets.token_hex(8)
+        res: Any
         t0 = time.perf_counter()
         try:
             if kind == "batch":
@@ -102,8 +103,8 @@ def build(gw: Gateway) -> MCPServer:
         return await _call(ctx, "batch", {"kind": kind, "items": items}, threshold, cost=len(items))
 
     @mcp.tool(name="lorde_create_gating_job",
-              annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False,
-                                          openWorldHint=False),
+              annotations=ToolAnnotations.model_validate({"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False,
+                                          "openWorldHint": False}),
               description="Start a CuratorKIT gating job on an uploaded dataset (upload_id from POST /v1/uploads) "
                           "or a Hub dataset (dataset_url hf://datasets/<owner>/<name>). Gates are thresholds (0-1) "
                           "or null to disable. Confirm with the user before starting: jobs consume quota.")
