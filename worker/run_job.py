@@ -15,6 +15,7 @@ import os
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -110,6 +111,13 @@ def stamp_ids(src: Path, fmt: str, dst_dir: Path, max_rows: int | None = None,
     return src, -1
 
 
+TEXT_CLIP = 4000
+
+
+def _clip(v) -> str | None:
+    return None if v is None else str(v)[:TEXT_CLIP]
+
+
 def gate_notes(sample) -> dict[str, dict]:
     out = {}
     for p in sample.provenance_chain:
@@ -140,7 +148,7 @@ def main() -> None:
         dataset, n_rows = job["hf_dataset"], -1  # Hub datasets: CuratorKIT reads at most max_rows samples
     concurrency = max(1, int(job.get("judge_concurrency") or 16))
 
-    judge = {"model": f"openai/{job['served_model']}", "api_base": job["vllm_base_url"],
+    judge: Any = {"model": f"openai/{job['served_model']}", "api_base": job["vllm_base_url"],
              "api_key": os.environ.get("VLLM_API_KEY") or "EMPTY", "temperature": 0.1, "max_tokens": 512,
              "concurrency": concurrency}
     cfg = CuratorConfig(
@@ -151,8 +159,8 @@ def main() -> None:
         reward_threshold=gates.get("reward"),
         judge_llm=judge,
         # Structured outputs per gate: the worker calls Serve directly, so it asks for each schema itself.
-        reward_llm={"extra_body": {"response_format": response_format("reward")}},
-        hallucination_llm={"extra_body": {"response_format": response_format("grounding")}},
+        reward_llm=cast(Any, {"extra_body": {"response_format": response_format("reward")}}),
+        hallucination_llm=cast(Any, {"extra_body": {"response_format": response_format("grounding")}}),
         judge_on_error="reject",
         judge_concurrency=concurrency,
         max_samples=max_rows,
@@ -189,7 +197,11 @@ def main() -> None:
             if n and key in n:
                 idx = row_idx(s)
                 judgments.append({"row_idx": idx, "gate": gate, "score": n[key], "lang": langs.get(idx),
-                                  "decision": bool(n.get("passed", passed)), "verdict": n.get("verdict")})
+                                  "decision": bool(n.get("passed", passed)), "verdict": n.get("verdict"),
+                                  # row text; the worker stores it in judgments.parsed only when the org enabled
+                                  # store_content (debug retention), never otherwise
+                                  "text": {"instruction": _clip(s.instruction), "input": _clip(s.input),
+                                           "output": _clip(s.output)}})
 
     with (out_dir / "passed.jsonl").open("w", encoding="utf-8") as f:
         for s in res.passed:

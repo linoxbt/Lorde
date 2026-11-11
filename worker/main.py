@@ -30,6 +30,7 @@ import socket
 import sys
 import time
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
@@ -75,6 +76,14 @@ def dataset_path_ok(path: str, org_id: str, dataset_id: str | None) -> bool:
     return len(parts) == 3 and all(p not in ("", ".", "..") for p in parts) and "\\" not in path
 
 
+def parsed(j: dict) -> dict:
+    """judgments.parsed when the org enabled store_content: the scores plus the row's text, flat
+    (instruction; input = source/context; output = response/answer), each clipped to 4,000 chars."""
+    out = {k: j.get(k) for k in ("row_idx", "gate", "score", "decision", "verdict", "lang")}
+    out.update({k: v for k, v in (j.get("text") or {}).items() if k in ("instruction", "input", "output")})
+    return out
+
+
 class Worker:
     def __init__(self, s: Settings | None = None, worker_id: str | None = None, work_dir: str | None = None,
                  storage=None, poll_s: float = 2.0, heartbeat_s: float = HEARTBEAT_S) -> None:
@@ -83,11 +92,11 @@ class Worker:
             raise RuntimeError("DATABASE_URL is required")
         self.id = worker_id or os.environ.get("WORKER_ID") or f"{socket.gethostname()}-{os.getpid()}"
         self.work = Path(work_dir or os.environ.get("LORDE_WORK_DIR", "/tmp/lorde-work"))
-        self.storage = storage or from_settings(self.s)
+        self.storage: Any = storage or from_settings(self.s)
         if self.storage is None:
             raise RuntimeError("storage is required (SUPABASE_URL + key, or LORDE_STORAGE_DIR)")
         self.poll_s, self.heartbeat_s = poll_s, heartbeat_s
-        self.conn: psycopg.AsyncConnection | None = None
+        self.conn: Any = None  # psycopg.AsyncConnection with dict rows
         self._last_requeue = 0.0
         self._last_purge = 0.0
         self.stopping = False
@@ -98,6 +107,7 @@ class Worker:
         if self.conn is not None and not self.conn.closed:
             with contextlib.suppress(Exception):
                 await self.conn.close()
+        assert self.s.database_url
         self.conn = await psycopg.AsyncConnection.connect(self.s.database_url, autocommit=True, row_factory=dict_row)
 
     async def q(self, sql: str, args=()) -> list[dict]:
@@ -252,6 +262,7 @@ class Worker:
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "worker.run_job", str(job_dir), cwd=str(Path(__file__).resolve().parent.parent),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=child_env(job_dir))
+        assert proc.stdout is not None
         log_task = asyncio.create_task(proc.stdout.read())
         exited = asyncio.create_task(proc.wait())
         stop = asyncio.create_task(self._stop_event().wait())
@@ -325,7 +336,7 @@ class Worker:
                     continue
                 j = json.loads(line)
                 batch.append((jid, j["row_idx"], j["gate"], j.get("lang"), j["score"], j["decision"],
-                              j.get("verdict"), Jsonb(j) if org_row["store_content"] else None))
+                              j.get("verdict"), Jsonb(parsed(j)) if org_row["store_content"] else None))
                 n_judg += 1
                 if len(batch) >= 1000:
                     async with self.conn.cursor() as cur:

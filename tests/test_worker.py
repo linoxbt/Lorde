@@ -269,3 +269,20 @@ def test_keys_cli_uses_postgres(env, monkeypatch, capsys):
         assert c.get("/v1/models", headers={"Authorization": f"Bearer {key}"}).status_code == 403
     with pytest.raises(SystemExit):
         keys.main(["create", "--name", "x", "--org", str(env["org"]), "--rpm", "100000"])
+
+
+def test_store_content_keeps_row_text_only_when_enabled(env):
+    clear_jobs(env)
+    with db(env) as c:
+        c.execute("update orgs set store_content = true where id=%s", (env["org"],))
+    try:
+        jid = submit(env, ROWS[:2])
+        assert run_one(work(env)) is True
+    finally:
+        with db(env) as c:
+            c.execute("update orgs set store_content = false where id=%s", (env["org"],))
+    with db(env) as c:
+        p = c.execute("select parsed from judgments where job_id=%s and gate='grounding' and row_idx=1",
+                      (jid,)).fetchone()[0]
+    assert p["instruction"] == ROWS[1]["instruction"] and p["input"] == ROWS[1]["input"]
+    assert p["output"] == ROWS[1]["output"] and p["gate"] == "grounding" and "score" in p and "text" not in p

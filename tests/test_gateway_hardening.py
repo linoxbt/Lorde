@@ -31,6 +31,8 @@ def test_cors_preflight_allows_put_and_errors_carry_cors(gw):
         r = c.options("/v1/_storage/sometoken", headers={"Origin": ORIGIN, "Access-Control-Request-Method": "PUT",
                                                          "Access-Control-Request-Headers": "content-type"})
         assert r.status_code == 200 and "PUT" in r.headers["access-control-allow-methods"]
+        r = c.options("/v1/_storage/sometoken", headers={"Origin": ORIGIN, "Access-Control-Request-Method": "GET"})
+        assert r.status_code == 200 and "GET" in r.headers["access-control-allow-methods"]
         r = c.options("/v1/jobs", headers={"Origin": ORIGIN, "Access-Control-Request-Method": "POST",
                                            "Access-Control-Request-Headers": "authorization,idempotency-key"})
         assert r.status_code == 200
