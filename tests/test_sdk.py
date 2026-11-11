@@ -107,4 +107,61 @@ def test_stdio_mcp_builds():
     from lorde.mcp import build
 
     tools = asyncio.run(build(api_key="lorde_sk_test", base_url="http://x").list_tools())
-    assert {t.name for t in tools} == {"lorde_judge_grounding", "lorde_judge_reward", "lorde_judge_batch"}
+    assert {t.name for t in tools} == {"lorde_judge_grounding", "lorde_judge_reward", "lorde_judge_batch",
+                                       "lorde_create_gating_job", "lorde_job_status", "lorde_model_info"}
+
+
+def test_stdio_mcp_model_info_against_gateway(live):
+    """M10: the stdio server's lorde_model_info reaches the Gateway's model endpoint."""
+    pytest.importorskip("mcp")
+    from lorde.mcp import build
+
+    async def go():
+        m = build(api_key=live["key"], base_url=live["url"])
+        return await m.call_tool("lorde_model_info", {})
+    out = json.dumps(asyncio.run(go()), default=str)
+    assert "lorde-tiny-aya@v1.0.0" in out and "api_version" in out
+
+
+def scripted(responses):
+    """An httpx client that answers each request from a script and records what it saw."""
+    import httpx
+
+    seen = []
+
+    def handler(request):
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json={"api_version": 1})
+        seen.append((request.method, request.url.path, request.headers.get("idempotency-key")))
+        step = responses.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+    return httpx.Client(base_url="http://gw", transport=httpx.MockTransport(handler)), seen
+
+
+def test_sdk_does_not_resend_posts_that_may_have_run(monkeypatch):
+    """Perf 12: a read timeout on a judge POST is not retried; connect errors, 429 and 503+Retry-After are."""
+    import httpx
+    import lorde.client as lc
+
+    monkeypatch.setattr(lc.time, "sleep", lambda s: None)
+    ok = httpx.Response(200, json={"overall_score": 0.8, "decision": "pass", "threshold": 0.7, "model": "m",
+                                   "template": "t", "latency_ms": 1, "request_id": "r"})
+    http, seen = scripted([httpx.ReadTimeout("slow")])
+    with pytest.raises(httpx.ReadTimeout):
+        Lorde(api_key="k", http_client=http).judge.reward("a", "b")
+    assert len(seen) == 1
+    http, seen = scripted([httpx.ConnectError("down"), httpx.Response(429, headers={"retry-after": "1"}, json={}),
+                           httpx.Response(503, headers={"retry-after": "1"}, json={}), ok])
+    assert Lorde(api_key="k", http_client=http).judge.reward("a", "b").passed
+    assert len(seen) == 4
+    http, seen = scripted([httpx.Response(502, json={})])
+    with pytest.raises(LordeAPIError):
+        Lorde(api_key="k", http_client=http).judge.reward("a", "b")
+    assert len(seen) == 1
+    # job creation carries an Idempotency-Key, so it is retried after a read timeout, with the same key
+    job = {"id": "j1", "status": "queued"}
+    http, seen = scripted([httpx.ReadTimeout("slow"), httpx.Response(200, json=job)])
+    assert Lorde(api_key="k", http_client=http).jobs.create(dataset_url="hf://datasets/a/b").id == "j1"
+    assert len(seen) == 2 and seen[0][2] and seen[0][2] == seen[1][2]

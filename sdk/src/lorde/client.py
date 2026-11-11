@@ -34,6 +34,24 @@ def _error(r: httpx.Response) -> LordeAPIError:
         return LordeAPIError(r.status_code, "error", r.text[:200], r.headers.get("x-request-id"))
 
 
+# Transport errors where the request never reached the Gateway: always safe to retry.
+_NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
+def _retry_transport(e: httpx.TransportError, method: str, idempotent: bool) -> bool:
+    """POSTs are retried only if they cannot have been processed (or carry an Idempotency-Key): a read
+    timeout on a judge call may mean the judgment ran and was billed."""
+    return isinstance(e, _NOT_SENT) or method == "GET" or idempotent
+
+
+def _retry_status(r: httpx.Response, method: str, idempotent: bool) -> bool:
+    if r.status_code == 429:
+        return True  # refused before any work was done
+    if r.status_code == 503:
+        return method == "GET" or idempotent or "retry-after" in r.headers
+    return r.status_code in (502, 504) and (method == "GET" or idempotent)
+
+
 def _delay(attempt: int, r: httpx.Response | None) -> float:
     if r is not None and r.headers.get("retry-after", "").isdigit():
         return min(float(r.headers["retry-after"]), 60.0)
@@ -90,27 +108,28 @@ class Lorde:
 
         return storage_request(self._http, self.base_url, method, url, **kw)
 
-    def _request(self, method: str, path: str, json: dict | None = None) -> dict[str, Any]:
+    def _request(self, method: str, path: str, json: dict | None = None,
+                 headers: dict[str, str] | None = None) -> dict[str, Any]:
         if not self._checked:
             self._checked = True
             _check_version(self.health())
         payload = {k: v for k, v in (json or {}).items() if v is not None} if json else None
-        last: httpx.Response | None = None
+        hdrs = {**self._headers, **(headers or {})}
+        idempotent = "Idempotency-Key" in hdrs
         for attempt in range(self.max_retries + 1):
             try:
-                r = self._http.request(method, path, json=payload, headers=self._headers)
-            except httpx.TransportError:
-                if attempt == self.max_retries:
+                r = self._http.request(method, path, json=payload, headers=hdrs)
+            except httpx.TransportError as e:
+                if attempt == self.max_retries or not _retry_transport(e, method, idempotent):
                     raise
                 time.sleep(_delay(attempt, None))
                 continue
             if r.status_code < 400:
                 return r.json()
             err = _error(r)
-            if not err.retryable or attempt == self.max_retries:
+            if attempt == self.max_retries or not _retry_status(r, method, idempotent):
                 raise err
-            last = r
-            time.sleep(_delay(attempt, last))
+            time.sleep(_delay(attempt, r))
         raise AssertionError("unreachable")
 
     def _post(self, path: str, body: dict) -> dict[str, Any]:
@@ -163,27 +182,54 @@ class AsyncLorde:
         self._checked = False
         self.judge = _AsyncJudge(self)
 
-    async def _post(self, path: str, body: dict) -> dict[str, Any]:
+    async def _request(self, method: str, path: str, json: dict | None = None,
+                       headers: dict[str, str] | None = None) -> dict[str, Any]:
         if not self._checked:
             self._checked = True
             r = await self._http.get("/healthz")
             _check_version(r.json() if r.status_code == 200 else {})
-        payload = {k: v for k, v in body.items() if v is not None}
+        payload = {k: v for k, v in (json or {}).items() if v is not None} if json else None
+        hdrs = {**self._headers, **(headers or {})}
+        idempotent = "Idempotency-Key" in hdrs
         for attempt in range(self.max_retries + 1):
             try:
-                r = await self._http.post(path, json=payload, headers=self._headers)
-            except httpx.TransportError:
-                if attempt == self.max_retries:
+                r = await self._http.request(method, path, json=payload, headers=hdrs)
+            except httpx.TransportError as e:
+                if attempt == self.max_retries or not _retry_transport(e, method, idempotent):
                     raise
                 await asyncio.sleep(_delay(attempt, None))
                 continue
             if r.status_code < 400:
                 return r.json()
             err = _error(r)
-            if not err.retryable or attempt == self.max_retries:
+            if attempt == self.max_retries or not _retry_status(r, method, idempotent):
                 raise err
             await asyncio.sleep(_delay(attempt, r))
         raise AssertionError("unreachable")
+
+    async def _post(self, path: str, body: dict) -> dict[str, Any]:
+        return await self._request("POST", path, body)
+
+    async def model_info(self) -> dict[str, Any]:
+        """The active model revision, its Lorde Bench scores and the template fingerprints."""
+        models = await self._request("GET", "/v1/models")
+        served = models["data"][0]["id"]
+        return await self._request("GET", f"/v1/models/{served}")
+
+    async def create_job(self, *, upload_id: str | None = None, dataset_url: str | None = None,
+                         gates: dict[str, float | None] | None = None) -> dict[str, Any]:
+        """POST /v1/jobs with an Idempotency-Key, so a retried request never starts a second job."""
+        import uuid
+
+        body: dict[str, Any] = {"upload_id": upload_id, "dataset_url": dataset_url,
+                                "gates": gates or {"grounding": 0.7, "reward": 0.7}}
+        return await self._request("POST", "/v1/jobs", body, headers={"Idempotency-Key": f"sdk-{uuid.uuid4()}"})
+
+    async def job_status(self, job_id: str) -> dict[str, Any]:
+        job = await self._request("GET", f"/v1/jobs/{job_id}")
+        if job.get("status") == "succeeded":
+            job["files"] = (await self._request("GET", f"/v1/jobs/{job_id}/results"))["files"]
+        return job
 
     async def aclose(self) -> None:
         await self._http.aclose()
