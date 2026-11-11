@@ -13,15 +13,20 @@ Creates
 
 Needs HF_TOKEN with write scope (use it only here, never in serving).
 
-The release tag is immutable: if it already exists and points at another commit than the one just
-published, the step fails; publish a new version with ``--tag v1.0.1``. Human labels are published without
-labeller names or notes. The repos stay un-gated (the hackathon requires it); the licence (CC-BY-NC-4.0) and
+The release tag pins the WEIGHTS (safetensors/gguf, config, tokenizer files) and is never moved. Re-running
+with an existing tag compares the local weights with the files the tag points at (LFS sha256 / git blob
+ids): when they are the same, only the card and side files on main are updated and the tag stays where it is,
+then the data repo, collections and visibility are published as usual (so private first, then ``--public``,
+works under one tag). When they differ, the step fails before uploading anything; publish the new weights
+with a new version, e.g. ``--tag v1.0.1``. Human labels are published without labeller names or notes. The repos stay un-gated (the hackathon requires it); the licence (CC-BY-NC-4.0) and
 the Cohere Labs Acceptable Use Policy are stated in the card metadata and at the top of every card.
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import hashlib
 import json
 import shutil
 import sys
@@ -196,6 +201,53 @@ manifests and `lexsi_provenance.json`, the downstream sets, golden sets and ever
 """
 
 
+# Files that make up the model a tag pins; the card, fingerprints and train_meta.json may change under a tag.
+WEIGHT_PATTERNS = ("*.safetensors", "*.safetensors.index.json", "*.gguf", "*.bin", "*.bin.index.json",
+                   "config.json", "generation_config.json", "tokenizer*", "special_tokens_map.json",
+                   "added_tokens.json", "chat_template*", "*.model", "vocab*", "merges.txt")
+
+
+def is_weight_file(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(name, pat) for pat in WEIGHT_PATTERNS)
+
+
+def local_weights(model_dir: Path) -> dict[str, dict]:
+    """Weight files under ``model_dir``: relative path -> size, sha256 (the LFS oid) and git blob sha1."""
+    out = {}
+    for f in sorted(model_dir.rglob("*")):
+        rel = f.relative_to(model_dir).as_posix()
+        if not f.is_file() or not is_weight_file(rel) or rel.startswith("."):
+            continue
+        size = f.stat().st_size
+        sha256, git = hashlib.sha256(), hashlib.sha1(f"blob {size}\0".encode())
+        with f.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 22), b""):
+                sha256.update(chunk)
+                git.update(chunk)
+        out[rel] = {"size": size, "sha256": sha256.hexdigest(), "git_sha1": git.hexdigest()}
+    return out
+
+
+def remote_weights(api, repo_id: str, revision: str) -> dict:
+    """Weight files of ``repo_id`` at ``revision`` (a commit or tag): path -> RepoFile (blob_id, lfs.sha256)."""
+    return {f.path: f for f in api.list_repo_tree(repo_id, revision=revision, recursive=True)
+            if getattr(f, "blob_id", None) is not None and is_weight_file(f.path)}
+
+
+def weight_differences(local: dict[str, dict], remote: dict) -> list[str]:
+    """Why the local weight files are not the remote ones (empty when they are the same)."""
+    diff = [f"{p} only in the local model" for p in sorted(set(local) - set(remote))]
+    diff += [f"{p} only on the Hub" for p in sorted(set(remote) - set(local))]
+    for p in sorted(set(local) & set(remote)):
+        r, loc = remote[p], local[p]
+        lfs = getattr(r, "lfs", None)
+        same = loc["sha256"] == lfs.sha256 if lfs is not None else loc["git_sha1"] == r.blob_id
+        if not same:
+            diff.append(f"{p} differs")
+    return diff
+
+
 def tag_commit(api, repo_id: str, tag: str) -> str | None:
     """The commit a tag points at, or None if the tag does not exist."""
     refs = api.list_repo_refs(repo_id)
@@ -237,13 +289,15 @@ def main() -> None:
 
     api = HfApi()
     private = not args.public
+    failures: list[str] = []
 
     def visibility(repo_id: str, repo_type: str) -> None:
         try:
-            # the submission requires public, un-gated repos
+            # the submission requires public, un-gated repos; set every run, so --public alone flips it
             api.update_repo_settings(repo_id=repo_id, repo_type=repo_type, private=private,
                                      **({} if repo_type == "space" else {"gated": False}))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  (finish the other repos first; exit non-zero at the end)
+            failures.append(f"visibility of {repo_id}: {e}")
             print(f"[publish] could not set visibility of {repo_id}: {e}")
 
     # Model
@@ -253,10 +307,19 @@ def main() -> None:
             sys.exit(f"no merged model at {model_dir}: run forge/05_train_sft.py")
         api.create_repo(model_id, private=private, exist_ok=True)
         tagged = tag_commit(api, model_id, args.tag)
-        head = api.model_info(model_id).sha
-        if tagged and tagged != head:
-            sys.exit(f"[publish] tag {args.tag} already points at {tagged[:12]}, not at the head of {model_id} "
-                     f"({str(head)[:12]}). Tags are never moved: publish with a new version, e.g. --tag {bump(args.tag)}.")
+        upload_weights = True
+        if tagged:
+            # The tag pins the weights: decide on the weight files only, before uploading anything.
+            weights = local_weights(model_dir)
+            diff = weight_differences(weights, remote_weights(api, model_id, tagged))
+            if diff:
+                sys.exit(f"[publish] tag {args.tag} of {model_id} pins other weights (commit {tagged[:12]}): "
+                         f"{'; '.join(diff[:5])}{' ...' if len(diff) > 5 else ''}. Nothing was uploaded. Tags are "
+                         f"never moved: publish these weights as a new version, e.g. --tag {bump(args.tag)}.")
+            # Same weights: main only needs them again if it drifted from the tag.
+            upload_weights = bool(weight_differences(weights, remote_weights(api, model_id, "main")))
+            print(f"[publish] {model_id}: weights match tag {args.tag} ({tagged[:12]}); updating the card on main, "
+                  "the tag stays where it is")
         with tempfile.TemporaryDirectory() as tmp:
             stage = Path(tmp)
             shutil.copy(cards / "model_README.md", stage / "README.md")
@@ -264,15 +327,14 @@ def main() -> None:
             meta = config.RUNS / config.RUN_NAME / "train_meta.json"
             if meta.exists():
                 shutil.copy(meta, stage / "train_meta.json")
-            api.upload_folder(repo_id=model_id, folder_path=str(model_dir), commit_message=f"Lorde {args.tag} weights")
+            if upload_weights:
+                api.upload_folder(repo_id=model_id, folder_path=str(model_dir),
+                                  commit_message=f"Lorde {args.tag} weights")
             api.upload_folder(repo_id=model_id, folder_path=str(stage), commit_message="Model card and fingerprints")
-        head = api.model_info(model_id).sha
         if tagged is None:
+            head = api.model_info(model_id).sha
             api.create_tag(model_id, tag=args.tag, revision=head, tag_message=f"Lorde {args.tag}")
-        elif tagged != head:
-            sys.exit(f"[publish] these weights/card are on main ({str(head)[:12]}) but tag {args.tag} still points at "
-                     f"{tagged[:12]}: the card's `--revision {args.tag}` would serve the old model. Re-run with "
-                     f"--tag {bump(args.tag)}.")
+            print(f"[publish] tagged {args.tag} at {str(head)[:12]}")
         visibility(model_id, "model")
         print(f"[publish] model -> https://huggingface.co/{model_id} (revision {args.tag})")
 
@@ -335,9 +397,12 @@ def main() -> None:
         try:
             api.update_collection_metadata(c.slug, private=private)
         except Exception as e:  # noqa: BLE001
+            failures.append(f"visibility of collection {c.slug}: {e}")
             print(f"[publish] collection visibility {c.slug}: {e}")
     print(f"[publish] collections: https://huggingface.co/collections/{models.slug} , "
           f"https://huggingface.co/collections/{datasets_c.slug}")
+    if failures:
+        sys.exit("[publish] published, but " + "; ".join(failures) + ". Fix it on the Hub or re-run.")
     print("[publish] done" + ("" if args.public else " (private: re-run with --public when reviewed)"))
 
 
