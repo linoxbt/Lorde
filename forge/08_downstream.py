@@ -12,22 +12,29 @@ Tiny Aya Base learns to answer questions from a source passage (AlignTune, or
 (Wikipedia articles never used anywhere else), and AuditKIT scores the answers:
 ``f1_score`` against the reference answer and ``lexical_groundedness`` against
 the source. AuditKIT's paired bootstrap tests lorde vs ungated (should be better,
-p < 0.05) and lorde vs teacher (should be within 2% relative).
+p < 0.05) and lorde vs teacher (should be within ±2% relative; undefined if the teacher's F1 is 0).
 
 Writes runs/downstream/<set>/, results/downstream/preds_<set>.jsonl and
 results/downstream.{json,md}.
+
+Nothing stale is reused: a trained set is kept only if runs/downstream/<set>/meta.json records the same
+gated data (hash of passed.jsonl), and predictions only if preds_<set>.meta.json records the same adapter
+(hash of its weights) and eval set. Outputs from before these fingerprints existed are reused only with
+``--trust-legacy-cache`` (e.g. to score a finished run: ``score --trust-legacy-cache``).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import audit, config, jsonl, variants  # noqa: E402
+from lorde_forge import audit, config, fingerprint, jsonl, variants  # noqa: E402
 from lorde_forge import train as T  # noqa: E402
 from lorde_forge.report import fmt, table  # noqa: E402
 
@@ -43,6 +50,34 @@ def sft_rows(rows: list[dict]) -> list[dict]:
              "completion": " " + r["output"].strip()} for r in rows]
 
 
+EVAL_FIELDS = ("uid", "question", "context", "answer")
+
+
+def data_sha(rows: list[dict]) -> str:
+    return fingerprint.rows_sha(rows, ("uid", "instruction", "input", "output"))
+
+
+def preds_meta(args, name: str, adapter: Path | None, ev: list[dict]) -> dict:
+    a = None
+    if adapter is not None and any(adapter.rglob("adapter_config.json")):
+        a = fingerprint.dir_sha(T.find_adapter(adapter))
+    return {"base_model": args.base_model, "adapter_sha": "none" if adapter is None else a,
+            "eval_sha": fingerprint.rows_sha(ev, EVAL_FIELDS), "n_eval": len(ev), "max_new_tokens": args.max_new_tokens,
+            "prompt_sha": fingerprint.sha256(PROMPT)}
+
+
+def trained(out: Path, sha: str, trust_legacy: bool) -> tuple[bool, str]:
+    """Is runs/downstream/<set> a finished training run on exactly this gated data?"""
+    meta_p = out / "meta.json"
+    if not meta_p.exists():
+        return False, "not trained"
+    meta = json.loads(meta_p.read_text())
+    if meta.get("data_sha") is None:
+        return (True, "legacy run, trusted by --trust-legacy-cache") if trust_legacy else (
+            False, "legacy run without a data fingerprint (pass --trust-legacy-cache to keep it)")
+    return (True, "same gated data") if meta["data_sha"] == sha else (False, "the gated data changed")
+
+
 def stage_train(args) -> None:
     from transformers import AutoTokenizer
 
@@ -52,14 +87,24 @@ def stage_train(args) -> None:
     recipe = T.Recipe(epochs=args.epochs, batch_size=4, grad_accum=4, lr=2e-4, max_len=1536)
     for s in args.sets:
         out = RUNS / s
-        if (out / "meta.json").exists() and not args.force:
-            print(f"[downstream] {s}: already trained ({out / 'adapter'})")
-            continue
         rows = jsonl.read(config.DATA / "gated" / s / "passed.jsonl")
         if not rows:
             sys.exit(f"no gated set for {s}: run forge/07_curatorkit_plugin.py first")
         if n_equal:
             rows = sorted(rows, key=lambda r: variants.rng_for("eq", r["uid"]).random())[:n_equal]
+        sha = data_sha(rows)
+        done, why = trained(out, sha, args.trust_legacy_cache)
+        if done and not args.force:
+            print(f"[downstream] {s}: already trained ({why}; {out / 'adapter'})")
+            continue
+        # Checkpoints may only be resumed when they were trained on these very rows.
+        pending = out / "pending.json"
+        started = json.loads(pending.read_text()).get("data_sha") if pending.exists() else None
+        if (out / "meta.json").exists() or args.force or (started and started != sha):
+            print(f"[downstream] {s}: training from scratch ({why if (out / 'meta.json').exists() else 'new data'})")
+            shutil.rmtree(out / "adapter", ignore_errors=True)
+            (out / "meta.json").unlink(missing_ok=True)
+        jsonl.write_json(pending, {"data_sha": sha})
         keep, dropped = T.filter_by_tokens(sft_rows(rows), tok, recipe.max_len)
         path = out / "train.jsonl"
         jsonl.write(path, keep)
@@ -70,7 +115,8 @@ def stage_train(args) -> None:
         else:
             T.train_trl(args.base_model, path, None, out / "adapter", len(keep), recipe)
         # No merge: generation loads base + adapter, which saves ~6.7 GB of disk per set on Kaggle.
-        jsonl.write_json(out / "meta.json", {"rows": len(keep), "dropped": dropped, "seconds": round(time.time() - t0)})
+        jsonl.write_json(out / "meta.json", {"rows": len(keep), "dropped": dropped, "seconds": round(time.time() - t0),
+                                             "data_sha": sha, "base_model": args.base_model})
 
 
 def generate(base_model: str, adapter: Path | None, rows: list[dict], batch: int, max_new_tokens: int) -> list[str]:
@@ -111,21 +157,37 @@ def stage_generate(args) -> None:
         targets.insert(0, ("base", None))
     for name, adapter in targets:
         dst = OUT / f"preds_{name}.jsonl"
-        if dst.exists() and not args.force:
-            print(f"[downstream] {name}: predictions exist ({dst})")
+        meta = preds_meta(args, name, adapter, ev)
+        usable, status = fingerprint.check(dst, meta, args.trust_legacy_cache)
+        if usable and not args.force:
+            print(f"[downstream] {name}: predictions exist ({dst}; {status})")
             continue
+        if dst.exists():
+            fingerprint.discard(dst, status)
         outs = generate(args.base_model, adapter, ev, args.gen_batch, args.max_new_tokens)
         jsonl.write(dst, ({**r, "output": o} for r, o in zip(ev, outs)))
+        fingerprint.write_meta(dst, meta)
 
 
 def stage_score(args) -> None:
     names = (["base"] if (OUT / "preds_base.jsonl").exists() else []) + list(args.sets)
-    runs, report = {}, {"metrics": {}, "by_lang": {}, "train_rows": {}, "significance": {}}
+    runs, report = {}, {"metrics": {}, "by_lang": {}, "train_rows": {}, "significance": {}, "preds": {}}
+    ev = jsonl.read(config.DATA / "downstream_eval.jsonl")
+    if args.limit:
+        ev = ev[: args.limit]
     for name in names:
-        rows = jsonl.read(OUT / f"preds_{name}.jsonl")
+        dst = OUT / f"preds_{name}.jsonl"
+        rows = jsonl.read(dst)
         if not rows:
             print(f"[downstream] no predictions for {name}; skipping")
             continue
+        # Predictions must come from the current adapter on the current eval set.
+        usable, status = fingerprint.check(dst, preds_meta(args, name, None if name == "base" else RUNS / name / "adapter",
+                                                           ev), args.trust_legacy_cache)
+        if not usable:
+            print(f"[downstream] {name}: predictions not scored ({status}); re-run generate")
+            continue
+        report["preds"][name] = status
         runs[name] = audit.answer_run(name, rows)
         report["metrics"][name] = dict(runs[name].headline)
         f1 = audit.per_sample(runs[name], "f1_score")
@@ -138,8 +200,6 @@ def stage_score(args) -> None:
         report["by_lang"][name] = by_lang
         meta = RUNS / name / "meta.json"
         if meta.exists():
-            import json
-
             report["train_rows"][name] = json.loads(meta.read_text())["rows"]
 
     cand = "lorde"
@@ -149,14 +209,22 @@ def stage_score(args) -> None:
                 m: audit.run_significance(runs[base], runs[cand], m) for m in ("f1_score", "lexical_groundedness")}
     if cand in report["metrics"] and "teacher" in report["metrics"]:
         t, c = report["metrics"]["teacher"]["f1_score"], report["metrics"][cand]["f1_score"]
-        report["f1_relative_to_teacher"] = round((c - t) / t, 4) if t else None
-        report["within_2pct_of_teacher"] = t == 0 or (c - t) / t >= -0.02
+        report["f1_relative_to_teacher"], report["within_2pct_of_teacher"] = within_2pct(t, c)
     s = report["significance"].get(f"{cand} vs ungated", {}).get("f1_score", {})
     if s:
         report["better_than_ungated_p05"] = bool(s.get("significant") and s.get("delta", 0) > 0)
     jsonl.write_json(config.RESULTS / "downstream.json", report)
     (config.RESULTS / "downstream.md").write_text(render_md(report), encoding="utf-8")
     print(f"[downstream] wrote {config.RESULTS / 'downstream.md'}")
+
+
+def within_2pct(teacher_f1: float, lorde_f1: float) -> tuple[float | None, bool | None]:
+    """(relative difference, criterion met). Two-sided ("within 2% relative"), and undefined, not vacuously
+    met, when the teacher-gated F1 is 0."""
+    if not teacher_f1:
+        return None, None
+    rel = (lorde_f1 - teacher_f1) / teacher_f1
+    return round(rel, 4), abs(rel) <= 0.02
 
 
 def render_md(r: dict) -> str:
@@ -168,9 +236,12 @@ def render_md(r: dict) -> str:
              table(["Training data", "Rows", "F1", "Groundedness"],
                    [[n, r["train_rows"].get(n, "–"), fmt(v.get("f1_score")), fmt(v.get("lexical_groundedness"))]
                     for n, v in m.items()]), ""]
-    if "f1_relative_to_teacher" in r:
+    if r.get("f1_relative_to_teacher") is not None:
         lines.append(f"Lorde-gated F1 relative to teacher-gated: **{r['f1_relative_to_teacher'] * 100:+.1f}%** "
-                     f"(criterion: within 2%; {'met' if r['within_2pct_of_teacher'] else 'not met'}).\n")
+                     f"(criterion: within ±2%; {'met' if r['within_2pct_of_teacher'] else 'not met'}).\n")
+    elif "f1_relative_to_teacher" in r:
+        lines.append("Lorde-gated F1 relative to teacher-gated: undefined (teacher-gated F1 is 0), so the "
+                     "within-2% criterion is not measured.\n")
     if "better_than_ungated_p05" in r:
         lines.append(f"Lorde-gated beats ungated with p < 0.05: **{fmt(r['better_than_ungated_p05'])}**.\n")
     if r["significance"]:
@@ -201,6 +272,8 @@ def main() -> None:
     ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--trust-legacy-cache", action="store_true",
+                    help="reuse trained sets and predictions written before fingerprints existed")
     args = ap.parse_args()
     args.sets = [s.strip() for s in args.sets.split(",") if s.strip()]
     if args.stage in ("train", "all"):

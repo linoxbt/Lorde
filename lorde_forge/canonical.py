@@ -83,3 +83,19 @@ def canonical(j: Judgment) -> dict[str, Any] | None:
 def dumps(target: dict[str, Any]) -> str:
     """Compact, stable serialization used as the assistant turn."""
     return json.dumps(target, ensure_ascii=False, separators=(", ", ": "))
+
+
+def reference_verdict(item: dict[str, Any]) -> str | None:
+    """The teacher's verdict as the student was trained to give it (the canonical target's verdict).
+
+    Test items written by the fixed step 3 carry it as ``teacher_verdict`` (with ``teacher_verdict_raw``
+    next to it); older ones carry the raw teacher verdict, so it is re-derived from ``teacher_raw``.
+    """
+    if item.get("kind") != "grounding":
+        return None
+    if "teacher_verdict_raw" in item or item.get("teacher_raw") is None:
+        return item.get("teacher_verdict")
+    from .contract import parse_reply
+
+    target = canonical(parse_reply("grounding", item["teacher_raw"]))
+    return target["verdict"] if target else item.get("teacher_verdict")

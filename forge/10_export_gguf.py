@@ -4,7 +4,8 @@
     python forge/10_export_gguf.py --user <hf-user>              # private repo <user>/lorde-tiny-aya-GGUF
     python forge/10_export_gguf.py --user <hf-user> --public
 
-Uses llama.cpp's own converter (convert_hf_to_gguf.py, cloned at run time) with --outtype q8_0, which
+Uses llama.cpp's own converter (convert_hf_to_gguf.py, cloned at run time at the pinned tag LLAMA_CPP_REF,
+overridable with --llama-cpp-ref or the env var of the same name) with --outtype q8_0, which
 needs no compiled tools. The staging Serve on Railway (llama.cpp) then serves it by setting
 LLAMA_ARG_HF_REPO=<user>/lorde-tiny-aya-GGUF:Q8_0. Runs in the forge-train env (torch, transformers).
 """
@@ -12,6 +13,7 @@ LLAMA_ARG_HF_REPO=<user>/lorde-tiny-aya-GGUF:Q8_0. Runs in the forge-train env (
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lorde_forge import config  # noqa: E402
 
 LLAMA_CPP = "https://github.com/ggml-org/llama.cpp"
+LLAMA_CPP_REF = os.environ.get("LLAMA_CPP_REF", "b12283")  # a release tag, never HEAD: the converter changes often
 
 CARD = """---
 license: cc-by-nc-4.0
@@ -31,14 +34,15 @@ tags: [gguf, llm-judge, curatorkit, lexsi-hackathon]
 # Lorde (GGUF)
 
 GGUF build of [{user}/lorde-tiny-aya](https://huggingface.co/{user}/lorde-tiny-aya) for llama.cpp and CPU serving.
-Quantization: {outtype}. Serve with:
+Quantization: {outtype}, converted with llama.cpp `{ref}`. Serve with:
 
 ```bash
 llama-server -hf {user}/lorde-tiny-aya-GGUF:{tag} --alias lorde --jinja -c 4096
 ```
 
 Use structured outputs per gate (`response_format` with the gate's JSON schema) so every reply is gate-usable.
-Licence: CC-BY-NC-4.0, inherited from Tiny Aya Global. Non-commercial use only.
+Licence: CC-BY-NC-4.0, inherited from Tiny Aya Global, and the Cohere Labs Acceptable Use Policy
+(https://docs.cohere.com/docs/c4ai-acceptable-use-policy). Non-commercial use only.
 """
 
 
@@ -51,6 +55,7 @@ def main() -> None:
     ap.add_argument("--work", default=str(config.RUNS / "gguf"))
     ap.add_argument("--public", action="store_true")
     ap.add_argument("--no-push", action="store_true")
+    ap.add_argument("--llama-cpp-ref", default=LLAMA_CPP_REF, help="llama.cpp tag to convert with")
     args = ap.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -58,9 +63,10 @@ def main() -> None:
         sys.exit(f"no merged model at {model_dir}: run forge/05_train_sft.py")
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
-    src = work / "llama.cpp"
+    src = work / f"llama.cpp-{args.llama_cpp_ref}"
     if not (src / "convert_hf_to_gguf.py").exists():
-        subprocess.run(["git", "clone", "--depth", "1", LLAMA_CPP, str(src)], check=True)
+        subprocess.run(["git", "clone", "--depth", "1", "--branch", args.llama_cpp_ref, LLAMA_CPP, str(src)],
+                       check=True)
     # gguf-py from the same checkout keeps the converter and the library in step.
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", str(src / "gguf-py")], check=True)
 
@@ -77,7 +83,7 @@ def main() -> None:
     api = HfApi()
     repo = f"{args.user}/{args.repo}"
     api.create_repo(repo, private=not args.public, exist_ok=True)
-    (work / "README.md").write_text(CARD.format(user=args.user, outtype=args.outtype, tag=tag), encoding="utf-8")
+    (work / "README.md").write_text(CARD.format(user=args.user, outtype=args.outtype, tag=tag, ref=args.llama_cpp_ref), encoding="utf-8")
     api.upload_file(path_or_fileobj=str(work / "README.md"), path_in_repo="README.md", repo_id=repo)
     api.upload_file(path_or_fileobj=str(out), path_in_repo=out.name, repo_id=repo, commit_message="Lorde GGUF")
     print(f"[gguf] pushed https://huggingface.co/{repo} · serve with LLAMA_ARG_HF_REPO={repo}:{tag}")

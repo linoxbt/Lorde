@@ -59,3 +59,30 @@ def test_variants_deterministic():
     assert len(variants.pad_repetition(t, "u4")) > len(t)
     assert variants.pick_degraded("reward", "x") in variants.REWARD_DEGRADED
     assert variants.swap_from(["a", "b"], "u", exclude="a") == "b"
+
+
+def test_stratified_draws_disjoint_proportional_seeded():
+    rows = ([{"uid": f"r-en-{i}", "kind": "reward", "lang": "en"} for i in range(300)]
+            + [{"uid": f"g-hi-{i}", "kind": "grounding", "lang": "hi"} for i in range(100)])
+    a, b = splits.stratified_draws(rows, 40, k=2, seed=0)
+    assert len(a) == len(b) == 40 and not {r["uid"] for r in a} & {r["uid"] for r in b}
+    assert sum(r["kind"] == "grounding" for r in a) == 10  # proportional: 100 of 400
+    assert a == splits.stratified_draws(rows, 40, k=2, seed=0)[0]
+    assert a != splits.stratified_draws(rows, 40, k=2, seed=1)[0]
+    assert a[:5] != rows[:5]  # not the first items of the file
+    small = splits.stratified_draws(rows[:30], 256, k=2)
+    assert len(small[0]) <= 15 and not {r["uid"] for r in small[0]} & {r["uid"] for r in small[1]}
+
+
+def test_reference_verdict_is_canonical():
+    import json
+
+    from lorde_forge import canonical
+
+    raw = json.dumps({"grounding_score": 0.5, "supported_claims": [], "unsupported_claims": []})
+    legacy = {"kind": "grounding", "teacher_raw": raw, "teacher_verdict": None}
+    assert canonical.reference_verdict(legacy) == "partially_grounded"
+    new = {"kind": "grounding", "teacher_raw": raw, "teacher_verdict": "partially_grounded",
+           "teacher_verdict_raw": None}
+    assert canonical.reference_verdict(new) == "partially_grounded"
+    assert canonical.reference_verdict({"kind": "reward", "teacher_raw": "{}"}) is None

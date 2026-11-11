@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Push and start the Lorde kernel on Kaggle (GPU T4 x2, Internet on): bash forge/kaggle/push.sh a|b|ab|c
 # Needs the kaggle CLI (>= 1.8) logged in and a private dataset <kaggle-user>/lorde-secrets holding hf_token.
+# Optional: LORDE_REPO (git URL) and LORDE_BRANCH override the repo and branch the kernel clones.
 set -euo pipefail
 cd "$(dirname "$0")"
 SESSION="${1:-a}"
 KUSER="${KAGGLE_USER:-$(kaggle config view | awk '/username/{print $3}')}"
 work=$(mktemp -d)
-sed "s/^SESSION = .*/SESSION = \"$SESSION\"/" kernel.py > "$work/kernel.py"
+sed -e "s/^SESSION = .*/SESSION = \"$SESSION\"/" \
+    ${LORDE_REPO:+-e "s|\"https://github.com/[^\"]*\"|\"$LORDE_REPO\"|"} \
+    ${LORDE_BRANCH:+-e "s|(\"LORDE_BRANCH\", \"[^\"]*\")|(\"LORDE_BRANCH\", \"$LORDE_BRANCH\")|"} \
+    kernel.py > "$work/kernel.py"
 cat > "$work/kernel-metadata.json" <<JSON
 {
   "id": "$KUSER/lorde-forge",

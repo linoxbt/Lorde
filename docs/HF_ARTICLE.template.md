@@ -60,6 +60,8 @@ gate's reply to its JSON schema, and Bench measures the raw model too so the mod
 
 <!-- teacher_audit -->
 
+<!-- acceptance -->
+
 <!-- results:judge_eval -->
 
 <!-- results:plugin_eval -->
@@ -69,6 +71,18 @@ gate's reply to its JSON schema, and Bench measures the raw model too so the mod
 ## ROI: self-hosted Lorde vs paying per token
 
 <!-- roi -->
+
+## Deviations from the spec
+
+We changed a few things from the build spec (LORDE-SPEC-001 v1.0), on purpose:
+
+- **Languages:** Portuguese, Indonesian and Turkish instead of Swahili, Yoruba and Hausa. Aya Expanse, the
+  teacher, does not cover those three, and a teacher that cannot read a language cannot label it.
+- **Maximum length 1,536 tokens** instead of 2,048, and **batch 1 × 16 accumulation** instead of 2 × 8. On a
+  16 GB T4, Tiny Aya's 261k-token vocabulary makes the logits the memory peak. 1,536 tokens is the 99.7th
+  percentile of the judge SFT set, and the effective batch is still 16. Longer rows are dropped, never truncated.
+- **Hardware:** everything ran on free Kaggle T4s, not the spec's L4. Every throughput and latency figure
+  above names the GPU it was measured on. We did not measure an L4.
 
 ## Limitations
 

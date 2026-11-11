@@ -9,8 +9,13 @@
 Same commands as forge/kaggle_runbook.ipynb, run in the Kaggle kernel's own Python (huggingface_hub is
 preinstalled there). Needs HF_TOKEN in the environment and HF_USER (default Oxlino). Every step resumes from
 the private work repo <HF_USER>/lorde-work, and the driver uploads data/, results/, bench/ and logs/ there
-after each step (data and logs also every 10 minutes during long steps), so progress is visible while it runs and a
-killed session loses at most one step. A JSON progress record goes to live/progress.json in the same repo.
+after each step (data and logs also every 10 minutes during long steps, plus the newest complete training
+checkpoint while training), so progress is visible while it runs and a killed session loses at most one step
+(training resumes from its checkpoint). A JSON progress record goes to live/progress.json in the same repo.
+
+Human labels belong to the label tool: the driver never uploads data/human_labels.jsonl (its older local copy
+would overwrite newer labels), uploads the human sample and its key only after the step that writes them, and
+pulls the latest labels again right before the steps that read them.
 """
 
 from __future__ import annotations
@@ -132,6 +137,47 @@ def train_args() -> str:
 
 SESSIONS = {"a": SESSION_A, "b": SESSION_B, "c": SESSION_C}
 
+# Written by the label tool (labels) or by step 3 (key); pulled fresh before the steps that read them.
+HUMAN_FILES = ("human_labels.jsonl", "human_sample_key.jsonl")
+WRITES_HUMAN_SAMPLE = {"splits"}  # only after this step may the sample and its key be uploaded
+READS_HUMAN_LABELS = {"judge-eval", "publish-private"}
+TRAIN_STEPS = {"train-smoke", "train"}
+
+
+def push_ignore(base: str, human_sample: bool = False) -> list[str]:
+    """ignore_patterns for upload_folder of ROOT/<base> (patterns are relative to that folder)."""
+    out = ["*.tmp", "_input/**", "*.pid"]
+    if base == "data":
+        out += ["human_labels.jsonl", "human_labels.jsonl.*"]  # never: the label tool owns them
+        if not human_sample:  # a stale local copy must not undo forge/04b_blind_sample.py on the hub
+            out += ["human_sample.jsonl", "human_sample_key.jsonl"]
+    return out
+
+
+def pull_patterns(checkpoints: bool = False) -> list[str]:
+    out = ["data/**", "results/**", "runs/**/merged/**", "runs/**/train_meta.json", "bench/**"]
+    if checkpoints:
+        out.append("runs/*/adapter/checkpoint-*/**")
+    return out
+
+
+def checkpoint_ready(ckpt: Path, quiet_s: float = 120) -> bool:
+    """Complete once the trainer state is written and nothing in it changed for ``quiet_s`` seconds."""
+    files = [f for f in ckpt.rglob("*") if f.is_file()]
+    if not files or not (ckpt / "trainer_state.json").exists():
+        return False
+    return time.time() - max(f.stat().st_mtime for f in files) >= quiet_s
+
+
+def latest_checkpoints(quiet_s: float = 120) -> list[Path]:
+    out = []
+    for adapter in sorted((ROOT / "runs").glob("*/adapter")):
+        ready = [c for c in adapter.glob("checkpoint-*")
+                 if c.name.split("-")[-1].isdigit() and checkpoint_ready(c, quiet_s)]
+        if ready:
+            out.append(max(ready, key=lambda c: int(c.name.split("-")[-1])))
+    return out
+
 
 class Hub:
     def __init__(self) -> None:
@@ -141,23 +187,49 @@ class Hub:
         self.api.create_repo(WORK_REPO, repo_type="dataset", private=True, exist_ok=True)
         self.lock = threading.Lock()
 
-    def pull(self) -> None:
+    def pull(self, checkpoints: bool = False) -> None:
         from huggingface_hub import snapshot_download
 
         snapshot_download(WORK_REPO, repo_type="dataset", local_dir=str(ROOT),
-                          allow_patterns=["data/**", "results/**", "runs/**/merged/**", "runs/**/train_meta.json",
-                                          "bench/**"])
+                          allow_patterns=pull_patterns(checkpoints))
 
-    def push(self, folders=("data", "results", "bench", "logs"), message="sync") -> None:
+    def pull_human_labels(self) -> None:
+        """Fresh copies of the labels (written by the label tool, maybe minutes ago) and of the sample key."""
+        from huggingface_hub import hf_hub_download
+
+        for name in HUMAN_FILES:
+            try:
+                got = hf_hub_download(WORK_REPO, f"data/{name}", repo_type="dataset", force_download=True)
+                (ROOT / "data").mkdir(exist_ok=True)
+                shutil.copyfile(got, ROOT / "data" / name)
+                print(f"[driver] pulled the latest data/{name}", flush=True)
+            except Exception as e:  # noqa: BLE001  (no labels yet)
+                print(f"[driver] data/{name} not pulled: {type(e).__name__}", flush=True)
+
+    def push(self, folders=("data", "results", "bench", "logs"), message="sync", human_sample: bool = False) -> None:
         with self.lock:
             for base in folders:
                 if (ROOT / base).exists():
                     try:
                         self.api.upload_folder(repo_id=WORK_REPO, repo_type="dataset", folder_path=str(ROOT / base),
                                                path_in_repo=base if base != "logs" else "live/logs",
-                                               ignore_patterns=["*.tmp", "_input/**", "*.pid"], commit_message=message)
+                                               ignore_patterns=push_ignore(base, human_sample), commit_message=message)
                     except Exception as e:  # a failed sync must never kill a long run
                         print(f"[driver] sync of {base} failed: {e}", flush=True)
+
+    def push_checkpoints(self) -> None:
+        """Upload the newest complete training checkpoint per run, dropping older ones from the repo."""
+        with self.lock:
+            for ckpt in latest_checkpoints():
+                adapter = ckpt.parent
+                try:
+                    self.api.upload_folder(repo_id=WORK_REPO, repo_type="dataset", folder_path=str(adapter),
+                                           path_in_repo=adapter.relative_to(ROOT).as_posix(),
+                                           allow_patterns=[f"{ckpt.name}/**"], delete_patterns=["checkpoint-*/**"],
+                                           commit_message=f"checkpoint {ckpt.relative_to(ROOT).as_posix()}")
+                    print(f"[driver] uploaded {ckpt.relative_to(ROOT)}", flush=True)
+                except Exception as e:  # noqa: BLE001  (never kill training over a sync)
+                    print(f"[driver] checkpoint upload failed: {e}", flush=True)
 
     def progress(self, record: dict) -> None:
         with self.lock:
@@ -176,6 +248,8 @@ def run_bash(name: str, script: str, hub: Hub) -> int:
     def heartbeat() -> None:
         while not stop.wait(600):
             hub.push(("data", "logs"), message=f"progress during {name}")
+            if name in TRAIN_STEPS:
+                hub.push_checkpoints()
 
     t = threading.Thread(target=heartbeat, daemon=True)
     t.start()
@@ -223,7 +297,7 @@ def main() -> None:
     if not shutil.which("uv"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "uv"], check=True)
     hub = Hub()
-    hub.pull()
+    hub.pull(checkpoints="b" in which)
     record = {"session": which, "started": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), "steps": []}
     for sess, name, script in plan:
         if only and name not in only and name != "setup":
@@ -232,6 +306,8 @@ def main() -> None:
         record["current"] = f"{sess}:{name}"
         hub.progress(record)
         print(f"\n===== [{sess}] {name} =====", flush=True)
+        if name in READS_HUMAN_LABELS:
+            hub.pull_human_labels()
         if name == "exit-check-a":
             ok, note = exit_check_a()
             rc = 0 if ok else 1
@@ -245,7 +321,7 @@ def main() -> None:
         record["steps"].append(step)
         print(f"===== [{sess}] {name}: rc={rc} in {step['minutes']} min {note}", flush=True)
         if name != "setup":
-            hub.push(message=f"{sess}:{name} rc={rc}")
+            hub.push(message=f"{sess}:{name} rc={rc}", human_sample=name in WRITES_HUMAN_SAMPLE and rc == 0)
         if rc != 0:
             record["current"] = None
             record["failed"] = f"{sess}:{name}"

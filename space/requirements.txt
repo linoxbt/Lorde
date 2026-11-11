@@ -1,4 +1,4 @@
-curatorkit>=0.1.21,<0.2
+curatorkit==0.1.23   # the exact templates Lorde was trained on
 jsonschema>=4
 openai>=1.40
 transformers>=5.15,<6

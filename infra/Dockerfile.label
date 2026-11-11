@@ -1,8 +1,14 @@
-# Hosted human-labelling page (forge/04_label_tool.py --hub). Env: HF_TOKEN, LABEL_HUB_REPO, LABEL_PASSWORD.
+# Hosted human-labelling page (forge/04_label_tool.py --hub).
+# Env: HF_TOKEN (fine-grained, write access to the work repo only), LABEL_HUB_REPO, LABEL_PASSWORD and
+# LABEL_NAME (= the login username, recorded as the labeller) or LABEL_USERS=name:password,...; PORT.
+# The tool refuses to start without a password, and refuses a sample that is not blind (forge/04b_blind_sample.py).
 FROM python:3.11-slim
+RUN useradd --create-home --uid 10001 label
 WORKDIR /app
-RUN pip install --no-cache-dir "gradio>=5" "huggingface_hub>=1.0"
+RUN pip install --no-cache-dir "gradio==6.31.0" "huggingface_hub==1.33.0"
 COPY lorde_forge lorde_forge
 COPY forge/04_label_tool.py forge/04_label_tool.py
-ENV PYTHONUNBUFFERED=1
-CMD ["sh", "-c", "python forge/04_label_tool.py --host 0.0.0.0 --labeler ${LABEL_NAME:-owner}"]
+RUN mkdir -p /app/data && chown -R label:label /app/data
+USER label
+ENV PYTHONUNBUFFERED=1 HF_HOME=/home/label/.cache/huggingface
+CMD ["sh", "-c", "python forge/04_label_tool.py --host 0.0.0.0"]

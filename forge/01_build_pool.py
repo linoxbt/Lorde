@@ -118,8 +118,9 @@ def _chunk(text: str, lo: int = 900, hi: int = 2200) -> str | None:
 ROWS_API = "https://datasets-server.huggingface.co/rows"
 
 
-def _wiki_rows_api(config_name: str, page: int = 100, max_rows: int = 20000):
-    """Articles in dump order from the Hub's datasets-server: fast, no shard downloads."""
+def _wiki_rows_api(config_name: str, page: int = 100, max_rows: int = 20000, progress: dict | None = None):
+    """Articles in dump order from the Hub's datasets-server: fast, no shard downloads. ``progress["n"]``
+    counts the articles yielded, so a fallback can resume at the same offset."""
     import json as _json
     import time as _time
     import urllib.parse
@@ -140,22 +141,29 @@ def _wiki_rows_api(config_name: str, page: int = 100, max_rows: int = 20000):
         if not rows:
             return
         for row in rows:
+            if progress is not None:
+                progress["n"] += 1
             yield row["row"]
 
 
-def _wiki_stream(config_name: str):
+def _wiki_stream(config_name: str, skip: int = 0):
     from datasets import load_dataset
 
-    yield from load_dataset(config.WIKI_DATASET, config_name, split="train", streaming=True)
+    ds = load_dataset(config.WIKI_DATASET, config_name, split="train", streaming=True)
+    yield from (ds.skip(skip) if skip else ds)
 
 
-def _articles(config_name: str):
-    """Rows API first; fall back to `datasets` streaming if the API is unreachable."""
+def _articles(config_name: str, rows_api=None, stream=None):
+    """Rows API first; if it fails, continue with `datasets` streaming from the same offset (same dump order),
+    so no article is seen twice. Callers also de-duplicate by title and url."""
+    rows_api, stream = rows_api or _wiki_rows_api, stream or _wiki_stream
+    progress = {"n": 0}
     try:
-        yield from _wiki_rows_api(config_name)
+        yield from rows_api(config_name, progress=progress)
     except Exception as e:  # noqa: BLE001
-        print(f"[pool] datasets-server unavailable for {config_name} ({e}); streaming instead")
-        yield from _wiki_stream(config_name)
+        print(f"[pool] datasets-server unavailable for {config_name} after {progress['n']} articles ({e}); "
+              f"streaming from offset {progress['n']} instead")
+        yield from stream(config_name, skip=progress["n"])
 
 
 def chunk_wikipedia(n_judge: int, n_down_raw: int, n_down_eval: int) -> list[dict]:
@@ -166,6 +174,7 @@ def chunk_wikipedia(n_judge: int, n_down_raw: int, n_down_eval: int) -> list[dic
     plan = [("judge", n_judge), ("down_raw", n_down_raw), ("down_eval", n_down_eval)]
     for lang, meta in config.LANGS.items():
         it = _articles(f"{config.WIKI_DUMP}.{meta['wiki']}")
+        seen: set[str] = set()  # one article feeds at most one chunk, so judge/downstream splits never share one
         for use, n in plan:
             got = 0
             while got < n:
@@ -174,6 +183,10 @@ def chunk_wikipedia(n_judge: int, n_down_raw: int, n_down_eval: int) -> list[dic
                 except StopIteration:
                     break
                 title = art.get("title", "")
+                keys = {f"t:{title.strip().lower()}", f"u:{art.get('url') or ''}"} - {"u:", "t:"}
+                if keys & seen:
+                    continue
+                seen |= keys
                 if ":" in title or title.lower().startswith(("list of", "liste", "lista")):
                     continue
                 if len(art.get("text", "")) < 1500:
@@ -223,8 +236,15 @@ def phase_teacher(args: argparse.Namespace) -> None:
                 for s in produced:
                     by_chunk[s.metadata.get("source_sample_id")].append(
                         {"question": s.instruction, "answer": s.output})
+                missing = 0
                 for c in batch:
-                    out.add({"chunk_id": c["chunk_id"], "qas": by_chunk.get(c["chunk_id"], [])[: nq[use]]})
+                    qas = by_chunk.get(c["chunk_id"], [])[: nq[use]]
+                    if qas:
+                        out.add({"chunk_id": c["chunk_id"], "qas": qas})
+                    else:  # failed call or empty reply: not cached, so the next run retries it
+                        missing += 1
+                if missing:
+                    print(f"[pool] QA {use}: {missing} chunks without QA pairs (not cached; re-run to retry)")
                 print(f"[pool] QA {use}: {min(i + args.batch, len(batch_all))}/{len(batch_all)}")
 
     # Translations for the wrong-language variant.
@@ -330,12 +350,13 @@ def phase_assemble(args: argparse.Namespace) -> None:
         pool.append({"uid": f"{pid}:{v}", "variant": v, **base, "response": resp})
 
     judge_qa = [q for q in qa if q["use"] == "judge"]
-    answers_by_lang: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    # Swapped answers come from the same split only: a judge item must never carry a downstream-eval answer.
+    answers_by: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
     for q in qa:
-        answers_by_lang[q["lang"]].append((q["chunk_id"], q["answer"]))
+        answers_by[(q["lang"], q["use"])].append((q["chunk_id"], q["answer"]))
 
     def other_answer(q: dict) -> str:
-        cands = [a for cid, a in answers_by_lang[q["lang"]] if cid != q["chunk_id"]]
+        cands = [a for cid, a in answers_by[(q["lang"], q["use"])] if cid != q["chunk_id"]]
         return variants.swap_from(cands, q["qid"], exclude=q["answer"])
 
     def degrade(q: dict, v: str) -> tuple[str, str]:
