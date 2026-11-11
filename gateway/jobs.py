@@ -1,7 +1,8 @@
 """Uploads and gating jobs (spec Sections 11 and 11.4).
 
 POST /v1/uploads            signed upload URL for a dataset (JSONL, CSV or Parquet, <= 200 MB)
-POST /v1/jobs               create a gating job (<= 3 queued or running per org)
+POST /v1/jobs               create a gating job (<= 3 queued or running per org; 429 quota_exceeded once the
+                            org's daily judgments are used up; the worker caps a job's rows to what is left)
 GET  /v1/jobs/{id}          status, progress, counts
 GET  /v1/jobs/{id}/results  signed URLs: passed.jsonl, rejected.jsonl, report.md, manifest, provenance
 POST /v1/jobs/{id}/cancel   cancel a queued or running job
@@ -95,6 +96,10 @@ async def submit_job(gw: Gateway, key: ApiKey, req: JobRequest, idempotency_key:
     if await jobs.active_jobs(key.org_id) >= gw.s.max_active_jobs:
         raise RateLimited(f"at most {gw.s.max_active_jobs} jobs may be queued or running per organization",
                           headers={"Retry-After": "30"})
+    if (lim := gw.s.org_daily_judgments) > 0:  # a job cannot start on a used-up daily quota (audit N1b)
+        used = max(await gw.quota.used(key.org_id), await jobs.judgments_today(key.org_id))
+        if used >= lim:
+            raise gw.quota_error(used)
     source: dict = {"dataset_url": req.dataset_url}
     dataset_id = None
     if req.upload_id:

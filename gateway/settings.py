@@ -4,6 +4,31 @@ DATABASE_URL: use Supabase's connection string with ``sslmode=verify-full`` and 
 the Supabase CA certificate (Dashboard > Database > SSL), e.g.
 ``postgresql://...@db.<ref>.supabase.co:5432/postgres?sslmode=verify-full&sslrootcert=/etc/ssl/supabase-ca.crt``.
 ``sslmode=require`` encrypts but does not verify the server, so it does not stop a man in the middle.
+
+Tenant fairness (audit N1; see gateway/slots.py and gateway/quota.py):
+
+- ``LORDE_UPSTREAM_CONCURRENCY`` is the number of calls Serve should have in flight at once (llama.cpp: its
+  ``--parallel`` slots; vLLM: what it batches well). With ``LORDE_WORKER_SHARES_UPSTREAM=1`` (the default: the
+  job worker calls the same Serve), the Gateway keeps ``LORDE_WORKER_JUDGE_CONCURRENCY`` of them for the
+  worker and uses the rest (at least one) for API calls: ``api_upstream_slots``. So on the one-slot CPU
+  deployment Serve sees at most one API call plus one job judgment at a time, and an API call waits for at most
+  one job judgment inside Serve.
+- ``LORDE_ORG_UPSTREAM_CONCURRENCY`` (1): API calls in flight per organization.
+- ``LORDE_UPSTREAM_QUEUE_TIMEOUT_S`` (30) and ``LORDE_UPSTREAM_MAX_WAITERS`` (32): how long, and how many
+  requests may, wait for a slot; past either, 429 ``rate_limited`` "model busy, retry later".
+- ``LORDE_ORG_DAILY_JUDGMENTS`` (5000, 0 = unlimited): judgments per organization per UTC day, API and jobs
+  together; past it, 429 ``quota_exceeded`` until 00:00 UTC.
+
+Per-IP limit (audit N2): ``LORDE_IP_RPM`` (300, 0 = off) requests per minute per client IP on every keyed route,
+checked before the API key is looked up, so a flood of made-up keys from one address is refused without
+reaching the database. The client IP is the TCP peer as uvicorn reports it. Behind Railway's proxy run uvicorn
+with ``--proxy-headers --forwarded-allow-ips='*'`` (infra/start-api.sh does): uvicorn then reports the first
+X-Forwarded-For hop, the address Railway's edge saw. Without uvicorn's proxy headers, list the proxy addresses
+(IPs or CIDRs, or ``*``) in ``LORDE_TRUSTED_PROXIES`` and the Gateway reads X-Forwarded-For's first hop itself,
+only for requests that come from one of them. The Console relays its users' calls from Vercel's few egress
+addresses; with ``LORDE_RELAY_SECRET`` set (32+ characters, the same value in the Console), a request carrying
+``x-lorde-relay-secret: <secret>`` is limited by its ``x-lorde-client-ip`` header instead. IPv6 clients are
+limited per /64.
 """
 
 from __future__ import annotations
@@ -67,17 +92,35 @@ class Settings:
     job_max_rows: int = field(default_factory=lambda: int(_env("LORDE_JOB_MAX_ROWS", "50000")))
     job_max_input_bytes: int = field(
         default_factory=lambda: int(_env("LORDE_JOB_MAX_INPUT_BYTES", str(200 * 1024 * 1024))))
-    worker_judge_concurrency: int | None = field(
-        default_factory=lambda: int(v) if (v := _env("LORDE_WORKER_JUDGE_CONCURRENCY")) else None)
+    # one job judgment at a time by default: jobs share Serve with API calls (see the module docstring)
+    worker_judge_concurrency: int = field(default_factory=lambda: int(_env("LORDE_WORKER_JUDGE_CONCURRENCY", "1")))
+    worker_shares_upstream: bool = field(default_factory=lambda: _env("LORDE_WORKER_SHARES_UPSTREAM", "1") == "1")
+    # tenant fairness (audit N1)
+    org_upstream_concurrency: int = field(
+        default_factory=lambda: int(_env("LORDE_ORG_UPSTREAM_CONCURRENCY", "1")))
+    upstream_queue_timeout_s: float = field(
+        default_factory=lambda: float(_env("LORDE_UPSTREAM_QUEUE_TIMEOUT_S", "30")))
+    upstream_max_waiters: int = field(default_factory=lambda: int(_env("LORDE_UPSTREAM_MAX_WAITERS", "32")))
+    org_daily_judgments: int = field(default_factory=lambda: int(_env("LORDE_ORG_DAILY_JUDGMENTS", "5000")))
+    # per-IP limit before key resolution (audit N2)
+    ip_rpm: int = field(default_factory=lambda: int(_env("LORDE_IP_RPM", "300")))
+    trusted_proxies: list[str] = field(default_factory=lambda: _csv("LORDE_TRUSTED_PROXIES"))
+    # the Console's server-side relay sends this secret plus x-lorde-client-ip (its user's address)
+    relay_secret: str | None = field(default_factory=lambda: _env("LORDE_RELAY_SECRET"))
     mcp_allowed_hosts: list[str] = field(default_factory=lambda: _csv("LORDE_MCP_ALLOWED_HOSTS"))
 
     def __post_init__(self) -> None:
-        if self.worker_judge_concurrency is None:
-            self.worker_judge_concurrency = self.upstream_concurrency
         if not self.mcp_allowed_hosts and self.public_url:
             host = urlparse(self.public_url).netloc
             if host:  # DNS-rebinding protection for /mcp defaults to the Gateway's own public host
                 self.mcp_allowed_hosts = [host, f"{host}:*"]
+
+    @property
+    def api_upstream_slots(self) -> int:
+        """Global in-flight API calls to Serve: what the job worker does not use (at least one)."""
+        if self.worker_shares_upstream:
+            return max(1, self.upstream_concurrency - self.worker_judge_concurrency)
+        return max(1, self.upstream_concurrency)
 
     @property
     def model_label(self) -> str:

@@ -1,8 +1,10 @@
-"""Client for Lorde Serve (vLLM): 30 s timeout, one retry on connection errors, circuit breaker."""
+"""Client for Lorde Serve (vLLM or llama.cpp): timeout, one retry on connection errors, circuit breaker, and
+admission (gateway/slots.py): per-org and global in-flight slots with a bounded, timed wait. Only real upstream
+failures (connection errors, timeouts, 5xx) count towards the breaker; a request refused for want of a slot
+(429 "model busy") never reached Serve and does not."""
 
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any
 
@@ -10,6 +12,7 @@ import httpx
 
 from .errors import ModelUnavailable
 from .settings import Settings
+from .slots import LocalSlots, UpstreamSlots
 
 
 class CircuitBreaker:
@@ -48,14 +51,17 @@ class Upstream:
         self.client = httpx.AsyncClient(
             base_url=s.vllm_base_url.rstrip("/") + "/", timeout=s.upstream_timeout_s, transport=transport,
             headers={"Authorization": f"Bearer {s.vllm_api_key}"},
-            limits=httpx.Limits(max_connections=s.upstream_concurrency * 4))
+            limits=httpx.Limits(max_connections=s.api_upstream_slots + 2))
         self.breaker = CircuitBreaker(s.breaker_failures, s.breaker_window_s)
-        self.sem = asyncio.Semaphore(s.upstream_concurrency * 4)
+        self.slots: UpstreamSlots = LocalSlots(s.api_upstream_slots, s.org_upstream_concurrency,
+                                               s.upstream_max_waiters, s.upstream_queue_timeout_s)
 
-    async def chat(self, body: dict[str, Any]) -> dict[str, Any]:
-        """POST /chat/completions; returns the JSON body. Raises ModelUnavailable on failure."""
+    async def chat(self, body: dict[str, Any], org_id: str | None = None) -> dict[str, Any]:
+        """POST /chat/completions for ``org_id``; returns the JSON body. Raises ModelUnavailable on failure and
+        429 rate_limited (slots.Busy) when no slot frees up in time."""
         self.breaker.check()
-        async with self.sem:
+        async with self.slots.acquire(org_id):
+            self.breaker.check()  # it may have opened while this call waited
             for attempt in range(2):
                 try:
                     r = await self.client.post("chat/completions", json=body)

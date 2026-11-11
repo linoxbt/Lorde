@@ -1,4 +1,11 @@
-"""Error bodies: {"error": {"code", "message", "request_id"}} (spec Section 11.2)."""
+"""Error bodies: {"error": {"code", "message", "request_id"}} (spec Section 11.2).
+
+Codes: 400 invalid_request, 401 unauthenticated, 403 forbidden, 404 not_found, 409 conflict, 413 payload_too_large,
+422 judge_unparseable, 429 rate_limited (a key's or an address's requests per minute, or the model is busy: retry
+after Retry-After), 429 quota_exceeded (the organization's daily judgments are used up: Retry-After is the time
+until 00:00 UTC, so clients should not retry sooner), 503 model_unavailable, 503 unavailable, 503 not_configured,
+500 internal_error.
+"""
 
 from __future__ import annotations
 
@@ -31,9 +38,14 @@ Conflict = _make("Conflict", 409, "conflict")
 PayloadTooLarge = _make("PayloadTooLarge", 413, "payload_too_large")
 JudgeUnparseable = _make("JudgeUnparseable", 422, "judge_unparseable")
 RateLimited = _make("RateLimited", 429, "rate_limited")
+QuotaExceeded = _make("QuotaExceeded", 429, "quota_exceeded")      # the org's daily judgments (audit N1b)
 ModelUnavailable = _make("ModelUnavailable", 503, "model_unavailable")
 Unavailable = _make("Unavailable", 503, "unavailable")          # a backing store (database) is unreachable
 InternalError = _make("InternalError", 500, "internal_error")
+
+
+# Quota spent on a judgment that never reached the model (or that Serve refused) is given back.
+REFUNDED = frozenset({"rate_limited", "model_unavailable", "invalid_request", "unavailable"})
 
 
 def body(err: LordeError, request_id: str) -> dict[str, Any]:

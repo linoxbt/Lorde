@@ -5,8 +5,8 @@ compatible, for CuratorKIT and LiteLLM), GET /v1/models, /mcp (MCP Streamable HT
 (gateway/jobs.py), /healthz, /readyz, /metrics. Every response carries x-request-id; judge responses also
 carry x-lorde-model and x-lorde-template.
 
-Request order (RequestContext): request id -> API key check for /v1/* and /mcp (malformed keys never reach
-the database; revoked keys are 403) -> body size limit while streaming (5 MB; the signed storage route
+Request order (RequestContext): request id -> per-IP token bucket for /v1/* and /mcp (LORDE_IP_RPM; before any
+key lookup) -> API key check for /v1/* and /mcp (malformed keys never reach the database; revoked keys are 403) -> body size limit while streaming (5 MB; the signed storage route
 /v1/_storage/* allows the 200 MB upload limit and streams to disk) -> route -> one JSON access log line.
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import re
@@ -35,12 +36,14 @@ from lorde_forge import contract
 from . import API_MAJOR, __version__
 from . import logs as lorde_logs
 from .errors import (
+    REFUNDED,
     Forbidden,
     InternalError,
     InvalidRequest,
     LordeError,
     NotFound,
     PayloadTooLarge,
+    QuotaExceeded,
     RateLimited,
     Unauthenticated,
     Unavailable,
@@ -53,6 +56,7 @@ from .mcp_server import load_bench
 from .metering import UsageSink
 from .metrics import Metrics
 from .models import BatchRequest, GroundingRequest, RewardRequest
+from .quota import make_quota, seconds_to_midnight, utc_day
 from .service import JudgeService
 from .settings import Settings
 from .upstream import Upstream
@@ -61,6 +65,13 @@ log = logging.getLogger("lorde.gateway")
 access_log = logging.getLogger("lorde.access")
 _RID = re.compile(r"^[A-Za-z0-9_.-]{6,64}$")
 STORAGE_PREFIX = "/v1/_storage/"
+
+
+def _ip(v: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(v.strip().strip("[]"))
+    except ValueError:
+        return None
 
 
 def _db_error(e: BaseException) -> bool:
@@ -95,6 +106,10 @@ class Gateway:
             self.usage = UsageSink(s.usage_file)
         self.storage = from_settings(s)
         self.buckets = make_buckets(s.redis_url)
+        self.quota = make_quota(s.redis_url)
+        self._quota_seeded: set[tuple[str, str]] = set()  # (org, UTC day) already reconciled with usage_events
+        self.trust_all = "*" in s.trusted_proxies
+        self.trusted = [ipaddress.ip_network(x, strict=False) for x in s.trusted_proxies if x != "*"]
         self.metrics = Metrics()
         self.upstream = Upstream(s, transport)
         self.service = JudgeService(s, self.upstream, self.metrics)
@@ -137,6 +152,85 @@ class Gateway:
             self.metrics.rate_limited.inc()
             retry = "60" if wait == float("inf") else str(int(wait) + 1)
             raise RateLimited(f"rate limit of {key.rpm} judgments/minute exceeded", headers={"Retry-After": retry})
+
+    # ------------------------------------------------------------------ per-IP limit (audit N2)
+    def client_ip(self, scope: Mapping[str, Any], headers: Mapping[str, str]) -> str:
+        """The address to limit: the Console relay's forwarded user address (with the relay secret), X-Forwarded-
+        For's first hop when the peer is a trusted proxy, else the peer. IPv6 is grouped per /64."""
+        peer_s = (scope.get("client") or ("unknown", 0))[0] or "unknown"
+        ip = _ip(peer_s)
+        relay = self.s.relay_secret
+        if relay and secrets.compare_digest(headers.get("x-lorde-relay-secret", "").encode(), relay.encode()):
+            ip = _ip(headers.get("x-lorde-client-ip", "")) or ip
+        elif ip is not None and (self.trust_all or any(ip in n for n in self.trusted)):
+            ip = _ip(headers.get("x-forwarded-for", "").split(",")[0]) or ip
+        if ip is None:
+            return peer_s[:64]
+        if isinstance(ip, ipaddress.IPv6Address):
+            if ip.ipv4_mapped:
+                return str(ip.ipv4_mapped)
+            if not ip.is_loopback:
+                return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+        return str(ip)
+
+    async def limit_ip(self, scope: Mapping[str, Any], headers: Mapping[str, str]) -> None:
+        if self.s.ip_rpm <= 0:
+            return
+        ip = self.client_ip(scope, headers)
+        wait = await self.buckets.atake(f"ip:{ip}", self.s.ip_rpm)
+        if wait:
+            self.metrics.rate_limited.inc()
+            retry = "60" if wait == float("inf") else str(int(wait) + 1)
+            raise RateLimited(f"too many requests from this address (limit {self.s.ip_rpm}/minute)",
+                              headers={"Retry-After": retry})
+
+    # ------------------------------------------------------------------ daily quota (audit N1b)
+    def quota_error(self, used: int) -> LordeError:
+        lim = self.s.org_daily_judgments
+        return QuotaExceeded(f"this organization's daily quota of {lim} judgments is used up ({used} today); "
+                             "it resets at 00:00 UTC", headers={"Retry-After": str(seconds_to_midnight())},
+                             extra={"limit": lim, "used": used})
+
+    async def spend(self, key: ApiKey, n: int = 1) -> None:
+        """Spend ``n`` of the org's judgments for today, or 429 quota_exceeded (nothing is spent then)."""
+        lim = self.s.org_daily_judgments
+        if lim <= 0:
+            return
+        if n > lim:
+            raise PayloadTooLarge(f"{n} judgments exceed this organization's daily quota of {lim}")
+        await self._seed_quota(key.org_id)
+        ok, used = await self.quota.take(key.org_id, n, lim)
+        if not ok:
+            self.metrics.rate_limited.inc()
+            raise self.quota_error(used)
+
+    async def _seed_quota(self, org_id: str) -> None:
+        """Once per org and day, raise the counter to what usage_events already metered today, so a Gateway
+        restart (in-process counter) or a Redis flush does not hand out a fresh quota. Best effort."""
+        if self.jobs is None:
+            return
+        day = utc_day()
+        if (org_id, day) in self._quota_seeded:
+            return
+        if len(self._quota_seeded) > 50_000:
+            self._quota_seeded = {k for k in self._quota_seeded if k[1] == day}
+        try:
+            metered = await self.jobs.judgments_today(org_id)
+        except Exception:  # noqa: BLE001  (the database is down: fail open, try again next request)
+            return
+        self._quota_seeded.add((org_id, day))
+        counted = await self.quota.used(org_id)
+        if metered > counted:
+            await self.quota.add(org_id, metered - counted)
+
+    async def refund(self, key: ApiKey, n: int) -> None:
+        if n > 0 and self.s.org_daily_judgments > 0:
+            await self.quota.add(key.org_id, -n)
+
+    async def quota_left(self, org_id: str) -> int | None:
+        """Judgments the org may still make today (None: unlimited)."""
+        lim = self.s.org_daily_judgments
+        return None if lim <= 0 else max(0, lim - await self.quota.used(org_id))
 
     def model_info(self) -> dict[str, Any]:
         return {"model": self.s.model_label, "repo": self.s.model_repo, "revision": self.s.model_revision,
@@ -284,6 +378,7 @@ class RequestContext:
 
         try:
             if self.needs_key(method, path):
+                await self.gw.limit_ip(scope, headers)  # before any key lookup: a prefix flood stops here
                 key = await self.gw.resolve_key(headers)
                 state["api_key"] = key
             storage = path.startswith(STORAGE_PREFIX)
@@ -369,6 +464,7 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
             gw._model_task.cancel()
         await gw.usage.stop()
         await gw.upstream.close()
+        await gw.quota.close()
         if gw.pool is not None:
             await gw.pool.close()
 
@@ -425,10 +521,13 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
     async def run_judge(request: Request, key: ApiKey, kind: str, req: RewardRequest | GroundingRequest):
         t0 = time.perf_counter()
         await gw.rate_limit(key)
+        await gw.spend(key)
         fields = req.model_dump(exclude={"threshold"})
         try:
-            res, usage = await gw.service.judge(kind, fields, req.threshold, rid(request))
+            res, usage = await gw.service.judge(kind, fields, req.threshold, rid(request), key.org_id)
         except LordeError as e:
+            if e.code in REFUNDED:
+                await gw.refund(key, 1)
             meter(key, f"/v1/judge/{kind}", 0, e.status, t0)
             raise
         meter(key, f"/v1/judge/{kind}", 1, 200, t0, usage)
@@ -448,7 +547,14 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
         if len(req.items) > s.max_batch:
             raise PayloadTooLarge(f"batch of {len(req.items)} exceeds {s.max_batch} items")
         await gw.rate_limit(key, len(req.items))
-        res, usage = await gw.service.batch(req.kind, req.items, req.threshold, rid(request))
+        await gw.spend(key, len(req.items))
+        try:
+            res, usage = await gw.service.batch(req.kind, req.items, req.threshold, rid(request), key.org_id)
+        except LordeError as e:
+            if e.code in REFUNDED:
+                await gw.refund(key, len(req.items))
+            raise
+        await gw.refund(key, sum(1 for x in res.results if x.error and x.error.get("code") in REFUNDED))
         meter(key, "/v1/judge/batch", res.summary["total"] - res.summary["errors"], 200, t0, usage)
         return JSONResponse(res.model_dump(), headers=headers(req.kind))
 
@@ -463,7 +569,13 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
             raise InvalidRequest("body must be a JSON object")
         gw.service.sanitize_chat(payload)  # 400 before spending a rate-limit token
         await gw.rate_limit(key)
-        resp, template = await gw.service.chat(payload)
+        await gw.spend(key)
+        try:
+            resp, template = await gw.service.chat(payload, key.org_id)
+        except LordeError as e:
+            if e.code in REFUNDED:
+                await gw.refund(key, 1)
+            raise
         meter(key, "/v1/chat/completions", 1, 200, t0, resp.get("usage") and {
             "prompt_tokens": resp["usage"].get("prompt_tokens", 0),
             "completion_tokens": resp["usage"].get("completion_tokens", 0)})

@@ -14,6 +14,8 @@ log = logging.getLogger("lorde.limits")
 
 
 class TokenBuckets:
+    MAX_KEYS = 100_000
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._state: dict[str, tuple[float, float]] = {}  # key -> (tokens, last_ts)
@@ -24,6 +26,8 @@ class TokenBuckets:
         cap = float(per_minute)
         now = time.monotonic()
         with self._lock:
+            if len(self._state) > self.MAX_KEYS:  # per-IP buckets: forget full ones (a bucket refills in 60 s)
+                self._state = {k: v for k, v in self._state.items() if now - v[1] < 60}
             tokens, last = self._state.get(key, (cap, now))
             tokens = min(cap, tokens + (now - last) * rate)
             if cost > cap:

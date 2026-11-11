@@ -21,7 +21,7 @@ from mcp.types import ToolAnnotations
 
 from lorde_forge import contract
 
-from .errors import InvalidRequest, LordeError, NotFound, PayloadTooLarge
+from .errors import REFUNDED, InvalidRequest, LordeError, NotFound, PayloadTooLarge
 
 if TYPE_CHECKING:
     from .app import Gateway
@@ -53,17 +53,22 @@ def build(gw: Gateway) -> MCPServer:
     async def _call(ctx: Context, kind: str, fields: dict[str, Any], threshold: float | None, cost: int = 1):
         key = await gw.authenticate(ctx.headers or {}, scope="judge")
         await gw.rate_limit(key, cost)
+        await gw.spend(key, cost)
         rid = "req_" + secrets.token_hex(8)
         res: Any
         t0 = time.perf_counter()
         try:
             if kind == "batch":
-                res, usage = await gw.service.batch(fields["kind"], fields["items"], threshold, rid)
-                n = len(fields["items"])
+                res, usage = await gw.service.batch(fields["kind"], fields["items"], threshold, rid, key.org_id)
+                failed = sum(1 for x in res.results if x.error and x.error.get("code") in REFUNDED)
+                await gw.refund(key, failed)
+                n = len(fields["items"]) - failed
             else:
-                res, usage = await gw.service.judge(kind, fields, threshold, rid)
+                res, usage = await gw.service.judge(kind, fields, threshold, rid, key.org_id)
                 n = 1
         except LordeError as e:
+            if e.code in REFUNDED:
+                await gw.refund(key, cost)
             gw.usage.record(org_id=key.org_id, api_key_id=key.id, key_prefix=key.prefix, route=f"mcp:{kind}",
                             judgments=0, status=e.status, model_revision=gw.s.model_label, source="mcp",
                             latency_ms=int((time.perf_counter() - t0) * 1000))

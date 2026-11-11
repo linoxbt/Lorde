@@ -286,3 +286,130 @@ def test_store_content_keeps_row_text_only_when_enabled(env):
                       (jid,)).fetchone()[0]
     assert p["instruction"] == ROWS[1]["instruction"] and p["input"] == ROWS[1]["input"]
     assert p["output"] == ROWS[1]["output"] and p["gate"] == "grounding" and "score" in p and "text" not in p
+
+
+# ------------------------------------------------------------------ audit N5: no resurrection at finish
+
+def test_cancel_during_upload_ends_cancelled_without_judgments_and_expires_results(env, monkeypatch):
+    clear_jobs(env)
+    jid = submit(env, ROWS)
+    w = work(env)
+    real_upload = w.storage.upload
+
+    async def upload_then_cancel(bucket, path, local, ctype):
+        await real_upload(bucket, path, local, ctype)
+        with db(env) as c:  # what POST /cancel or request_org_data_deletion() does while results upload
+            c.execute("update jobs set cancel_requested = true where id=%s", (jid,))
+
+    monkeypatch.setattr(w.storage, "upload", upload_then_cancel)
+    assert run_one(w) is True
+    with db(env) as c:
+        status, results, expire, locked = c.execute(
+            "select status, results, results_expire_at, locked_by from jobs where id=%s", (jid,)).fetchone()
+        assert status == "cancelled" and locked is None and results and expire is not None
+        assert c.execute("select count(*) from judgments where job_id=%s", (jid,)).fetchone()[0] == 0
+        expired = {r[0] for r in c.execute("select path from expired_objects() where id=%s", (jid,))}
+        assert expired == set(results.values())  # the purge deletes the uploaded files
+        actions = [r[0] for r in c.execute("select action from audit_log where target=%s order by id", (str(jid),))]
+        assert actions[-1] == "job.cancelled"
+    with TestClient(create_app(env["s"])) as c:
+        assert c.get(f"/v1/jobs/{jid}/results", headers=env["keys"]["all"]).status_code == 409
+
+
+def test_finish_inserts_judgments_and_status_in_one_transaction(env, monkeypatch):
+    clear_jobs(env)
+    jid = submit(env, ROWS)
+    w = work(env)
+    real_q = w.q
+
+    async def failing_audit(sql, args=()):
+        if sql.startswith("insert into audit_log") and "job.succeeded" in args:
+            raise RuntimeError("database hiccup after the judgments were written")
+        return await real_q(sql, args)
+
+    monkeypatch.setattr(w, "q", failing_audit)
+    assert run_one(w) is True  # the job fails; neither 'succeeded' nor its judgments were committed
+    with db(env) as c:
+        assert c.execute("select status from jobs where id=%s", (jid,)).fetchone()[0] == "failed"
+        assert c.execute("select count(*) from judgments where job_id=%s", (jid,)).fetchone()[0] == 0
+
+
+# ------------------------------------------------------------------ audit N1b: the daily quota and jobs
+
+def used_today(env) -> int:
+    with db(env) as c:
+        return c.execute("select coalesce(sum(judgments), 0) from usage_events where org_id=%s and created_at >= "
+                         "date_trunc('day', now() at time zone 'utc') at time zone 'utc'", (env["org"],)).fetchone()[0]
+
+
+def test_daily_quota_caps_job_rows_and_refuses_jobs(env):
+    clear_jobs(env)
+    used = used_today(env)
+    # two gates per row: 4 judgments left allow 2 of the 3 rows
+    s = Settings(**{**env["s"].__dict__, "org_daily_judgments": used + 4})
+    jid = submit(env, ROWS, s)
+    assert run_one(Worker(s, worker_id="quota", work_dir=str(env["tmp"] / "quota"), poll_s=0.1)) is True
+    status, error, _, _, counts = job_row(env, jid)
+    assert status == "succeeded", error
+    assert counts["rows_in"] == 3 and counts["quota_rows"] == 2 and counts["not_evaluated"] == 1
+    assert "not evaluated" in counts["notice"] and counts["evaluated"] <= 2
+    with db(env) as c:
+        idx = {r[0] for r in c.execute("select row_idx from judgments where job_id=%s", (jid,))}
+        assert idx and idx <= {0, 1}
+    assert used_today(env) <= used + 4
+
+    # the quota is now used up: POST /v1/jobs is refused, and a job already queued fails without judging
+    s = Settings(**{**env["s"].__dict__, "org_daily_judgments": used_today(env)})
+    with TestClient(create_app(s)) as c:
+        h = env["keys"]["all"]
+        up = upload(c, h, ROWS[:1])
+        r = c.post("/v1/jobs", headers=h, json={"upload_id": up})
+        assert r.status_code == 429 and r.json()["error"]["code"] == "quota_exceeded"
+        assert 0 < int(r.headers["retry-after"]) <= 86401
+    jid = submit(env, ROWS[:1])  # accepted under the default quota, then run under the used-up one
+    assert run_one(Worker(s, worker_id="quota2", work_dir=str(env["tmp"] / "quota2"), poll_s=0.1)) is True
+    status, error, *_ = job_row(env, jid)
+    assert status == "failed" and "daily quota" in error
+    with db(env) as c:
+        assert c.execute("select count(*) from judgments where job_id=%s", (jid,)).fetchone()[0] == 0
+
+
+def test_api_quota_starts_from_todays_metered_usage(env):
+    """A fresh Gateway process (in-process counter) still counts what usage_events metered today, jobs included."""
+    with db(env) as c:  # e.g. a job metered earlier today
+        c.execute("insert into usage_events (org_id, route, judgments, source) values (%s, 'job:gating', 5, 'job')",
+                  (env["org"],))
+    used = used_today(env)
+    s = Settings(**{**env["s"].__dict__, "org_daily_judgments": used + 1})
+    with TestClient(create_app(s)) as c:
+        h = env["keys"]["judge"]
+        body = {"instruction": "Explain X", "response": "X is a thing."}
+        assert c.post("/v1/judge/reward", headers=h, json=body).status_code == 200
+        r = c.post("/v1/judge/reward", headers=h, json=body)
+        assert r.status_code == 429 and r.json()["error"]["code"] == "quota_exceeded"
+
+
+def test_stamp_ids_keeps_only_the_quota_rows(tmp_path):
+    import csv
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from worker.run_job import stamp_ids
+
+    rows = [{"instruction": f"q{i}", "output": "a", "lang": "fr"} for i in range(5)]
+    src = tmp_path / "in.jsonl"
+    src.write_text("\n".join(json.dumps(r) for r in rows))
+    langs: dict = {}
+    dst, n = stamp_ids(src, "jsonl", tmp_path, 10, langs, keep=2)
+    assert n == 5 and [json.loads(x)["id"] for x in dst.read_text().splitlines()] == ["row-0", "row-1"]
+    assert set(langs) == {0, 1}
+    with (tmp_path / "in.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    dst, n = stamp_ids(tmp_path / "in.csv", "csv", tmp_path, 10, keep=3)
+    assert n == 5 and len(dst.read_text().splitlines()) == 4  # header + 3
+    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "in.parquet")
+    dst, n = stamp_ids(tmp_path / "in.parquet", "parquet", tmp_path, 10, keep=4)
+    assert n == 5 and pq.read_table(dst).column("id").to_pylist() == ["row-0", "row-1", "row-2", "row-3"]

@@ -183,7 +183,10 @@ def test_metrics_token_and_mcp_hosts_default():
     s = Settings(key_pepper=PEPPER, public_url="https://api.lorde.example")
     assert s.mcp_allowed_hosts == ["api.lorde.example", "api.lorde.example:*"]
     assert Settings(key_pepper=PEPPER, public_url="").mcp_allowed_hosts == []
-    assert Settings(key_pepper=PEPPER, upstream_concurrency=2).worker_judge_concurrency == 2
+    s = Settings(key_pepper=PEPPER, upstream_concurrency=2)
+    assert s.worker_judge_concurrency == 1 and s.api_upstream_slots == 1   # one job judgment, the rest for the API
+    assert Settings(key_pepper=PEPPER, upstream_concurrency=1).api_upstream_slots == 1
+    assert Settings(key_pepper=PEPPER, upstream_concurrency=16, worker_shares_upstream=False).api_upstream_slots == 16
 
 
 def test_metrics_need_token_when_set(gw):
