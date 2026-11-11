@@ -32,7 +32,7 @@ const LICENCES: [string, string, string][] = [
 export default function Model() {
   return (
     <>
-      <SiteHeader announcement={false} />
+      <SiteHeader />
       <main>
         <PageHero eyebrow="Model card" title="Lorde, Tiny Aya Global trained to judge."
           lead="A 3.35B judge for CuratorKIT's RewardGate and HallucinationGate, distilled from an Aya Expanse teacher on CuratorKIT's exact prompts.">

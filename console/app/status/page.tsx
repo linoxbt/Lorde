@@ -11,7 +11,7 @@ export const metadata: Metadata = { title: "Status", description: "Gateway, mode
 export default function Status() {
   return (
     <>
-      <SiteHeader announcement={false} />
+      <SiteHeader />
       <main>
         <PageHero eyebrow="Status" title="System status."
           lead="Live checks of the Gateway and Lorde Serve, refreshed every 30 seconds. Incidents follow the runbooks in the repository." />

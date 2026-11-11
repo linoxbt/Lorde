@@ -31,7 +31,7 @@ const CRITERIA: [string, string, string][] = [
 export default function Bench() {
   return (
     <>
-      <SiteHeader announcement={false} />
+      <SiteHeader />
       <main>
         <PageHero eyebrow="Lorde Bench" title="What every release must prove."
           lead="Lorde Bench is the gate between a trained revision and production. It runs in Forge, in CI against staging, and weekly in production to catch drift.">

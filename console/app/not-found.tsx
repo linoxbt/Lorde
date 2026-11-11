@@ -5,7 +5,7 @@ import { Container, LinkButton } from "@/components/ui";
 export default function NotFound() {
   return (
     <>
-      <SiteHeader announcement={false} />
+      <SiteHeader />
       <main>
         <Container className="flex min-h-[60vh] flex-col items-center justify-center py-24 text-center">
           <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-muted">404 · verdict: not found</p>

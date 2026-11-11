@@ -44,7 +44,7 @@ function H2({ id, children }: { id: string; children: React.ReactNode }) {
 export default function Docs() {
   return (
     <>
-      <SiteHeader announcement={false} />
+      <SiteHeader />
       <main>
         <PageHero eyebrow="Docs" title="Judge your first item in five minutes."
           lead="Lorde speaks OpenAI-compatible chat, a native judge API, Python, and MCP. Pick the surface you already use.">
