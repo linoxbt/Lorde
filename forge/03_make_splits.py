@@ -6,7 +6,10 @@
 Outputs
   data/sft/train.jsonl, data/sft/val.jsonl   SFT rows: messages + prompt/completion
   data/test.jsonl                            held-out items with teacher labels
-  data/human_sample.jsonl                    200 test items to hand-label (step 4)
+  data/human_sample.jsonl                    200 test items to hand-label (step 4), blind: opaque ids,
+                                             no variant/group, shuffled
+  data/human_sample_key.jsonl                private key: opaque id -> uid, variant, group (never shown to
+                                             labellers; step 6 uses it to join the labels)
 
 Splits are grouped by prompt (reward) or source chunk (grounding), so no test
 prompt or source passage appears in training. Only gate-usable teacher replies
@@ -22,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import canonical, config, contract, jsonl, splits  # noqa: E402
+from lorde_forge import canonical, config, contract, human, jsonl, splits  # noqa: E402
 
 ITEM_FIELDS = ("instruction", "response", "source_text", "question", "answer")
 
@@ -35,6 +38,8 @@ def main() -> None:
     ap.add_argument("--test", type=float, default=0.15)
     ap.add_argument("--human-langs", default="en", help="comma-separated languages you can read")
     ap.add_argument("--human-n", type=int, default=200)
+    ap.add_argument("--blind-salt", default=None,
+                    help="salt for the opaque human-sample ids (default: random; ids already in the key are kept)")
     ap.add_argument("--max-prompt-chars", type=int, default=7000,
                     help="rough guard; step 5 drops rows over 2,048 tokens with the real tokenizer")
     args = ap.parse_args()
@@ -83,21 +88,21 @@ def main() -> None:
 
     langs = [x.strip() for x in args.human_langs.split(",") if x.strip()]
     human_pool = [t for t in test if t["lang"] in langs]
-    human = splits.stratified_sample(human_pool, args.human_n, keys=("kind", "lang", "variant"), salt="human")
-    hidden = ("teacher_score", "teacher_raw", "teacher_verdict", "teacher_decision", "prompt")
-    jsonl.write(config.DATA / "human_sample.jsonl", ({k: v for k, v in h.items() if k not in hidden} for h in human))
+    sample = splits.stratified_sample(human_pool, args.human_n, keys=("kind", "lang", "variant"), salt="human")
+    human.write_blind(sample, config.DATA / "human_sample.jsonl", config.DATA / "human_sample_key.jsonl",
+                      salt=args.blind_salt)
 
     stats = {
         "labels": len(labels), "usable": len(rows), "dropped": dict(dropped),
-        "train": n_train, "val": n_val, "test": n_test, "human_sample": len(human),
+        "train": n_train, "val": n_val, "test": n_test, "human_sample": len(sample),
         "test_by_kind_lang": Counter(f"{t['kind']}:{t['lang']}" for t in test),
         "test_teacher_pass_rate": round(sum(t["teacher_decision"] for t in test) / max(1, n_test), 4),
         "train_target_score_hist": Counter(round(r["teacher_score"], 1) for r in parts["train"]),
     }
     jsonl.write_json(config.DATA / "splits_summary.json", stats)
-    print(f"[splits] train={n_train} val={n_val} test={n_test} human_sample={len(human)} dropped={dict(dropped)}")
-    if len(human) < args.human_n:
-        print(f"[splits] note: only {len(human)} human-sample items available in langs {langs}")
+    print(f"[splits] train={n_train} val={n_val} test={n_test} human_sample={len(sample)} dropped={dict(dropped)}")
+    if len(sample) < args.human_n:
+        print(f"[splits] note: only {len(sample)} human-sample items available in langs {langs}")
 
 
 if __name__ == "__main__":

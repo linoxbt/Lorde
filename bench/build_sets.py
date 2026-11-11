@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import config, contract, jsonl, splits, variants  # noqa: E402
+from lorde_forge import config, contract, human, jsonl, splits, variants  # noqa: E402
 
 OUT = config.ROOT / "bench" / "data"
 
@@ -42,7 +42,7 @@ MIXED = "Это ответ 这是答案 هذه إجابة यह उत्तर
 
 def golden(test: list[dict], n_per_kind: int = 150) -> list[dict]:
     cal = {r["uid"]: r for r in jsonl.read(config.DATA / "labels_32b.jsonl") if r.get("ok")}
-    human = {r["uid"]: r for r in jsonl.read(config.DATA / "human_labels.jsonl")}
+    hl = human.load_labels(config.DATA / "human_labels.jsonl", config.DATA / "human_sample_key.jsonl")
     out = []
     for kind in contract.KINDS:
         rows = [t for t in test if t["kind"] == kind]
@@ -51,8 +51,8 @@ def golden(test: list[dict], n_per_kind: int = 150) -> list[dict]:
         g["set"] = "golden-300"
         g["ref_32b_score"] = cal[g["uid"]]["score"] if g["uid"] in cal else None
         g["ref_32b_verdict"] = cal[g["uid"]].get("verdict") if g["uid"] in cal else None
-        g["human_score"] = human[g["uid"]]["human_score"] if g["uid"] in human else None
-        g["human_verdict"] = human[g["uid"]].get("human_verdict") if g["uid"] in human else None
+        g["human_score"] = hl[g["uid"]]["human_score"] if g["uid"] in hl else None
+        g["human_verdict"] = hl[g["uid"]].get("human_verdict") if g["uid"] in hl else None
     return out
 
 

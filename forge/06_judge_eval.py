@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import audit, config, contract, jsonl, llm, metrics  # noqa: E402
+from lorde_forge import audit, config, contract, human, jsonl, llm, metrics  # noqa: E402
 from lorde_forge.judge import as_metric_row, predict  # noqa: E402
 from lorde_forge.report import fmt, table  # noqa: E402
 
@@ -74,6 +74,8 @@ def main() -> None:
     ap.add_argument("--baseline", default="base")
     ap.add_argument("--test", default=str(config.DATA / "test.jsonl"))
     ap.add_argument("--human-labels", default=str(config.DATA / "human_labels.jsonl"))
+    ap.add_argument("--human-key", default=str(config.DATA / "human_sample_key.jsonl"),
+                    help="private key mapping the blind sample's opaque ids to test uids")
     ap.add_argument("--calibration", default=str(config.DATA / "labels_32b.jsonl"))
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--perf-n", type=int, default=256)
@@ -140,12 +142,15 @@ def main() -> None:
         }
 
     # Human agreement: teacher is the ceiling.
-    human = {r["uid"]: r for r in jsonl.read(args.human_labels)}  # latest row per uid wins
-    hu = [i for i, u in enumerate(uids) if u in human]
+    # Labels are keyed by opaque id (mapped back through the key) or, for older labels, by the test uid;
+    # several labellers per item are averaged (score) and majority-voted (verdict).
+    hl = human.load_labels(args.human_labels, args.human_key)
+    hu = [i for i, u in enumerate(uids) if u in hl]
     if hu:
-        href = [{"ok": True, "score": human[uids[i]]["human_score"], "verdict": human[uids[i]].get("human_verdict")}
+        href = [{"ok": True, "score": hl[uids[i]]["human_score"], "verdict": hl[uids[i]].get("human_verdict")}
                 for i in hu]
-        report["human"] = {"n": len(hu), "teacher": metrics.compare([teacher[i] for i in hu], href)}
+        report["human"] = {"n": len(hu), "n_labelers": len({r.get("labeler") for r in jsonl.read(args.human_labels)}),
+                           "teacher": metrics.compare([teacher[i] for i in hu], href)}
         for name in rows:
             report["human"][name] = metrics.compare([rows[name][i] for i in hu], href)
 

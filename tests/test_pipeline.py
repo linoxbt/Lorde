@@ -83,6 +83,10 @@ def test_forge_pipeline(world):
     assert not {r["uid"].split(":")[0] for r in train} & {r["uid"].split(":")[0] for r in test}
     human = jsonl.read(root / "data" / "human_sample.jsonl")
     assert human and "teacher_score" not in human[0]
+    # blind: opaque ids, no variant/group; the private key maps them back (audit B1)
+    assert all(h["uid"].startswith("h-") and "variant" not in h and "group" not in h for h in human)
+    key = {k["id"]: k["uid"] for k in jsonl.read(root / "data" / "human_sample_key.jsonl")}
+    assert set(key) >= {h["uid"] for h in human} and set(key.values()) <= {t["uid"] for t in test}
     jsonl.write(root / "data" / "human_labels.jsonl",
                 [{"uid": h["uid"], "kind": h["kind"], "lang": h["lang"], "human_score": 0.8,
                   "human_verdict": "grounded" if h["kind"] == "grounding" else None} for h in human])
@@ -95,7 +99,7 @@ def test_forge_pipeline(world):
     assert rep["judges"]["base+so"]["vs_teacher"]["gate_usable_rate"] == 1.0   # structured outputs fix it
     assert rep["judges"]["lorde"]["vs_teacher"]["decision_agreement"] == 1.0
     assert rep["judges"]["lorde"]["cost_per_1M"] is not None
-    assert "human" in rep and rep["significance_decision_agreement"]
+    assert "human" in rep and rep["human"]["n"] == len(human) and rep["significance_decision_agreement"]
     md = (root / "results" / "judge_eval.md").read_text()
     assert "Acceptance criteria" in md and "Before / after" in md
     # --report-only rebuilds the same report from cached predictions without calling any model.

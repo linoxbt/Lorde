@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lorde_forge import config  # noqa: E402
+from lorde_forge import config, human  # noqa: E402
 from lorde_forge.report import table  # noqa: E402
 
 TEMPLATE = Path(__file__).resolve().parent / "HF_ARTICLE.template.md"
@@ -35,12 +35,18 @@ def _read_jsonl(p: Path) -> list[dict]:
 
 def labels_note() -> str:
     has_32b = (config.DATA / "labels_32b.jsonl").exists()
-    human = {r["uid"] for r in _read_jsonl(config.DATA / "human_labels.jsonl")}
+    hl = human.load_labels(config.DATA / "human_labels.jsonl", config.DATA / "human_sample_key.jsonl")
+    raw = _read_jsonl(config.DATA / "human_labels.jsonl")
+    unblind = sum(not str(r.get("uid", "")).startswith("h-") for r in raw)
     parts = ["- **Labels:** Aya Expanse 8B (self-hosted vLLM, fp16 on 2xT4) for every item"]
     parts.append("; Aya Expanse 32B via the Cohere API on the golden-300 calibration slice" if has_32b
                  else "; the planned Aya Expanse 32B calibration slice was not run (no Cohere API key in the run)")
-    parts.append(f"; {len(human)} hand labels with the gate's own rubric." if human
-                 else "; hand labels were not collected in time, so human agreement is not reported.")
+    if hl:
+        blind = ("blind: labellers saw neither the item id nor its variant" if not unblind else
+                 f"{unblind} of {len(raw)} label rows were made before the label tool was blinded")
+        parts.append(f"; {len(hl)} hand-labelled items with the gate's own rubric ({blind}).")
+    else:
+        parts.append("; hand labels were not collected in time, so human agreement is not reported.")
     return "".join(parts)
 
 
