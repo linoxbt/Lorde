@@ -68,4 +68,5 @@ def test_latest_complete_checkpoint_only(tmp_path, monkeypatch):
             os.utime(f, (old, old))
     assert d.latest_checkpoints() == [adapter / "checkpoint-400"]
     assert "runs/*/adapter/checkpoint-*/**" in d.pull_patterns(checkpoints=True)
+    assert "runs/*/adapter/resume_key.json" in d.pull_patterns(checkpoints=True)
     assert not any("checkpoint" in p for p in d.pull_patterns())

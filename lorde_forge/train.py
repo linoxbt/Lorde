@@ -3,17 +3,23 @@
 AlignTune is the primary engine (TRL backend); plain TRL is the fallback. Both
 train on prompt/completion rows, so the loss covers the completion only, save a
 checkpoint every ``save_steps`` (the two newest are kept) and resume from the
-newest complete one when it exists, so a killed session loses little. Both
-report the validation loss when a validation file is given.
+newest complete one when it exists, so a killed session loses little. A
+checkpoint is only resumed when ``<out_dir>/resume_key.json`` says it was trained
+on the same rows with the same recipe and base model; otherwise the checkpoints
+are deleted and training starts from scratch. Both report the validation loss
+when a validation file is given.
 Heavy imports are lazy: this module imports cleanly without torch.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import shutil
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
@@ -112,6 +118,52 @@ def latest_checkpoint(out_dir: Path) -> str | None:
     return str(max(ckpts, key=lambda c: int(c.name.split("-")[-1]))) if ckpts else None
 
 
+RESUME_KEY = "resume_key.json"
+
+
+def resume_key(base_model: str, train_path: Path, r: Recipe, engine: str) -> dict:
+    """What a checkpoint must have been trained on to be resumed: the training rows (sha256 of their
+    canonical JSON, so formatting does not matter), every recipe field, the base model and the engine."""
+    from . import jsonl
+
+    h = hashlib.sha256()
+    n = 0
+    for row in jsonl.iter_rows(train_path):
+        h.update(json.dumps(row, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        h.update(b"\n")
+        n += 1
+    return {"version": 1, "base_model": base_model, "engine": engine, "train_sha256": h.hexdigest(),
+            "train_rows": n, "recipe": asdict(r)}
+
+
+def checkpoints(out_dir: Path) -> list[Path]:
+    return [c for c in Path(out_dir).glob("checkpoint-*") if c.is_dir() and c.name.split("-")[-1].isdigit()]
+
+
+def prepare_resume(out_dir: Path, key: dict) -> str | None:
+    """Checkpoint to resume from, if it belongs to this data and recipe. Checkpoints written for other
+    rows, another recipe or base model, or without a key (older runs), are deleted; then the key is written."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / RESUME_KEY
+    try:
+        old = json.loads(path.read_text()) if path.exists() else None
+    except (OSError, ValueError):
+        old = None
+    if not isinstance(old, dict):
+        old = None
+    stale = checkpoints(out_dir)
+    if stale and old != key:
+        why = "no resume key" if old is None else "different " + ", ".join(
+            k for k in sorted(set(key) | set(old)) if key.get(k) != old.get(k))
+        print(f"[train] {len(stale)} checkpoint(s) in {out_dir} do not match this run ({why}): deleting them "
+              "and training from scratch")
+        for c in stale:
+            shutil.rmtree(c, ignore_errors=True)
+    path.write_text(json.dumps(key, indent=2))
+    return latest_checkpoint(out_dir)
+
+
 @contextmanager
 def resume_trl_from(checkpoint: str | None):
     """AlignTune 0.1.32 calls ``trl.SFTTrainer.train()`` without arguments and has no resume option; while
@@ -163,6 +215,7 @@ def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: in
 
     from . import jsonl
 
+    key = resume_key(base_model, train_path, r, "aligntune")
     tok = AutoTokenizer.from_pretrained(base_model)
     rendered = train_path.with_name(train_path.stem + ".rendered.jsonl")
     jsonl.write(rendered, render_chat(jsonl.read(train_path), tok))
@@ -187,7 +240,7 @@ def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: in
     )
     if val_path is not None:
         attach_validation(trainer, train_path, val_path)
-    last = latest_checkpoint(out_dir)
+    last = prepare_resume(out_dir, key)
     if last:
         print(f"[train] resuming from {last}")
     with resume_trl_from(last):
@@ -219,7 +272,7 @@ def train_trl(base_model: str, train_path: Path, val_path: Path | None, out_dir:
                           target_modules=r.targets, task_type="CAUSAL_LM")
     trainer = SFTTrainer(model=base_model, args=cfg, train_dataset=ds["train"],
                          eval_dataset=ds.get("validation"), peft_config=peft_cfg)
-    last = latest_checkpoint(out_dir)
+    last = prepare_resume(out_dir, resume_key(base_model, train_path, r, "trl"))
     if last:
         print(f"[train] resuming from {last}")
     trainer.train(resume_from_checkpoint=last)

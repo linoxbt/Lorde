@@ -11,7 +11,9 @@ MLP projections; lr 1e-4, cosine, 3% warmup, 2 epochs, effective batch 16
 (1 x 16 accumulation; the spec's 2 x 8 does not fit next to Tiny Aya's 261k-token logits); loss on the
 assistant reply only; rows longer than 1,536 tokens (the spec says 2,048) are dropped, never truncated.
 fp16 on T4, bf16 on L4/A100. Validation loss on data/sft/val.jsonl; a checkpoint every 200 steps, and a
-re-run resumes from the newest one. ``--max-samples`` takes a seeded random subset, not the first rows.
+re-run resumes from the newest one only when
+runs/<run>/adapter/resume_key.json matches its rows, recipe and base model (otherwise the checkpoints are
+deleted and training starts over). ``--max-samples`` takes a seeded random subset, not the first rows.
 
 Outputs runs/lorde-v1/{adapter,merged,train_meta.json}. Runs in the forge-train env.
 """
