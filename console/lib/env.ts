@@ -12,5 +12,7 @@ export const env = {
   keyPepper: process.env.LORDE_KEY_PEPPER || "",
   /** Public API base shown in docs and snippets; empty when neither the public nor the server URL is set. */
   publicApiUrl: (process.env.NEXT_PUBLIC_LORDE_API_URL || gatewayUrl).replace(/\/$/, ""),
+  /** Optional: the model revision the Gateway serves, shown on /status when the Gateway does not report it. */
+  modelRevision: (process.env.NEXT_PUBLIC_LORDE_MODEL_REVISION || "").trim(),
 };
 export const supabaseEnabled = () => Boolean(env.supabaseUrl && env.supabaseAnonKey);

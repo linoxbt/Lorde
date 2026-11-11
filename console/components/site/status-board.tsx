@@ -4,11 +4,11 @@ import { RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 import { Badge, Button, Card } from "@/components/ui";
+import type { Check, ServedModel } from "@/lib/status";
 
-type Check = { name: string; state: "ok" | "degraded" | "down" | "demo"; detail: string; ms?: number };
-type Data = { summary: { state: string; label: string }; checks: Check[] };
+type Data = { summary: { state: string; label: string }; checks: Check[]; model?: ServedModel | null };
 const TONE = { ok: "pass", degraded: "warn", down: "reject", demo: "accent" } as const;
-const WORD = { ok: "Operational", degraded: "Degraded", down: "Down", demo: "Demo mode" };
+const WORD = { ok: "Responding", degraded: "Degraded", down: "Down", demo: "Demo mode" };
 
 export function StatusBoard() {
   const [d, setD] = useState<Data | null>(null);
@@ -30,6 +30,15 @@ export function StatusBoard() {
         <div>
           <p className="text-[22px] font-medium tracking-[-0.02em]">{d?.summary.label ?? "Checking…"}</p>
           <p className="mt-1 text-sm text-muted" aria-live="polite">{at ? `Last checked ${at}` : "Running checks"}</p>
+          {d?.model && (
+            <p className="mt-1 text-sm text-muted">
+              Model: <span className="font-mono text-[13px] text-ink">{d.model.label}</span>
+              {d.model.source === "config" && " (configured)"}
+            </p>
+          )}
+          {d?.model?.notice && (
+            <p role="note" className="mt-2"><Badge tone="warn">{d.model.notice}</Badge></p>
+          )}
         </div>
         <Button variant="secondary" size="sm" onClick={load}><RefreshCw className="size-3.5" aria-hidden />Refresh</Button>
       </Card>

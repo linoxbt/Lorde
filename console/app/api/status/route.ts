@@ -1,10 +1,9 @@
 import { NextResponse } from "next/server";
 
 import { env } from "@/lib/env";
+import { type Check, servedModel, summarize } from "@/lib/status";
 
 export const dynamic = "force-dynamic";
-
-type Check = { name: string; state: "ok" | "degraded" | "down" | "demo"; detail: string; ms?: number };
 
 async function probe(path: string): Promise<{ ok: boolean; ms: number; body: unknown }> {
   const t = performance.now();
@@ -23,15 +22,15 @@ export async function GET() {
       { name: "Lorde Serve", state: "demo", detail: "Checked through the Gateway's /readyz." },
       { name: "Job queue", state: "demo", detail: "Checked through the Gateway once jobs are configured." },
     ];
-    return NextResponse.json({ summary: { state: "demo", label: "Demo mode" }, checks });
+    return NextResponse.json({ summary: summarize(checks), checks, model: servedModel([], env.modelRevision) });
   }
   const [health, ready] = await Promise.all([probe("/healthz"), probe("/readyz")]);
   const checks: Check[] = [
     { name: "Gateway", state: health.ok ? "ok" : "down", detail: health.ok ? "Responding" : "Unreachable", ms: health.ms },
     { name: "Lorde Serve", state: ready.ok ? "ok" : "degraded",
-      detail: ready.ok ? "Model ready" : "Model not ready or circuit open", ms: ready.ms },
+      detail: ready.ok ? "Model server responding" : "Model server not ready or circuit open", ms: ready.ms },
   ];
-  const state = checks.every((c) => c.state === "ok") ? "ok" : checks.some((c) => c.state === "down") ? "down" : "degraded";
-  const label = { ok: "All systems operational", degraded: "Degraded performance", down: "Service disruption" }[state];
-  return NextResponse.json({ summary: { state, label }, checks });
+  // /readyz and /healthz are public and report no model today; servedModel picks one up if they ever do.
+  return NextResponse.json({ summary: summarize(checks), checks,
+    model: servedModel([ready.body, health.body], env.modelRevision) });
 }
