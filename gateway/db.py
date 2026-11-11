@@ -7,29 +7,43 @@ service paths are the only writers of jobs, judgments and usage_events (spec Sec
 
 from __future__ import annotations
 
+import asyncio
+import hmac
 import json
+import logging
 import time
+import uuid
 from typing import Any
 
+from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from .keys import CACHE_TTL_S, ApiKey, KeyStore, hash_key, prefix_of
+from .keys import ApiKey, KeyCache, KeyStore, hash_key, prefix_of
 
 
-def make_pool(url: str, min_size: int = 1, max_size: int = 10) -> AsyncConnectionPool:
-    return AsyncConnectionPool(url, min_size=min_size, max_size=max_size, open=False,
-                               kwargs={"autocommit": True, "row_factory": dict_row})
+def dataset_path(org_id: str, dataset_id: str, name: str) -> str:
+    """Storage path of an uploaded dataset; the worker refuses any other shape."""
+    return f"{org_id}/{dataset_id}/{name}"
+
+
+Pool = AsyncConnectionPool[AsyncConnection[dict[str, Any]]]  # connections return dict rows
+
+
+def make_pool(url: str, min_size: int = 1, max_size: int = 10) -> Pool:
+    pool: Any = AsyncConnectionPool(url, min_size=min_size, max_size=max_size, open=False,
+                                    kwargs={"autocommit": True, "row_factory": dict_row})
+    return pool
 
 
 class PgKeyStore(KeyStore):
-    """api_keys table; same cache and constant-time check as the file store."""
+    """api_keys table; same bounded cache and constant-time check as the file store."""
 
-    def __init__(self, pool: AsyncConnectionPool, pepper: str) -> None:
+    def __init__(self, pool: Pool, pepper: str, cache_size: int = 10_000) -> None:
         self.pool, self.pepper = pool, pepper
-        self._cache: dict[str, tuple[float, ApiKey | None]] = {}
-        self._touched: dict[str, float] = {}
+        self._cache = KeyCache(cache_size)
+        self._touched: dict[str, float] = {}  # only valid keys land here, so it stays small
 
     @staticmethod
     def _rec(r: dict) -> ApiKey:
@@ -37,28 +51,28 @@ class PgKeyStore(KeyStore):
                       scopes=list(r["scopes"]), rpm=r["rpm"], created_at=str(r["created_at"]),
                       revoked_at=str(r["revoked_at"]) if r["revoked_at"] else None, id=str(r["id"]))
 
-    async def averify(self, key: str) -> ApiKey | None:
-        import hmac
-
-        prefix = prefix_of(key)
+    async def alookup(self, key: str) -> ApiKey | None:
+        prefix = prefix_of(key)  # malformed keys never reach the database
         if not prefix:
             return None
-        now = time.monotonic()
-        hit = self._cache.get(prefix)
-        if hit and now - hit[0] < CACHE_TTL_S:
-            rec = hit[1]
-        else:
+        found, rec = self._cache.get(prefix)
+        if not found:
             async with self.pool.connection() as c:
                 r = await (await c.execute("select * from api_keys where prefix = %s", (prefix,))).fetchone()
             rec = self._rec(r) if r else None
-            self._cache[prefix] = (now, rec)
-        if rec is None or rec.revoked_at or not hmac.compare_digest(rec.key_hash, hash_key(key, self.pepper)):
+            self._cache.put(prefix, rec)
+        if rec is None or not hmac.compare_digest(rec.key_hash, hash_key(key, self.pepper)):
             return None
-        if now - self._touched.get(prefix, 0) > 60:  # last_used_at, at most once a minute per key
+        now = time.monotonic()
+        if not rec.revoked_at and now - self._touched.get(prefix, 0) > 60:  # last_used_at, once a minute
             self._touched[prefix] = now
             async with self.pool.connection() as c:
                 await c.execute("update api_keys set last_used_at = now() where prefix = %s", (prefix,))
         return rec
+
+    async def averify(self, key: str) -> ApiKey | None:
+        rec = await self.alookup(key)
+        return None if rec is None or rec.revoked_at else rec
 
     async def acreate(self, name: str, org_id: str, scopes: list[str] | None = None, rpm: int = 600,
                       actor: str = "cli") -> tuple[str, ApiKey]:
@@ -73,6 +87,13 @@ class PgKeyStore(KeyStore):
             )).fetchone()
         return key, self._rec(r)
 
+    async def alist(self, org_id: str | None = None) -> list[ApiKey]:
+        async with self.pool.connection() as c:
+            rows = await (await c.execute(
+                "select * from api_keys where %s::uuid is null or org_id = %s::uuid order by created_at",
+                (org_id, org_id))).fetchall()
+        return [self._rec(r) for r in rows]
+
     async def arevoke(self, prefix: str, actor: str = "cli") -> bool:
         async with self.pool.connection() as c:
             await c.execute("select set_config('lorde.actor', %s, false)", (actor,))
@@ -84,53 +105,73 @@ class PgKeyStore(KeyStore):
 
 
 class PgUsageSink:
-    """Batched inserts into usage_events every second; no request content."""
+    """Batched inserts into usage_events every second; no request content.
+
+    A batch that fails to insert goes back to the queue and is retried next tick; at most
+    ``max_queue`` events are held, the oldest dropped first (and counted in the log).
+    """
 
     COLS = ("org_id", "api_key_id", "key_prefix", "route", "judgments", "prompt_tokens", "completion_tokens",
-            "latency_ms", "status", "model_revision")
+            "latency_ms", "status", "model_revision", "source")
 
-    def __init__(self, pool: AsyncConnectionPool) -> None:
+    def __init__(self, pool: Pool, max_queue: int = 10_000) -> None:
         self.pool = pool
+        self.max_queue = max_queue
         self.queue: list[dict[str, Any]] = []
-        self._task = None
+        self.dropped = 0
+        self._task: asyncio.Task | None = None
 
     def record(self, **e: Any) -> None:
+        e.setdefault("source", "mcp" if str(e.get("route", "")).startswith("mcp:") else "api")
         self.queue.append(e)
+        self._trim()
+
+    def _trim(self) -> None:
+        over = len(self.queue) - self.max_queue
+        if over > 0:
+            del self.queue[:over]
+            self.dropped += over
 
     async def aflush(self) -> None:
         if not self.queue:
             return
         batch, self.queue = self.queue, []
         sql = f"insert into usage_events ({', '.join(self.COLS)}) values ({', '.join(['%s'] * len(self.COLS))})"
-        async with self.pool.connection() as c, c.cursor() as cur:
-            await cur.executemany(sql, [tuple(e.get(k) for k in self.COLS) for e in batch])
+        try:
+            async with self.pool.connection() as c, c.cursor() as cur:
+                await cur.executemany(sql, [tuple(e.get(k) for k in self.COLS) for e in batch])
+        except Exception:
+            self.queue = batch + self.queue  # keep order; retried next tick
+            self._trim()
+            raise
 
     def start(self) -> None:
-        import asyncio
-
         async def loop():
             while True:
                 await asyncio.sleep(1.0)
                 try:
                     await self.aflush()
                 except Exception:  # noqa: BLE001  (never lose the loop; retry next tick)
-                    import logging
-
-                    logging.getLogger("lorde.usage").exception("usage flush failed")
+                    logging.getLogger("lorde.usage").warning(
+                        "usage flush failed; %s events queued, %s dropped so far", len(self.queue), self.dropped,
+                        exc_info=True)
 
         self._task = asyncio.create_task(loop())
 
     async def stop(self) -> None:
         if self._task:
             self._task.cancel()
-        await self.aflush()
+        try:
+            await self.aflush()
+        except Exception:  # noqa: BLE001
+            logging.getLogger("lorde.usage").warning("final usage flush failed; %s events lost", len(self.queue))
 
     def flush(self) -> None:  # parity with UsageSink
         pass
 
 
 class JobStore:
-    def __init__(self, pool: AsyncConnectionPool) -> None:
+    def __init__(self, pool: Pool) -> None:
         self.pool = pool
 
     async def create_dataset(self, org_id: str, name: str, fmt: str, size: int | None, retention_days: int | None,
@@ -139,13 +180,12 @@ class JobStore:
             ret = retention_days or (await (await c.execute("select retention_days from orgs where id=%s",
                                                             (org_id,))).fetchone() or {"retention_days": 30})[
                 "retention_days"]
+            # The path shape is enforced by the datasets_storage_path_shape constraint (0005_hardening.sql).
+            did = uuid.uuid4()
             r = await (await c.execute(
-                "insert into datasets (org_id, name, storage_path, format, bytes, expires_at) "
-                "values (%s, %s, '', %s, %s, now() + make_interval(days => %s)) returning *",
-                (org_id, name, fmt, size, ret))).fetchone()
-            path = f"{org_id}/{r['id']}/{name}"
-            await c.execute("update datasets set storage_path=%s where id=%s", (path, r["id"]))
-            r["storage_path"] = path
+                "insert into datasets (id, org_id, name, storage_path, format, bytes, expires_at) "
+                "values (%s, %s, %s, %s, %s, %s, now() + make_interval(days => %s)) returning *",
+                (did, org_id, name, dataset_path(org_id, str(did), name), fmt, size, ret))).fetchone()
         return r
 
     async def get_dataset(self, org_id: str, dataset_id: str) -> dict | None:
@@ -159,12 +199,23 @@ class JobStore:
                                        (org_id,))).fetchone()
         return r["n"]
 
+    async def job_by_idempotency_key(self, org_id: str, key: str) -> dict | None:
+        async with self.pool.connection() as c:
+            return await (await c.execute("select * from jobs where org_id=%s and idempotency_key=%s",
+                                          (org_id, key))).fetchone()
+
     async def create_job(self, org_id: str, dataset_id: str | None, api_key_id: str | None, config: dict,
-                         model_revision: str, actor: str) -> dict:
+                         model_revision: str, actor: str, idempotency_key: str | None = None) -> dict:
+        """Insert a job; with an idempotency key, a concurrent duplicate returns the existing job."""
         async with self.pool.connection() as c:
             r = await (await c.execute(
-                "insert into jobs (org_id, dataset_id, api_key_id, config, model_revision) values (%s,%s,%s,%s,%s) "
-                "returning *", (org_id, dataset_id, api_key_id, Jsonb(config), model_revision))).fetchone()
+                "insert into jobs (org_id, dataset_id, api_key_id, config, model_revision, idempotency_key) "
+                "values (%s,%s,%s,%s,%s,%s) on conflict (org_id, idempotency_key) where idempotency_key is not null "
+                "do nothing returning *",
+                (org_id, dataset_id, api_key_id, Jsonb(config), model_revision, idempotency_key))).fetchone()
+            if r is None:
+                return await (await c.execute("select * from jobs where org_id=%s and idempotency_key=%s",
+                                              (org_id, idempotency_key))).fetchone()
             await c.execute("insert into audit_log (org_id, actor, action, target, detail) values "
                             "(%s, %s, 'job.create', %s, %s)", (org_id, actor, str(r["id"]), Jsonb(config)))
         return r

@@ -36,9 +36,9 @@ def stub_vllm(style="plain", seen=None, fail=False):
 
 @pytest.fixture()
 def gw(tmp_path):
-    def make(style="plain", rpm=600, fail=False, scopes=("judge",)):
+    def make(style="plain", rpm=600, fail=False, scopes=("judge",), **kw):
         s = Settings(key_pepper=PEPPER, keys_file=str(tmp_path / "keys.json"), usage_file=str(tmp_path / "usage.jsonl"),
-                     model_revision="v1.0.0", vllm_base_url="http://vllm/v1")
+                     model_revision="v1.0.0", vllm_base_url="http://vllm/v1", **kw)
         key, _ = KeyStore(s.keys_file, PEPPER).create("test", "org1", list(scopes), rpm)
         seen: list = []
         app = create_app(s, transport=stub_vllm(style, seen, fail))
@@ -134,7 +134,8 @@ def test_revocation_takes_effect(gw, tmp_path):
         prefix = store.list()[0].prefix
         assert store.revoke(prefix)
         app.gw.keys._cache.clear()  # another process revoked it; the 60 s cache would otherwise hold it
-        assert c.get("/v1/models", headers=h).status_code == 401
+        r = c.get("/v1/models", headers=h)
+        assert r.status_code == 403 and r.json()["error"]["code"] == "forbidden"  # spec 11.2: revoked -> 403
 
 
 def mcp_call(c, h, method, params=None, i=1):

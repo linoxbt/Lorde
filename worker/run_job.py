@@ -15,14 +15,38 @@ import os
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lorde_forge.schemas import response_format  # noqa: E402
 
 
-def stamp_ids(src: Path, fmt: str, dst_dir: Path) -> tuple[Path, int]:
-    """Copy the dataset with an ``id`` per row (CuratorKIT keeps it), so judgments map back to rows."""
+class TooManyRows(Exception):
+    pass
+
+
+def _lang(row: dict) -> str | None:
+    v = row.get("lang") or row.get("language")
+    return v.strip()[:16] if isinstance(v, str) and v.strip() else None
+
+
+def stamp_ids(src: Path, fmt: str, dst_dir: Path, max_rows: int | None = None,
+              langs: dict[int, str] | None = None) -> tuple[Path, int]:
+    """Copy the dataset with an ``id`` per row (CuratorKIT keeps it), so judgments map back to rows.
+
+    Streams row by row (Parquet: batch by batch), so the input is never held in memory; stops with
+    TooManyRows past ``max_rows``; records each row's ``lang`` (or ``language``) field into ``langs``.
+    """
+    def check(n: int) -> None:
+        if max_rows is not None and n > max_rows:
+            raise TooManyRows(f"dataset has more than {max_rows} rows (LORDE_JOB_MAX_ROWS); "
+                              "split it into smaller jobs")
+
+    def note(n: int, row) -> None:
+        if langs is not None and isinstance(row, dict) and (lang := _lang(row)):
+            langs[n] = lang
+
     if fmt == "jsonl":
         dst = dst_dir / "stamped.jsonl"
         n = 0
@@ -30,9 +54,11 @@ def stamp_ids(src: Path, fmt: str, dst_dir: Path) -> tuple[Path, int]:
             for line in f:
                 if not line.strip():
                     continue
+                check(n + 1)
                 row = json.loads(line)
                 if isinstance(row, dict):
                     row["id"] = f"row-{n}"
+                note(n, row)
                 out.write(json.dumps(row, ensure_ascii=False) + "\n")
                 n += 1
         return dst, n
@@ -45,7 +71,9 @@ def stamp_ids(src: Path, fmt: str, dst_dir: Path) -> tuple[Path, int]:
             w.writeheader()
             n = 0
             for row in rd:
+                check(n + 1)
                 row["id"] = f"row-{n}"
+                note(n, row)
                 w.writerow(row)
                 n += 1
         return dst, n
@@ -53,14 +81,41 @@ def stamp_ids(src: Path, fmt: str, dst_dir: Path) -> tuple[Path, int]:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        t = pq.read_table(src)
-        if "id" in t.column_names:
-            t = t.drop(["id"])
-        t = t.append_column("id", pa.array([f"row-{i}" for i in range(t.num_rows)]))
+        pf = pq.ParquetFile(src)
+        check(pf.metadata.num_rows)
         dst = dst_dir / "stamped.parquet"
-        pq.write_table(t, dst)
-        return dst, t.num_rows
+        writer = None
+        n = 0
+        try:
+            for batch in pf.iter_batches(batch_size=4096):
+                t = pa.Table.from_batches([batch])
+                if "id" in t.column_names:
+                    t = t.drop(["id"])
+                if langs is not None:
+                    col = next((c for c in ("lang", "language") if c in t.column_names), None)
+                    if col:
+                        for i, v in enumerate(t.column(col).to_pylist()):
+                            note(n + i, {"lang": v})
+                t = t.append_column("id", pa.array([f"row-{n + i}" for i in range(t.num_rows)]))
+                if writer is None:
+                    writer = pq.ParquetWriter(dst, t.schema)
+                writer.write_table(t)
+                n += t.num_rows
+        finally:
+            if writer is not None:
+                writer.close()
+        if writer is None:  # empty file: keep the schema
+            t = pf.schema_arrow.empty_table()
+            pq.write_table(t, dst)
+        return dst, n
     return src, -1
+
+
+TEXT_CLIP = 4000
+
+
+def _clip(v) -> str | None:
+    return None if v is None else str(v)[:TEXT_CLIP]
 
 
 def gate_notes(sample) -> dict[str, dict]:
@@ -80,15 +135,22 @@ def main() -> None:
     out_dir = job_dir / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    max_rows = job.get("max_rows")
+    langs: dict[int, str] = {}
     if job.get("input_path"):
-        dataset, n_rows = stamp_ids(Path(job["input_path"]), job.get("format", "jsonl"), job_dir)
-        dataset = str(dataset)
+        try:
+            stamped, n_rows = stamp_ids(Path(job["input_path"]), job.get("format", "jsonl"), job_dir, max_rows, langs)
+        except TooManyRows as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(3)
+        dataset = str(stamped)
     else:
-        dataset, n_rows = job["hf_dataset"], -1
+        dataset, n_rows = job["hf_dataset"], -1  # Hub datasets: CuratorKIT reads at most max_rows samples
+    concurrency = max(1, int(job.get("judge_concurrency") or 16))
 
-    judge = {"model": f"openai/{job['served_model']}", "api_base": job["vllm_base_url"],
+    judge: Any = {"model": f"openai/{job['served_model']}", "api_base": job["vllm_base_url"],
              "api_key": os.environ.get("VLLM_API_KEY") or "EMPTY", "temperature": 0.1, "max_tokens": 512,
-             "concurrency": job.get("judge_concurrency", 16)}
+             "concurrency": concurrency}
     cfg = CuratorConfig(
         dataset=dataset,
         output_dir=str(out_dir / "curatorkit"),
@@ -97,10 +159,11 @@ def main() -> None:
         reward_threshold=gates.get("reward"),
         judge_llm=judge,
         # Structured outputs per gate: the worker calls Serve directly, so it asks for each schema itself.
-        reward_llm={"extra_body": {"response_format": response_format("reward")}},
-        hallucination_llm={"extra_body": {"response_format": response_format("grounding")}},
+        reward_llm=cast(Any, {"extra_body": {"response_format": response_format("reward")}}),
+        hallucination_llm=cast(Any, {"extra_body": {"response_format": response_format("grounding")}}),
         judge_on_error="reject",
-        judge_concurrency=job.get("judge_concurrency", 16),
+        judge_concurrency=concurrency,
+        max_samples=max_rows,
         pii_pseudonymize=bool(opts.get("pii")),
         dedup=opts.get("dedup", "exact"),
         clean=False,
@@ -108,9 +171,13 @@ def main() -> None:
     )
     res = Curator(cfg).run()
 
+    unstamped: dict[int, int] = {}  # Hub datasets carry no row-N id: number their samples in output order
+
     def row_idx(s) -> int:
         sid = str(s.id)
-        return int(sid[4:]) if sid.startswith("row-") and sid[4:].isdigit() else -1
+        if sid.startswith("row-") and sid[4:].isdigit():
+            return int(sid[4:])
+        return unstamped.setdefault(id(s), len(unstamped))
 
     def record(s, extra: dict) -> dict:
         notes = gate_notes(s)
@@ -128,8 +195,13 @@ def main() -> None:
                                                                              "grounding_score")):
             n = gate_notes(s).get(step)
             if n and key in n:
-                judgments.append({"row_idx": row_idx(s), "gate": gate, "score": n[key],
-                                  "decision": bool(n.get("passed", passed)), "verdict": n.get("verdict")})
+                idx = row_idx(s)
+                judgments.append({"row_idx": idx, "gate": gate, "score": n[key], "lang": langs.get(idx),
+                                  "decision": bool(n.get("passed", passed)), "verdict": n.get("verdict"),
+                                  # row text; the worker stores it in judgments.parsed only when the org enabled
+                                  # store_content (debug retention), never otherwise
+                                  "text": {"instruction": _clip(s.instruction), "input": _clip(s.input),
+                                           "output": _clip(s.output)}})
 
     with (out_dir / "passed.jsonl").open("w", encoding="utf-8") as f:
         for s in res.passed:
@@ -145,7 +217,7 @@ def main() -> None:
     reasons = Counter((r.rejection_reason or "?").split(":")[0] if not (r.rejection_reason or "").startswith(
         "judge_error") else r.rejection_reason for r in res.rejected)
     total = len(res.passed) + len(res.rejected)
-    summary = {"rows_in": n_rows, "evaluated": total, "passed": len(res.passed), "rejected": len(res.rejected),
+    summary = {"rows_in": n_rows, "evaluated": total, "max_rows": max_rows, "passed": len(res.passed), "rejected": len(res.rejected),
                "pass_rate": round(len(res.passed) / total, 4) if total else None,
                "rejection_reasons": dict(reasons),
                "judge_errors": sum(v for k, v in reasons.items() if k.startswith("judge_error")),

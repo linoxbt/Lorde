@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def _text(v: str) -> str:
@@ -62,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     from . import Lorde, LordeAPIError
 
     try:
+        res: Any
         with Lorde(api_key=a.api_key, base_url=a.base_url) as c:
             if a.kind == "grounding":
                 res = c.judge.grounding(_text(a.source), a.question, _text(a.answer), a.threshold)

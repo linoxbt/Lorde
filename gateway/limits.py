@@ -1,9 +1,16 @@
-"""Per-key token buckets. In-process (one replica); Redis-backed buckets replace this when scaling out."""
+"""Per-key token buckets: Redis-backed (shared by every replica) when REDIS_URL is set, else in-process.
+
+If Redis is unreachable the Gateway fails open to an in-process bucket per replica (same limits, but not
+shared across replicas) and logs a warning at most every 30 s, so a Redis outage never takes judging down.
+"""
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+
+log = logging.getLogger("lorde.limits")
 
 
 class TokenBuckets:
@@ -32,6 +39,9 @@ class LocalBuckets(TokenBuckets):
     async def atake(self, key: str, per_minute: int, cost: int = 1) -> float:
         return self.take(key, per_minute, cost)
 
+    async def ping(self) -> bool:
+        return True
+
 
 # Atomic token bucket in Redis: shared by every Gateway replica.
 _LUA = """
@@ -49,16 +59,31 @@ return tostring(wait)
 
 
 class RedisBuckets:
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, timeout_s: float = 1.0) -> None:
         import redis.asyncio as redis
 
-        self.r = redis.from_url(url)
+        self.r = redis.from_url(url, socket_timeout=timeout_s, socket_connect_timeout=timeout_s)
         self.script = self.r.register_script(_LUA)
+        self.fallback = LocalBuckets()
+        self._warned = 0.0
 
     async def atake(self, key: str, per_minute: int, cost: int = 1) -> float:
-        wait = float(await self.script(keys=[f"lorde:rl:{key}"],
-                                       args=[per_minute, per_minute / 60.0, cost, time.time()]))
+        try:
+            wait = float(await self.script(keys=[f"lorde:rl:{key}"],
+                                           args=[per_minute, per_minute / 60.0, cost, time.time()]))
+        except Exception:  # noqa: BLE001  (redis.RedisError, OSError, timeouts: fail open, locally limited)
+            now = time.monotonic()
+            if now - self._warned > 30:
+                self._warned = now
+                log.warning("Redis rate limiter unreachable; using in-process buckets", exc_info=True)
+            return self.fallback.take(key, per_minute, cost)
         return float("inf") if wait < 0 else wait
+
+    async def ping(self) -> bool:
+        try:
+            return bool(await self.r.ping())
+        except Exception:  # noqa: BLE001
+            return False
 
 
 def make_buckets(redis_url: str | None):

@@ -1,24 +1,27 @@
 """API keys: ``lorde_sk_`` + 32 random bytes (base62). Only the prefix and SHA-256(key + pepper) are stored.
 
-    python -m gateway.keys create --name ci --org demo [--scopes judge,jobs:read] [--rpm 600]
-    python -m gateway.keys list
+    python -m gateway.keys create --name ci --org <org id> [--scopes judge,jobs:read] [--rpm 600]
+    python -m gateway.keys list [--org <org id>]
     python -m gateway.keys revoke <prefix>
 
-This file-backed store suits one replica and the hackathon demo; Phase 2 swaps in the Supabase
-``api_keys`` table behind the same ``KeyStore`` interface.
+With DATABASE_URL set the commands act on the Supabase ``api_keys`` table (``--org`` is an org uuid);
+without it, on the JSON file named by LORDE_KEYS_FILE (one replica, local development).
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import string
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +31,9 @@ KEY_PREFIX = "lorde_sk_"
 PREFIX_LEN = 8  # characters of the random part kept as the public prefix
 DEFAULT_SCOPES = ["judge"]
 CACHE_TTL_S = 60.0
+MAX_RPM = 6000  # same cap as the api_keys_rpm_cap constraint (0005_hardening.sql)
+# Generated keys are lorde_sk_ + 43 base62 characters; anything else is refused before any lookup.
+KEY_FORMAT = re.compile(r"^lorde_sk_[A-Za-z0-9]{32,64}$")
 
 
 def _b62(n_bytes: int = 32) -> str:
@@ -44,9 +50,56 @@ def hash_key(key: str, pepper: str) -> str:
 
 
 def prefix_of(key: str) -> str | None:
-    if not key.startswith(KEY_PREFIX) or len(key) < len(KEY_PREFIX) + PREFIX_LEN + 16:
+    if not KEY_FORMAT.match(key):
         return None
     return key[: len(KEY_PREFIX) + PREFIX_LEN]
+
+
+class KeyCache:
+    """Bounded LRU with a TTL, keyed by key prefix. Misses (unknown prefixes) live in their own LRU, so a
+    flood of random prefixes evicts only other misses, never real keys."""
+
+    def __init__(self, size: int = 10_000, ttl_s: float = CACHE_TTL_S) -> None:
+        self.size, self.ttl_s = size, ttl_s
+        self._hits: OrderedDict[str, tuple[float, ApiKey]] = OrderedDict()
+        self._misses: OrderedDict[str, float] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, prefix: str) -> tuple[bool, ApiKey | None]:
+        """(found, record): found is False when the caller must look the prefix up."""
+        now = time.monotonic()
+        with self._lock:
+            hit = self._hits.get(prefix)
+            if hit and now - hit[0] < self.ttl_s:
+                self._hits.move_to_end(prefix)
+                return True, hit[1]
+            miss = self._misses.get(prefix)
+            if miss is not None and now - miss < self.ttl_s:
+                return True, None
+        return False, None
+
+    def put(self, prefix: str, rec: ApiKey | None) -> None:
+        now = time.monotonic()
+        with self._lock:
+            table: OrderedDict = self._hits if rec is not None else self._misses
+            (self._misses if rec is not None else self._hits).pop(prefix, None)
+            table[prefix] = (now, rec) if rec is not None else now
+            table.move_to_end(prefix)
+            while len(table) > self.size:
+                table.popitem(last=False)
+
+    def pop(self, prefix: str, default=None):
+        with self._lock:
+            self._misses.pop(prefix, None)
+            return self._hits.pop(prefix, default)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._hits.clear()
+            self._misses.clear()
+
+    def __len__(self) -> int:
+        return len(self._hits) + len(self._misses)
 
 
 @dataclass
@@ -66,11 +119,11 @@ class ApiKey:
 class KeyStore:
     """JSON file store with an in-process 60 s lookup cache; revocation purges the cache entry."""
 
-    def __init__(self, path: str | Path, pepper: str) -> None:
+    def __init__(self, path: str | Path, pepper: str, cache_size: int = 10_000) -> None:
         self.path = Path(path)
         self.pepper = pepper
         self._lock = threading.Lock()
-        self._cache: dict[str, tuple[float, ApiKey | None]] = {}
+        self._cache = KeyCache(cache_size)
 
     def _load(self) -> dict[str, ApiKey]:
         if not self.path.exists():
@@ -87,7 +140,9 @@ class KeyStore:
 
     def create(self, name: str, org_id: str, scopes: list[str] | None = None, rpm: int = 600) -> tuple[str, ApiKey]:
         key = KEY_PREFIX + _b62()
-        rec = ApiKey(prefix=prefix_of(key), key_hash=hash_key(key, self.pepper), name=name, org_id=org_id,
+        prefix = prefix_of(key)
+        assert prefix
+        rec = ApiKey(prefix=prefix, key_hash=hash_key(key, self.pepper), name=name, org_id=org_id,
                      scopes=scopes or list(DEFAULT_SCOPES), rpm=rpm)
         with self._lock:
             keys = self._load()
@@ -111,26 +166,53 @@ class KeyStore:
     async def averify(self, key: str) -> ApiKey | None:
         return self.verify(key)
 
-    def verify(self, key: str) -> ApiKey | None:
-        """The key record if ``key`` is valid and not revoked, else None (constant-time hash compare)."""
+    async def alookup(self, key: str) -> ApiKey | None:
+        return self.lookup(key)
+
+    def lookup(self, key: str) -> ApiKey | None:
+        """The record whose hash matches ``key``, revoked or not (constant-time compare); else None."""
         prefix = prefix_of(key)
         if not prefix:
             return None
-        now = time.monotonic()
-        hit = self._cache.get(prefix)
-        if hit and now - hit[0] < CACHE_TTL_S:
-            rec = hit[1]
-        else:
+        found, rec = self._cache.get(prefix)
+        if not found:
             rec = self._load().get(prefix)
-            self._cache[prefix] = (now, rec)
-        if rec is None or rec.revoked_at:
-            return None
-        if not hmac.compare_digest(rec.key_hash, hash_key(key, self.pepper)):
+            self._cache.put(prefix, rec)
+        if rec is None or not hmac.compare_digest(rec.key_hash, hash_key(key, self.pepper)):
             return None
         return rec
 
+    def verify(self, key: str) -> ApiKey | None:
+        """The key record if ``key`` is valid and not revoked, else None."""
+        rec = self.lookup(key)
+        return None if rec is None or rec.revoked_at else rec
 
-def main() -> None:
+
+def _print(k: ApiKey) -> None:
+    print(f"{k.prefix}  {k.name:<16} org={k.org_id} scopes={','.join(k.scopes)} rpm={k.rpm} "
+          f"{'REVOKED ' + k.revoked_at if k.revoked_at else 'active'}")
+
+
+async def _pg(args, s) -> None:
+    from .db import PgKeyStore, make_pool
+
+    pool = make_pool(s.database_url, max_size=1)
+    await pool.open()
+    try:
+        store = PgKeyStore(pool, s.key_pepper)
+        if args.cmd == "create":
+            key, rec = await store.acreate(args.name, args.org, args.scopes.split(","), args.rpm, actor="cli")
+            print(f"{key}\n(shown once; prefix {rec.prefix}, org {rec.org_id}, scopes {rec.scopes}, rpm {rec.rpm})")
+        elif args.cmd == "list":
+            for k in await store.alist(args.org):
+                _print(k)
+        else:
+            print("revoked" if await store.arevoke(args.prefix, actor="cli") else "no such active prefix")
+    finally:
+        await pool.close()
+
+
+def main(argv: list[str] | None = None) -> None:
     from .settings import Settings
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -140,20 +222,26 @@ def main() -> None:
     c.add_argument("--org", required=True)
     c.add_argument("--scopes", default="judge")
     c.add_argument("--rpm", type=int, default=600)
-    sub.add_parser("list")
+    ls = sub.add_parser("list")
+    ls.add_argument("--org")
     r = sub.add_parser("revoke")
     r.add_argument("prefix")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if args.cmd == "create" and not 1 <= args.rpm <= MAX_RPM:
+        ap.error(f"--rpm must be between 1 and {MAX_RPM}")
     s = Settings()
     s.check()
+    if s.database_url:
+        asyncio.run(_pg(args, s))
+        return
     store = KeyStore(s.keys_file, s.key_pepper)
     if args.cmd == "create":
         key, rec = store.create(args.name, args.org, args.scopes.split(","), args.rpm)
         print(f"{key}\n(shown once; prefix {rec.prefix}, org {rec.org_id}, scopes {rec.scopes}, rpm {rec.rpm})")
     elif args.cmd == "list":
         for k in store.list():
-            print(f"{k.prefix}  {k.name:<16} org={k.org_id} scopes={','.join(k.scopes)} rpm={k.rpm} "
-                  f"{'REVOKED ' + k.revoked_at if k.revoked_at else 'active'}")
+            if not args.org or k.org_id == args.org:
+                _print(k)
     else:
         print("revoked" if store.revoke(args.prefix) else "no such prefix")
 

@@ -69,13 +69,15 @@ class Jobs:
         """Upload a JSONL, CSV or Parquet file; returns the upload id."""
         p = Path(path)
         u = self._c._request("POST", "/v1/uploads", {"filename": p.name, "bytes": p.stat().st_size})
-        with p.open("rb") as f:
-            self._c._storage(u["method"], u["upload_url"], content=f.read(), headers=u.get("headers") or {})
+        with p.open("rb") as f:  # streamed from disk with its Content-Length, never read whole into memory
+            self._c._storage(u["method"], u["upload_url"], content=f, headers=u.get("headers") or {})
         return u["upload_id"]
 
     def create(self, dataset: str | Path | None = None, *, dataset_url: str | None = None,
                gates: dict[str, float | None] | None = None, pii: bool = False, dedup: str = "exact") -> Job:
-        """Start a gating job on a local file (uploaded first) or a Hub dataset (``hf://datasets/...``)."""
+        """Start a gating job on a local file (uploaded first) or a Hub dataset (``hf://datasets/...``).
+
+        The request carries an Idempotency-Key, so a retry after a timeout returns the same job."""
         if (dataset is None) == (dataset_url is None):
             raise ValueError("give exactly one of dataset (a local file) or dataset_url")
         body: dict[str, Any] = {"gates": gates or {"grounding": 0.7, "reward": 0.7},
@@ -84,7 +86,10 @@ class Jobs:
             body["upload_id"] = self.upload(dataset)
         else:
             body["dataset_url"] = dataset_url
-        return Job(self._c, self._c._request("POST", "/v1/jobs", body))
+        import uuid
+
+        return Job(self._c, self._c._request("POST", "/v1/jobs", body,
+                                             headers={"Idempotency-Key": f"sdk-{uuid.uuid4()}"}))
 
     def get(self, job_id: str) -> Job:
         return Job(self._c, self._c._request("GET", f"/v1/jobs/{job_id}"))
