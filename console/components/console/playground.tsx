@@ -6,7 +6,7 @@ import { useState } from "react";
 import { ConnectKey } from "@/components/console/connect-key";
 import { Badge, Button, Card } from "@/components/ui";
 import { curatorkitAction } from "@/lib/contract";
-import { gatewayFetch } from "@/lib/gateway-client";
+import { errorMessage, gatewayFetch } from "@/lib/gateway-client";
 import type { Gate } from "@/lib/types";
 
 const EX = {
@@ -71,8 +71,8 @@ export function Playground({ demo, gateway = false }: { demo: boolean; gateway?:
         setRes(j);
       } else {
         const r = await gatewayFetch(`/v1/judge/${kind}`, { method: "POST", body: JSON.stringify({ ...fields, threshold }) });
+        if (!r.ok) throw new Error(await errorMessage(r, r.statusText || `Request failed (${r.status})`));
         const j = await r.json();
-        if (!r.ok) throw new Error(j.error?.message ?? r.statusText);
         const { decision: _d, threshold: _t, model, template, latency_ms, request_id: _r, ...reply } = j;
         setRes({ lorde: JSON.stringify(reply, null, 2), meta: `${model} · ${template} · ${latency_ms} ms` });
       }

@@ -1,5 +1,6 @@
 "use client";
 
+import { type ErrorBody, friendlyGatewayError } from "./gateway-errors";
 import type { Scope } from "./scopes";
 
 /**
@@ -18,10 +19,11 @@ export async function gatewayFetch(path: string, init: RequestInit = {}, key = g
   return fetch(`/api/gateway${path}`, { ...init, headers });
 }
 
-/** The Gateway's (or the Console relay's) error message, or a fallback; never throws. */
+/** The Gateway's (or the Console relay's) error message, made friendly for known codes (quota, busy model,
+ * rate limits), or a fallback; never throws. */
 export async function errorMessage(r: Response, fallback = `Request failed (${r.status})`): Promise<string> {
-  const j = await r.json().catch(() => null) as { error?: { message?: string } } | null;
-  return j?.error?.message || fallback;
+  const j = await r.json().catch(() => null) as ErrorBody;
+  return friendlyGatewayError(r.status, j, r.headers.get("retry-after"), fallback);
 }
 
 const NIL = "00000000-0000-0000-0000-000000000000";
