@@ -29,7 +29,43 @@ from .models import (
     RewardResult,
 )
 from .settings import Settings
+from .slots import Busy
 from .upstream import Upstream
+
+MAX_SCHEMA_BYTES = 16 * 1024   # response_format / structured_outputs / guided_json, serialized (audit N10)
+MAX_SCHEMA_DEPTH = 12
+
+
+def _depth(v: Any) -> int:
+    """Nesting depth of a JSON value (iterative, so a hostile document cannot exhaust the stack)."""
+    deepest, stack = 0, [(v, 1)]
+    while stack:
+        x, d = stack.pop()
+        if isinstance(x, dict | list):
+            deepest = max(deepest, d)
+            if d > MAX_SCHEMA_DEPTH:
+                return d
+            stack.extend((y, d + 1) for y in (x.values() if isinstance(x, dict) else x))
+    return deepest
+
+
+def check_schema(name: str, v: Any) -> None:
+    """Structured-output schemas are compiled into a grammar by Serve: keep them small (400 otherwise)."""
+    import json
+
+    if isinstance(v, str):
+        size = len(v.encode())
+        if size <= MAX_SCHEMA_BYTES:
+            try:
+                v = json.loads(v)
+            except ValueError:
+                v = None  # a grammar or regex string: the size limit is all that applies
+    else:
+        size = len(json.dumps(v, separators=(",", ":")).encode())
+    if size > MAX_SCHEMA_BYTES:
+        raise InvalidRequest(f"{name} is limited to {MAX_SCHEMA_BYTES // 1024} KB of JSON")
+    if _depth(v) > MAX_SCHEMA_DEPTH:
+        raise InvalidRequest(f"{name} is nested more than {MAX_SCHEMA_DEPTH} levels deep")
 
 
 class JudgeService:
@@ -37,15 +73,15 @@ class JudgeService:
         self.s, self.up, self.m = s, upstream, metrics
 
     # ------------------------------------------------------------------ native judging
-    async def judge(self, kind: str, fields: dict[str, Any], threshold: float | None,
-                    request_id: str) -> tuple[RewardResult | GroundingResult, dict[str, int]]:
+    async def judge(self, kind: str, fields: dict[str, Any], threshold: float | None, request_id: str,
+                    org_id: str | None = None) -> tuple[RewardResult | GroundingResult, dict[str, int]]:
         thr = self.s.default_threshold if threshold is None else threshold
         item = {"kind": kind, **fields}
         body = {"model": self.s.served_model, "messages": contract.messages(item),
                 "temperature": JUDGE_TEMPERATURE, "max_tokens": JUDGE_MAX_TOKENS,
                 "response_format": response_format(kind)}
         t0 = time.perf_counter()
-        resp = await self.up.chat(body)
+        resp = await self.up.chat(body, org_id)
         latency_ms = int((time.perf_counter() - t0) * 1000)
         raw = resp["choices"][0]["message"].get("content") or ""
         usage = resp.get("usage") or {}
@@ -66,8 +102,12 @@ class JudgeService:
         return result, {"prompt_tokens": usage.get("prompt_tokens", 0),
                         "completion_tokens": usage.get("completion_tokens", 0)}
 
-    async def batch(self, kind: str, items: list[dict], threshold: float | None,
-                    request_id: str) -> tuple[BatchResult, dict[str, int]]:
+    async def batch(self, kind: str, items: list[dict], threshold: float | None, request_id: str,
+                    org_id: str | None = None) -> tuple[BatchResult, dict[str, int]]:
+        """Judge every item; an item's failure is reported in its slot. Items run at most
+        min(API slots, org slots) at a time, so a batch never queues against its own org's slots. Once an item
+        is refused as busy, the items not yet started are refused too (no point queueing them); when nothing was
+        judged at all, the whole batch is 429 rate_limited."""
         if len(items) > self.s.max_batch:
             from .errors import PayloadTooLarge
 
@@ -79,21 +119,32 @@ class JudgeService:
                 parsed.append(model.model_validate(it))
             except ValidationError as e:
                 raise InvalidRequest(f"items[{i}]: {e.errors()[0]['msg']}") from e
-        sem = asyncio.Semaphore(self.s.upstream_concurrency)
+        width = self.s.api_upstream_slots
+        if org_id is not None:
+            width = min(width, self.s.org_upstream_concurrency)
+        sem = asyncio.Semaphore(max(1, width))
         tokens = {"prompt_tokens": 0, "completion_tokens": 0}
+        busy: list[Busy] = []
 
         async def one(i: int, it: Any) -> BatchItemResult:
             fields = it.model_dump(exclude={"id"})
             async with sem:
                 try:
-                    res, usage = await self.judge(kind, fields, threshold, f"{request_id}.{i}")
+                    if busy:
+                        raise busy[0]
+                    res, usage = await self.judge(kind, fields, threshold, f"{request_id}.{i}", org_id)
                     for k in tokens:
                         tokens[k] += usage[k]
                     return BatchItemResult(index=i, id=it.id, result=res)
+                except Busy as e:
+                    busy.append(e)
+                    return BatchItemResult(index=i, id=it.id, error={"code": e.code, "message": e.message})
                 except LordeError as e:
                     return BatchItemResult(index=i, id=it.id, error={"code": e.code, "message": e.message})
 
         results = await asyncio.gather(*(one(i, it) for i, it in enumerate(parsed)))
+        if busy and all(r.result is None and r.error and r.error["code"] == busy[0].code for r in results):
+            raise busy[0]
         summary = {"passed": sum(r.result is not None and r.result.decision == "pass" for r in results),
                    "rejected": sum(r.result is not None and r.result.decision == "reject" for r in results),
                    "errors": sum(r.error is not None for r in results), "total": len(results)}
@@ -105,7 +156,8 @@ class JudgeService:
         """Allow-list and clamp an OpenAI chat request so the proxy stays a judge, not a general LLM.
 
         Kept: messages, temperature (finite, clamped to [0, 0.3]), top_p, max_tokens (<= 512; also read from
-        max_completion_tokens), stop, seed, response_format and vLLM's structured_outputs / guided_json.
+        max_completion_tokens), stop, seed, response_format and vLLM's structured_outputs / guided_json (each at
+        most 16 KB of JSON nested at most 12 levels: Serve compiles them into a grammar).
         n must be 1 and stream false. Every other field (logit_bias, tools, llama.cpp sampler knobs, ...) is
         dropped. Wrong types are 400 invalid_request.
         """
@@ -170,10 +222,11 @@ class JudgeService:
             if body.get(k) is not None:
                 if not isinstance(body[k], dict | str):
                     raise InvalidRequest(f"{k} must be an object")
+                check_schema(k, body[k])
                 out[k] = body[k]
         return out
 
-    async def chat(self, body: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    async def chat(self, body: dict[str, Any], org_id: str | None = None) -> tuple[dict[str, Any], str]:
         """Pass-through for CuratorKIT/LiteLLM. Judge-shaped prompts get the gate's schema.
 
         Returns (upstream response, template id or "unknown").
@@ -190,4 +243,4 @@ class JudgeService:
         else:
             template = "unknown"
             self.m.template.labels("unknown").inc()
-        return await self.up.chat(out), template
+        return await self.up.chat(out, org_id), template

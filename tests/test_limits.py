@@ -34,3 +34,16 @@ def test_redis_bucket_is_shared_between_replicas():
 
     got, wait, too_big = asyncio.run(go())
     assert got == [0.0, 0.0, 0.0] and 0 < wait <= 15.5 and too_big == float("inf")
+
+
+def test_local_buckets_forget_idle_keys(monkeypatch):
+    import time as _time
+
+    b = LocalBuckets()
+    b.MAX_KEYS = 10
+    for i in range(11):
+        b.take(f"ip:{i}", 5)
+    now = _time.monotonic()
+    monkeypatch.setattr("gateway.limits.time.monotonic", lambda: now + 61)
+    b.take("ip:new", 5)
+    assert list(b._state) == ["ip:new"]
