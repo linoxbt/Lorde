@@ -1,12 +1,16 @@
+import "server-only";
+
 /** Server-side configuration. With nothing set, the Console runs on clearly labelled demo data. */
+const gatewayUrl = (process.env.LORDE_GATEWAY_URL || "").replace(/\/$/, "");
+
 export const env = {
   supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL || "",
   supabaseAnonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "",
-  gatewayUrl: (process.env.LORDE_GATEWAY_URL || "").replace(/\/$/, ""),
+  gatewayUrl,
+  /** Operator key for single-tenant self-hosting only: never used when Supabase accounts are configured. */
   apiKey: process.env.LORDE_API_KEY || "",
   keyPepper: process.env.LORDE_KEY_PEPPER || "",
-  publicApiUrl: process.env.NEXT_PUBLIC_LORDE_API_URL || "https://api.<domain>",
+  /** Public API base shown in docs and snippets; empty when neither the public nor the server URL is set. */
+  publicApiUrl: (process.env.NEXT_PUBLIC_LORDE_API_URL || gatewayUrl).replace(/\/$/, ""),
 };
 export const supabaseEnabled = () => Boolean(env.supabaseUrl && env.supabaseAnonKey);
-export const gatewayEnabled = () => Boolean(env.gatewayUrl && env.apiKey);
-export const isDemo = () => !supabaseEnabled();

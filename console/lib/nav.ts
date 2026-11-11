@@ -33,7 +33,7 @@ export const siteNav: NavGroup[] = [
     links: [
       { label: "Status", href: "/status", desc: "Gateway, model and queue health." },
       { label: "Licences", href: "/model#licence", desc: "Research and non-commercial use." },
-      { label: "Hugging Face", href: "https://huggingface.co", desc: "Model, data and demo Space." },
+      { label: "Hugging Face", href: "https://huggingface.co/Oxlino", desc: "Model, data and demo Space." },
       { label: "GitHub", href: "https://github.com/linoxbt/Lorde", desc: "Forge, Gateway, SDK and Console." },
     ],
   },

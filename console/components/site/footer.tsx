@@ -15,7 +15,7 @@ export function SiteFooter() {
           <div className="mt-5 flex items-center gap-3 text-muted">
             <a href="https://github.com/linoxbt/Lorde" className="text-sm hover:text-ink">GitHub</a>
             <span aria-hidden>·</span>
-            <a href="https://huggingface.co" className="text-sm hover:text-ink">Hugging Face</a>
+            <a href="https://huggingface.co/Oxlino" className="text-sm hover:text-ink">Hugging Face</a>
           </div>
         </div>
         {siteNav.map((g) => (

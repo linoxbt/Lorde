@@ -127,7 +127,7 @@ export default function Docs() {
             </section>
             <section className="space-y-4">
               <H2 id="api">API reference</H2>
-              <Prose><p>Base URL <code>{env.publicApiUrl}</code>. JSON over HTTPS with <code>Authorization: Bearer lorde_sk_…</code>.
+              <Prose><p>Base URL <code>{env.publicApiUrl || "your Gateway URL (LORDE_BASE_URL)"}</code>. JSON over HTTPS with <code>Authorization: Bearer lorde_sk_…</code>.
                 Every response carries <code>x-request-id</code>; judge responses add <code>x-lorde-model</code> and
                 <code>x-lorde-template</code>.</p></Prose>
               <DataTable head={["Method", "Path", "Purpose", "Limit"]}

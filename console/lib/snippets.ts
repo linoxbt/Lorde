@@ -1,6 +1,9 @@
 import type { Snippet } from "@/components/site/code-tabs";
 
-export const snippets = (api = "https://api.<domain>"): Snippet[] => [
+/** Code samples; without a configured API URL they use the $LORDE_BASE_URL variable the SDK reads too. */
+export const snippets = (api = ""): Snippet[] => withBase(api || "$LORDE_BASE_URL");
+
+const withBase = (api: string): Snippet[] => [
   {
     id: "sdk", label: "Python SDK", lang: "python",
     code: `pip install lorde
