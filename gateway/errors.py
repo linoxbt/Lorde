@@ -48,5 +48,11 @@ InternalError = _make("InternalError", 500, "internal_error")
 REFUNDED = frozenset({"rate_limited", "model_unavailable", "invalid_request", "unavailable"})
 
 
+def refundable(err: LordeError) -> bool:
+    """Refund the quota for errors where the model did no work. An upstream timeout may have run the
+    judgment (the model server was busy with it), so it is charged (``err.charged``)."""
+    return err.code in REFUNDED and not getattr(err, "charged", False)
+
+
 def body(err: LordeError, request_id: str) -> dict[str, Any]:
     return {"error": {"code": err.code, "message": err.message, "request_id": request_id, **err.extra}}

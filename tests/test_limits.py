@@ -36,14 +36,14 @@ def test_redis_bucket_is_shared_between_replicas():
     assert got == [0.0, 0.0, 0.0] and 0 < wait <= 15.5 and too_big == float("inf")
 
 
-def test_local_buckets_forget_idle_keys(monkeypatch):
-    import time as _time
-
+def test_local_buckets_are_capped_lru():
+    """Per-IP buckets never exceed MAX_KEYS: the least recently used is forgotten in O(1), the newest kept."""
     b = LocalBuckets()
     b.MAX_KEYS = 10
     for i in range(11):
         b.take(f"ip:{i}", 5)
-    now = _time.monotonic()
-    monkeypatch.setattr("gateway.limits.time.monotonic", lambda: now + 61)
+    b.take("ip:1", 5)  # touched again: now most recently used
     b.take("ip:new", 5)
-    assert list(b._state) == ["ip:new"]
+    assert len(b._state) == 10
+    assert "ip:new" in b._state and "ip:1" in b._state
+    assert "ip:0" not in b._state and "ip:2" not in b._state

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
 
 log = logging.getLogger("lorde.limits")
 
@@ -18,7 +19,7 @@ class TokenBuckets:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._state: dict[str, tuple[float, float]] = {}  # key -> (tokens, last_ts)
+        self._state: OrderedDict[str, tuple[float, float]] = OrderedDict()  # key -> (tokens, last_ts), LRU order
 
     def take(self, key: str, per_minute: int, cost: int = 1) -> float:
         """Spend ``cost`` tokens; return 0 if allowed, else seconds until enough tokens refill."""
@@ -26,9 +27,11 @@ class TokenBuckets:
         cap = float(per_minute)
         now = time.monotonic()
         with self._lock:
-            if len(self._state) > self.MAX_KEYS:  # per-IP buckets: forget full ones (a bucket refills in 60 s)
-                self._state = {k: v for k, v in self._state.items() if now - v[1] < 60}
             tokens, last = self._state.get(key, (cap, now))
+            self._state[key] = (tokens, last)
+            self._state.move_to_end(key)
+            while len(self._state) > self.MAX_KEYS:  # hard cap, O(1): forget the least recently used bucket
+                self._state.popitem(last=False)
             tokens = min(cap, tokens + (now - last) * rate)
             if cost > cap:
                 return float("inf")

@@ -284,7 +284,23 @@ class Worker:
         return rows if rows < self.s.job_max_rows else None
 
     async def _run(self, job: dict, jid: str, org: str, job_dir: Path) -> None:
+        """Reserve the job's whole allowance against the shared daily quota before judging (so API calls made
+        while the job runs cannot spend it twice), then settle to the judgments actually counted."""
         quota_rows = await self.quota_rows(job)
+        reserved = 0
+        if self.s.org_daily_judgments > 0 and self.s.redis_url:
+            gates = max(1, sum(1 for v in (job["config"].get("gates") or {}).values() if v is not None))
+            reserved = (quota_rows if quota_rows is not None else self.s.job_max_rows) * gates
+            await self.quota.add(org, reserved)
+        counted = 0
+        try:
+            counted = await self._judge(job, jid, org, job_dir, quota_rows)
+        finally:
+            if reserved or counted:
+                await self.quota.add(org, counted - reserved)
+
+    async def _judge(self, job: dict, jid: str, org: str, job_dir: Path, quota_rows: int | None) -> int:
+        """Run the job; returns the judgments to count against the daily quota (0 when nothing is counted)."""
         spec = {"id": jid, "config": job["config"], "served_model": self.s.served_model,
                 "vllm_base_url": self.s.vllm_base_url, "model_revision": job.get("model_revision") or self.s.model_label,
                 "judge_concurrency": self.s.worker_judge_concurrency, "max_rows": self.s.job_max_rows,
@@ -343,15 +359,15 @@ class Worker:
                 outcome = "cancelled"
         if outcome == "cancelled":
             await self.finish(job, "cancelled")
-            return
+            return 0
         if outcome == "timeout":
             await self.finish(job, "failed", error=f"job exceeded the {self.s.job_max_seconds} s time limit "
                                                    "(LORDE_JOB_MAX_SECONDS); split the dataset into smaller jobs")
-            return
+            return 0
         if proc.returncode != 0:
             tail = "\n".join(output.strip().splitlines()[-15:])
             await self.finish(job, "failed", error=f"job process exited {proc.returncode}:\n{tail}"[:4000])
-            return
+            return 0
 
         out = job_dir / "out"
         summary = json.loads((out / "summary.json").read_text())
@@ -367,8 +383,8 @@ class Worker:
         status = await self.finish_succeeded(job, {**summary, "progress": "done"}, results, out / "judgments.jsonl")
         if status in ("succeeded", "cancelled"):  # the model did the work either way: meter and count it
             await self.meter(job, n_judg, int((time.monotonic() - t0) * 1000))
-            if self.s.org_daily_judgments > 0 and self.s.redis_url:
-                await self.quota.add(org, n_judg)
+            return n_judg if self.s.org_daily_judgments > 0 and self.s.redis_url else 0
+        return 0
 
     async def finish_succeeded(self, job: dict, counts: dict, results: dict, judgments: Path) -> str:
         """Store the judgments and mark the job succeeded in one transaction, unless a cancel or a data deletion

@@ -129,3 +129,5 @@ class Settings:
     def check(self) -> None:
         if not self.key_pepper or len(self.key_pepper) < 32:
             raise RuntimeError("LORDE_KEY_PEPPER must be set to 32+ random characters")
+        if self.relay_secret is not None and len(self.relay_secret) < 32:
+            raise RuntimeError("LORDE_RELAY_SECRET must be 32+ random characters (or unset)")

@@ -315,3 +315,110 @@ def test_structured_output_schema_size_and_depth_are_limited(tmp_path):
             r = c.post("/v1/chat/completions", headers=h["orgS"], json={"messages": msgs, field: value})
             assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_request", (field, r.text)
             assert why in r.json()["error"]["message"]
+
+
+# --- regressions from the fairness review -------------------------------------------------------------------
+
+def test_cancelled_org_waiter_does_not_evict_a_newer_slot():
+    """A waiter that gives up must not drop the org's slot entry if a newer request already replaced it,
+    or two requests of one org would hold upstream slots at once (limit 1)."""
+    import asyncio
+
+    from gateway.slots import LocalSlots
+
+    async def main():
+        s = LocalSlots(global_slots=4, org_slots=1, max_waiters=32, timeout_s=5)
+        inside = peak = 0
+        a_go, c_go = asyncio.Event(), asyncio.Event()
+
+        async def hold(ev):
+            nonlocal inside, peak
+            async with s.acquire("org"):
+                inside += 1
+                peak = max(peak, inside)
+                await ev.wait()
+                inside -= 1
+
+        a = asyncio.create_task(hold(a_go))
+        await asyncio.sleep(0)
+        b = asyncio.create_task(hold(asyncio.Event()))
+        await asyncio.sleep(0)
+        a_go.set()
+        c = asyncio.create_task(hold(c_go))
+        b.cancel()
+        await a
+        await asyncio.gather(b, return_exceptions=True)
+        d = asyncio.create_task(hold(asyncio.Event()))
+        await asyncio.sleep(0.01)
+        assert peak == 1
+        for t in (c, d):
+            t.cancel()
+        await asyncio.gather(c, d, return_exceptions=True)
+
+    asyncio.run(main())
+
+
+def test_quota_raise_to_is_idempotent_under_concurrency():
+    """Seeding the counter from metered usage is an atomic max, so concurrent first requests cannot add the
+    difference many times (it used to reach 20x the metered value)."""
+    import asyncio
+
+    from gateway.quota import LocalQuota
+
+    async def main():
+        q = LocalQuota()
+        await q.add("o", 10)
+        await asyncio.gather(*(q.raise_to("o", 100) for _ in range(20)))
+        assert await q.used("o") == 100
+        assert await q.raise_to("o", 50) == 100  # never lowers
+
+    asyncio.run(main())
+
+
+def test_redis_quota_raise_to_is_atomic():
+    import asyncio
+    import os
+
+    url = os.environ.get("LORDE_TEST_REDIS_URL")
+    if not url:
+        pytest.skip("set LORDE_TEST_REDIS_URL")
+    from gateway.quota import RedisQuota
+
+    async def main():
+        q = RedisQuota(url)
+        org = "raise-" + os.urandom(4).hex()
+        await q.add(org, 10)
+        await asyncio.gather(*(q.raise_to(org, 100) for _ in range(20)))
+        assert await q.used(org) == 100
+        await q.close()
+
+    asyncio.run(main())
+
+
+def test_ip_buckets_are_hard_capped_lru():
+    from gateway.limits import TokenBuckets
+
+    b = TokenBuckets()
+    b.MAX_KEYS = 50
+    for i in range(500):
+        b.take(f"ip:{i}", 300)
+    assert len(b._state) == 50 and "ip:499" in b._state and "ip:0" not in b._state
+
+
+def test_upstream_timeouts_are_charged_but_unreached_calls_refunded():
+    from gateway.errors import ModelUnavailable, RateLimited, refundable
+
+    timeout = ModelUnavailable("upstream timeout")
+    timeout.charged = True
+    assert not refundable(timeout)
+    assert refundable(ModelUnavailable("upstream connection failed"))
+    assert refundable(RateLimited("model busy, retry later"))
+
+
+def test_relay_secret_must_be_long(monkeypatch):
+    from gateway.settings import Settings
+
+    monkeypatch.setenv("LORDE_KEY_PEPPER", "p" * 40)
+    monkeypatch.setenv("LORDE_RELAY_SECRET", "short")
+    with pytest.raises(RuntimeError, match="LORDE_RELAY_SECRET"):
+        Settings().check()

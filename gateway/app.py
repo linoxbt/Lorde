@@ -48,6 +48,7 @@ from .errors import (
     Unauthenticated,
     Unavailable,
     body,
+    refundable,
 )
 from .keys import KEY_FORMAT, ApiKey, KeyStore
 from .limits import make_buckets
@@ -56,7 +57,7 @@ from .mcp_server import load_bench
 from .metering import UsageSink
 from .metrics import Metrics
 from .models import BatchRequest, GroundingRequest, RewardRequest
-from .quota import make_quota, seconds_to_midnight, utc_day
+from .quota import make_quota, seconds_to_midnight
 from .service import JudgeService
 from .settings import Settings
 from .upstream import Upstream
@@ -107,7 +108,7 @@ class Gateway:
         self.storage = from_settings(s)
         self.buckets = make_buckets(s.redis_url)
         self.quota = make_quota(s.redis_url)
-        self._quota_seeded: set[tuple[str, str]] = set()  # (org, UTC day) already reconciled with usage_events
+        self._quota_seeded: dict[str, float] = {}  # org -> monotonic time of the last reconcile with usage_events
         self.trust_all = "*" in s.trusted_proxies
         self.trusted = [ipaddress.ip_network(x, strict=False) for x in s.trusted_proxies if x != "*"]
         self.metrics = Metrics()
@@ -205,23 +206,23 @@ class Gateway:
             raise self.quota_error(used)
 
     async def _seed_quota(self, org_id: str) -> None:
-        """Once per org and day, raise the counter to what usage_events already metered today, so a Gateway
-        restart (in-process counter) or a Redis flush does not hand out a fresh quota. Best effort."""
+        """Every 60 s per org, raise the counter to what usage_events metered today (atomically: concurrent first
+        requests cannot add the difference twice), so a Gateway restart, a Redis flush or metered job work is
+        reflected. Best effort: a database error leaves the counter as it is."""
         if self.jobs is None:
             return
-        day = utc_day()
-        if (org_id, day) in self._quota_seeded:
+        now = time.monotonic()
+        last = self._quota_seeded.get(org_id)
+        if last is not None and now - last < 60:
             return
         if len(self._quota_seeded) > 50_000:
-            self._quota_seeded = {k for k in self._quota_seeded if k[1] == day}
+            self._quota_seeded = {k: t for k, t in self._quota_seeded.items() if now - t < 60}
+        self._quota_seeded[org_id] = now
         try:
             metered = await self.jobs.judgments_today(org_id)
-        except Exception:  # noqa: BLE001  (the database is down: fail open, try again next request)
+        except Exception:  # noqa: BLE001  (the database is down: fail open, try again next minute)
             return
-        self._quota_seeded.add((org_id, day))
-        counted = await self.quota.used(org_id)
-        if metered > counted:
-            await self.quota.add(org_id, metered - counted)
+        await self.quota.raise_to(org_id, metered)
 
     async def refund(self, key: ApiKey, n: int) -> None:
         if n > 0 and self.s.org_daily_judgments > 0:
@@ -526,7 +527,7 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
         try:
             res, usage = await gw.service.judge(kind, fields, req.threshold, rid(request), key.org_id)
         except LordeError as e:
-            if e.code in REFUNDED:
+            if refundable(e):
                 await gw.refund(key, 1)
             meter(key, f"/v1/judge/{kind}", 0, e.status, t0)
             raise
@@ -551,7 +552,7 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
         try:
             res, usage = await gw.service.batch(req.kind, req.items, req.threshold, rid(request), key.org_id)
         except LordeError as e:
-            if e.code in REFUNDED:
+            if refundable(e):
                 await gw.refund(key, len(req.items))
             raise
         await gw.refund(key, sum(1 for x in res.results if x.error and x.error.get("code") in REFUNDED))
@@ -573,7 +574,7 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
         try:
             resp, template = await gw.service.chat(payload, key.org_id)
         except LordeError as e:
-            if e.code in REFUNDED:
+            if refundable(e):
                 await gw.refund(key, 1)
             raise
         meter(key, "/v1/chat/completions", 1, 200, t0, resp.get("usage") and {

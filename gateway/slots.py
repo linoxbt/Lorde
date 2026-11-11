@@ -117,7 +117,8 @@ class LocalSlots:
             except TimeoutError:
                 raise self.busy("timed out waiting for this organization's turn") from None
             finally:
-                if org.idle:
+                # only drop the entry if it is still this slot: a newer request may have created a fresh one
+                if org.idle and self.orgs.get(org_id) is org:
                     self.orgs.pop(org_id, None)
         try:
             if not self.global_slot.free and self.global_slot.waiting >= self.max_waiters:

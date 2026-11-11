@@ -71,11 +71,17 @@ class Upstream:
                     self.breaker.fail()
                     raise ModelUnavailable(f"upstream connection failed: {type(e).__name__}",
                                            headers={"Retry-After": "5"}) from e
+                except httpx.PoolTimeout as e:
+                    # no connection to Serve became free: local contention, not a sign Serve is unhealthy
+                    raise ModelUnavailable("upstream busy", headers={"Retry-After": "5"}) from e
                 except httpx.TimeoutException as e:
                     self.breaker.fail()
-                    raise ModelUnavailable("upstream timeout", headers={"Retry-After": "5"}) from e
+                    err = ModelUnavailable("upstream timeout", headers={"Retry-After": "5"})
+                    err.charged = True  # type: ignore[attr-defined]  # Serve may have done the work
+                    raise err from e
                 if r.status_code >= 500:
                     self.breaker.fail()
+                    # 5xx (e.g. llama.cpp 503 while loading or out of slots): no judgment was produced, refunded
                     raise ModelUnavailable(f"upstream error {r.status_code}", headers={"Retry-After": "5"})
                 self.breaker.ok()
                 if r.status_code >= 400:

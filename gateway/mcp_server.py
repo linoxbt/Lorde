@@ -21,7 +21,7 @@ from mcp.types import ToolAnnotations
 
 from lorde_forge import contract
 
-from .errors import REFUNDED, InvalidRequest, LordeError, NotFound, PayloadTooLarge
+from .errors import REFUNDED, InvalidRequest, LordeError, NotFound, PayloadTooLarge, refundable
 
 if TYPE_CHECKING:
     from .app import Gateway
@@ -67,7 +67,7 @@ def build(gw: Gateway) -> MCPServer:
                 res, usage = await gw.service.judge(kind, fields, threshold, rid, key.org_id)
                 n = 1
         except LordeError as e:
-            if e.code in REFUNDED:
+            if refundable(e):
                 await gw.refund(key, cost)
             gw.usage.record(org_id=key.org_id, api_key_id=key.id, key_prefix=key.prefix, route=f"mcp:{kind}",
                             judgments=0, status=e.status, model_revision=gw.s.model_label, source="mcp",

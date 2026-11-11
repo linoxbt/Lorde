@@ -63,6 +63,17 @@ class LocalQuota:
         with self._lock:
             return self._used.get((org, utc_day()), 0)
 
+    def raise_to_sync(self, org: str, floor: int) -> int:
+        day = utc_day()
+        with self._lock:
+            v = max(self._used.get((org, day), 0), floor)
+            self._used[(org, day)] = v
+            return v
+
+    async def raise_to(self, org: str, floor: int) -> int:
+        """Atomically raise today's counter to at least ``floor`` (never lowers it)."""
+        return self.raise_to_sync(org, floor)
+
     async def take(self, org: str, n: int, limit: int) -> tuple[bool, int]:
         return self.take_sync(org, n, limit)
 
@@ -85,6 +96,12 @@ used = redis.call('INCRBY', KEYS[1], n)
 redis.call('EXPIRE', KEYS[1], 172800)
 return {1, used}
 """
+_RAISE = """
+local v = tonumber(redis.call('GET', KEYS[1]) or '0') local floor = tonumber(ARGV[1])
+if floor > v then redis.call('SET', KEYS[1], floor) v = floor end
+redis.call('EXPIRE', KEYS[1], 172800)
+return v
+"""
 _ADD = """
 local v = redis.call('INCRBY', KEYS[1], ARGV[1])
 if v < 0 then redis.call('SET', KEYS[1], 0) v = 0 end
@@ -100,6 +117,7 @@ class RedisQuota:
         self.r = redis.from_url(url, socket_timeout=timeout_s, socket_connect_timeout=timeout_s)
         self._take = self.r.register_script(_TAKE)
         self._add = self.r.register_script(_ADD)
+        self._raise = self.r.register_script(_RAISE)
         self.fallback = LocalQuota()
         self._warned = 0.0
         self.degraded = False  # the last call fell back to the in-process counter
@@ -130,6 +148,16 @@ class RedisQuota:
         except Exception:  # noqa: BLE001
             self._fail()
             return self.fallback.add_sync(org, n)
+        self.degraded = False
+        return v
+
+    async def raise_to(self, org: str, floor: int) -> int:
+        """Atomically raise today's counter to at least ``floor`` (never lowers it): safe under concurrency."""
+        try:
+            v = int(await self._raise(keys=[self.key(org)], args=[floor]))
+        except Exception:  # noqa: BLE001
+            self._fail()
+            return self.fallback.raise_to_sync(org, floor)
         self.degraded = False
         return v
 
