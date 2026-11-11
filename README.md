@@ -71,12 +71,12 @@ Step by step:
 | 0 | `bash forge/00_serve.sh teacher\|student\|lorde\|stop` | serve | vLLM on :8000 / :8001 / :8002 |
 | 1 | `python forge/01_build_pool.py --phase teacher\|student\|assemble` | data | `data/pool.jsonl`, `downstream_raw/eval.jsonl` |
 | 2 | `python forge/02_teacher_label.py --workers 32` | data | `data/labels.jsonl` |
-| 3 | `python forge/03_make_splits.py --human-langs en,fr,es` | data | `data/sft/*`, `data/test.jsonl`, `human_sample.jsonl` |
-| 4 | `python forge/04_label_tool.py --labeler you --share` | data | `data/human_labels.jsonl` |
+| 3 | `python forge/03_make_splits.py --human-langs en,fr,es` | data | `data/sft/*`, `data/test.jsonl`, blind `human_sample.jsonl` + private `human_sample_key.jsonl` |
+| 4 | `LABEL_PASSWORD=... python forge/04_label_tool.py [--hub <user>/lorde-work]` (blind: no ids or variants shown; an old sample is converted by `forge/04b_blind_sample.py`) | data | `data/human_labels.jsonl` |
 | 5 | `python forge/05_train_sft.py [--engine trl]` | train | `runs/lorde-v1/merged` |
 | 6 | `python forge/06_judge_eval.py --judge base=... --judge lorde=... --structured` | data | `results/judge_eval.md` |
 | 7 | `python forge/07_curatorkit_plugin.py --judge lorde=... [--structured]` | data | `data/gated/*`, `results/plugin_eval.md` |
-| 8 | `python forge/08_downstream.py all --sets ungated,teacher,lorde` | train | `results/downstream.md` |
+| 8 | `python forge/08_downstream.py all --sets ungated,teacher,lorde --equal-size [--max-rows N --max-len 1024]` | train | `results/downstream.md` |
 | 9 | `python forge/09_publish.py --user you [--space] [--public]` | data | HF repos, cards, collections (Space needs HF PRO) |
 | 10 | `python forge/10_export_gguf.py --user you` (optional) | train | `<you>/lorde-tiny-aya-GGUF` for llama.cpp CPU serving |
 | Bench | `python bench/build_sets.py` · `python bench/run_bench.py --judge lorde=... --structured` | data | `bench/results/*` |

@@ -69,3 +69,37 @@ the Hub, and set `LLAMA_ARG_HF_REPO` to it.
    - `LORDE_MODEL_REPO` / `LORDE_MODEL_REVISION` = what the endpoint serves (e.g. `tiny-aya-global` / `main` for
      staging, `lorde-tiny-aya` / `v1.0.0` after training)
 3. `/status` turns green and the playground judges live with your key.
+
+## Hardening after the audit (11 Nov)
+
+Migrations `0005_hardening.sql` and `0006_console.sql` were applied by the Gateway's migrator on boot (0006 at 07:01,
+0005 at 16:12 UTC; the reverse order was replayed locally and gives the same end state). Verified live:
+
+- Database (as a signed-in user through PostgREST): inserting `datasets` → 403; `api_keys.rpm` above 6000 or an unknown
+  scope → 23514; changing `rpm` → 403; revoking works and un-revoking is refused; an unconfirmed sign-up gets no
+  organization, confirming creates exactly one; `usage_daily` works for members and is refused for `anon`.
+- Gateway: `/docs`, `/redoc`, `/openapi.json` 404 (enable with `LORDE_PUBLIC_DOCS=1`); `/metrics` 404 without
+  `LORDE_METRICS_TOKEN`; `/readyz` reports serve, database and Redis; CORS allows PUT from the Console; a 6 MB body
+  without a key → 401 before it is read; malformed keys are refused before any lookup; `n != 1` → 400.
+- End to end: a 5.9 MB upload (refused before), a gating job through the worker (succeeded in 47 s), result download,
+  `judgments.lang` recorded, the job metered as `usage_events.source = 'job'`, `Idempotency-Key` returns the same job.
+- Console: signed-out redirects keep the query string; `/api/gateway/*`, `/api/judge`, `/api/keys` → 401 without a
+  session; injected `?error=` text is not shown; every Console page renders real data (no demo banner); a key created in
+  the Console authenticates at the Gateway; owner data deletion returns real counts and expires the files for the
+  6-hourly purge.
+
+New Gateway settings (defaults): `LORDE_PUBLIC_DOCS=0`, `LORDE_ACCESS_LOG=1`, `LORDE_MODEL_REGISTRY=1`,
+`LORDE_JOB_MAX_SECONDS=3600`, `LORDE_JOB_MAX_ROWS=50000`, `LORDE_JOB_MAX_INPUT_BYTES=209715200`,
+`LORDE_WORKER_JUDGE_CONCURRENCY` (= `LORDE_UPSTREAM_CONCURRENCY`). Set in production: `LORDE_METRICS_TOKEN`.
+Promote a model with `python -m gateway.models_cli promote <repo> <revision>`.
+
+Label service (`lorde-label`, `infra/Dockerfile.label`): `LABEL_HUB_REPO=Oxlino/lorde-work`, `LABEL_PASSWORD`,
+`LABEL_USER=lorde` (login name, recorded as the labeller), `HF_TOKEN` (should be a fine-grained token with write
+access to `datasets/Oxlino/lorde-work` only), optional `LABEL_USERS=name:pw,...`. The hub sample was blinded with
+`forge/04b_blind_sample.py` (opaque ids, no variants; the key file stays private).
+
+Vercel adds `NEXT_PUBLIC_SITE_URL=https://lorde-console.vercel.app`.
+
+Still to do by the account owner: Supabase email templates → `/auth/confirm?token_hash=...` links (see
+`console/README.md`) for cross-device email links; custom SMTP; CAPTCHA (Turnstile) on sign-up; leaked-password
+protection needs the Supabase Pro plan; the unused Railway `Postgres` service can be removed.

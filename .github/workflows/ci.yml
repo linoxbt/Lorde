@@ -75,3 +75,4 @@ jobs:
       - run: pnpm build
       - run: npx playwright install --with-deps chromium
       - run: pnpm test:e2e
+      - run: pnpm test:e2e:live   # production build against a fake Supabase: auth redirects, session-gated APIs
