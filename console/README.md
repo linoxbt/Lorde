@@ -9,7 +9,8 @@ Recharts, Supabase (`@supabase/ssr`), zod, Playwright.
 pnpm install
 pnpm dev                 # http://localhost:3000, demo data until env vars are set
 pnpm typecheck && pnpm test:unit && pnpm build
-pnpm test:e2e            # Playwright: desktop and phone projects
+pnpm test:e2e            # Playwright, demo mode: desktop and phone projects
+pnpm test:e2e:live       # Playwright, live mode: production build (.next-live) against tests/fixtures/fake-supabase.mjs
 ```
 
 ## Modes
@@ -23,8 +24,14 @@ pnpm test:e2e            # Playwright: desktop and phone projects
   (same hash as the Gateway) and inserted under RLS, so only owners and admins can create or revoke them; a database
   trigger audits every change.
 - **Gateway calls** (playground, uploads, jobs) go through `/api/gateway/*`, an allow-listed proxy to
-  `LORDE_GATEWAY_URL` that forwards the user's own API key from this browser tab (never stored server-side), or
-  `LORDE_API_KEY` for single-tenant self-hosting.
+  `LORDE_GATEWAY_URL` that needs a signed-in session and forwards the user's own API key from this browser tab (never
+  stored server-side). `LORDE_API_KEY` is used only without Supabase (single-tenant self-hosting).
+- **Database functions**: the Console has no service-role key. Aggregates (daily usage, pass rates, histograms, the
+  review queue, member emails) and owner-only data deletion are SQL functions in
+  `../supabase/migrations/0006_console.sql`, called with the user's session; apply it before deploying.
+- **Email links** work on any device: point the Supabase email templates at
+  `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=<type>&next={{ .RedirectTo }}`, which verifies the link
+  server-side (`verifyOtp`). `/auth/callback` keeps handling GitHub and PKCE `code` links.
 
 ## Design
 
