@@ -374,6 +374,21 @@ def test_daily_quota_caps_job_rows_and_refuses_jobs(env):
         assert c.execute("select count(*) from judgments where job_id=%s", (jid,)).fetchone()[0] == 0
 
 
+def test_api_quota_starts_from_todays_metered_usage(env):
+    """A fresh Gateway process (in-process counter) still counts what usage_events metered today, jobs included."""
+    with db(env) as c:  # e.g. a job metered earlier today
+        c.execute("insert into usage_events (org_id, route, judgments, source) values (%s, 'job:gating', 5, 'job')",
+                  (env["org"],))
+    used = used_today(env)
+    s = Settings(**{**env["s"].__dict__, "org_daily_judgments": used + 1})
+    with TestClient(create_app(s)) as c:
+        h = env["keys"]["judge"]
+        body = {"instruction": "Explain X", "response": "X is a thing."}
+        assert c.post("/v1/judge/reward", headers=h, json=body).status_code == 200
+        r = c.post("/v1/judge/reward", headers=h, json=body)
+        assert r.status_code == 429 and r.json()["error"]["code"] == "quota_exceeded"
+
+
 def test_stamp_ids_keeps_only_the_quota_rows(tmp_path):
     import csv
 
