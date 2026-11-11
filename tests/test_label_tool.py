@@ -80,13 +80,15 @@ def test_04b_converts_a_legacy_sample_and_eval_join_maps_back(tmp_path):
                "human_verdict": "grounded" if s["kind"] == "grounding" else None, "labeler": "a",
                "labeled_at": f"2026-11-12T10:00:{i:02d}"} for i, s in enumerate(sample)]
     labels.append({**labels[0], "labeler": "b", "human_score": 0.2, "labeled_at": "2026-11-12T11:00:00"})
-    labels.append({"uid": rows[0]["uid"], "kind": rows[0]["kind"], "lang": "fr", "human_score": 0.5,
+    first = {k["id"]: k["uid"] for k in key}[sample[0]["uid"]]
+    # the legacy label goes to another item (the salt is random, so rows[0] may be the first sample)
+    legacy = next(r for r in rows if r["uid"] != first)
+    labels.append({"uid": legacy["uid"], "kind": legacy["kind"], "lang": "fr", "human_score": 0.5,
                    "human_verdict": None, "labeler": "old", "ts": "2026-11-10T00:00:00"})
     labels.append({"uid": "h-unknown000", "human_score": 1.0, "labeler": "a", "labeled_at": "x"})
     jsonl.write(tmp_path / "labels.jsonl", labels)
     hl = human.load_labels(tmp_path / "labels.jsonl", kp)
     assert set(hl) == {r["uid"] for r in rows}  # all mapped back to test uids; unknown id dropped
-    first = {k["id"]: k["uid"] for k in key}[sample[0]["uid"]]
     assert hl[first]["n_labelers"] == 2 and hl[first]["human_score"] == 0.5  # mean of 0.8 and 0.2
     pub = human.public_labels(labels, kp)
     assert all("labeler" not in r and "note" not in r for r in pub)
