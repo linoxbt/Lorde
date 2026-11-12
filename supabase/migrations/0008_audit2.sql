@@ -52,7 +52,13 @@ grant execute on function public.request_org_data_deletion(uuid) to authenticate
 -- in the datasets bucket with their session, with no datasets row (so the retention purge never saw it) and no
 -- size or count limit. Objects are now written only through Gateway-issued uploads: a Supabase signed upload URL
 -- (created with the service key; it needs no policy) or the Gateway's own /v1/_storage route.
-drop policy if exists datasets_objects_upload on storage.objects;
+-- (Guarded: if the migration role may not alter storage.objects, the rest of 0008 still applies and the warning
+-- says to drop the policy in the dashboard: Storage > Policies.)
+do $$ begin
+  drop policy if exists datasets_objects_upload on storage.objects;
+exception when insufficient_privilege then
+  raise warning 'could not drop storage policy datasets_objects_upload (%); drop it in the Supabase dashboard', sqlerrm;
+end $$;
 
 -- The bucket refuses objects over the Gateway's upload limit (Settings.max_upload_bytes, 200 MB), which also bounds
 -- a signed upload whose declared size was a lie. (The column exists in Supabase; the test shim mirrors it.)
@@ -61,6 +67,8 @@ do $$ begin
              and column_name = 'file_size_limit') then
     update storage.buckets set file_size_limit = 200 * 1024 * 1024 where id = 'datasets';
   end if;
+exception when insufficient_privilege then
+  raise warning 'could not set the datasets bucket file_size_limit (%); set 200 MB in the dashboard', sqlerrm;
 end $$;
 
 -- When an upload completed (the Gateway's local storage route sets it; for Supabase Storage the object's own
