@@ -13,10 +13,20 @@ Reachable beyond localhost (``--hub``, ``--share`` or a non-local ``--host``) it
 LABEL_PASSWORD with the username LABEL_USER (or LABEL_NAME, default "lorde"), or LABEL_USERS="alice:pw1,bob:pw2"
 for several labellers. The labeller recorded with each label is the login username (``--labeler`` locally).
 
-Labels go to data/human_labels.jsonl, one row per (item, labeller); the newest ``labeled_at`` wins, so you can
-stop and come back at any time, and several people can label the same item. Hosted mode (``--hub``) pulls the
-sample at start, merges the hub's labels with the local file, and pushes after every save (one upload at a
-time, plus a trailing upload so the last save always reaches the hub).
+Labels go to <data dir>/human_labels.jsonl, one row per (item, labeller); the newest ``labeled_at`` wins, so you
+can stop and come back at any time, and several people can label the same item. The data dir is data/ by
+default, or LORDE_LABEL_DATA_DIR (hosted: point it at a mounted volume, so labels survive a redeploy).
+
+Hosted mode (``--hub``) pulls the sample at start, merges the hub's labels with the local file, and pushes after
+every save. Every push is a compare-and-swap: it reads the hub's head commit, merges the labels of that commit
+into the local file, and commits with ``parent_commit`` = that head, so a concurrent writer can never be
+overwritten; on a conflict it re-reads, re-merges and tries again. A push that fails (network, hub down) is
+never dropped: the local file is the outbox, the push is retried with backoff until it lands, and the page
+shows a warning while saves are not on the hub yet. One upload runs at a time, plus a trailing upload so the
+last save always reaches the hub. A file that is missing on the hub is the only error treated as "no labels".
+
+Labellers: label from the text on the page only, and do not consult the public dataset (Hugging Face
+<user>/lorde-data: pool.jsonl and test.jsonl hold the same texts with their variant) while labelling.
 """
 
 from __future__ import annotations
@@ -35,6 +45,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lorde_forge import config, human, jsonl  # noqa: E402
+
+DO_NOT_LOOK = ("**Label from this page only.** Do not look items up in the public Lorde dataset or anywhere else "
+               "while labelling: the published files name each item's variant, which would de-blind your labels.")
 
 REWARD_RUBRIC = """**Reward rubric (RewardGate).** Score the response 0.0-1.0 overall, considering
 *helpfulness* (is it useful?), *honesty* (does it admit uncertainty?) and
@@ -55,6 +68,11 @@ NOT_BLIND = ("data/human_sample.jsonl is not blind: {why}. Labelling it would sh
              "(writes a blind sample and the private key data/human_sample_key.jsonl)")
 
 
+def data_dir() -> Path:
+    """Where the sample and labels live: LORDE_LABEL_DATA_DIR (e.g. a mounted volume) or data/."""
+    return Path(os.environ.get("LORDE_LABEL_DATA_DIR") or config.DATA)
+
+
 def now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds")
 
@@ -69,44 +87,66 @@ def check_blind(items: list[dict]) -> str | None:
 
 
 class Uploader:
-    """One upload at a time; a save during an upload schedules one more, so the last save always lands."""
+    """One upload at a time; a save during an upload schedules one more, so the last save always lands.
 
-    def __init__(self, upload: Callable[[], None], retries: int = 5) -> None:
+    A failed upload is never given up: it is retried with exponential backoff (capped at ``max_backoff``
+    seconds) until it succeeds, and ``status()`` reports the unsynced state for the page. The labels themselves
+    are safe meanwhile: they are in the local file (the outbox), which every later upload merges and pushes."""
+
+    def __init__(self, upload: Callable[[], None], max_backoff: float = 300.0,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
         self._upload = upload
         self._cv = threading.Condition()
         self._pending = False
         self._running = False
-        self.retries = retries
+        self.max_backoff = max_backoff
+        self._sleep = sleep
         self.failures = 0
+        self.consecutive_failures = 0
+        self.last_error: str | None = None
+        self.last_ok: str | None = None
+        self.unsynced_since: str | None = None
 
     def request(self) -> None:
         with self._cv:
             self._pending = True
+            self.unsynced_since = self.unsynced_since or now()
             if self._running:
                 return
             self._running = True
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self) -> None:
-        tries = 0
         while True:
             with self._cv:
                 if not self._pending:
                     self._running = False
+                    self.unsynced_since = None
                     self._cv.notify_all()
                     return
                 self._pending = False
             try:
                 self._upload()
-                tries = 0
-            except Exception as e:  # noqa: BLE001  (network, hub errors: retry, never crash the page)
-                tries += 1
+                self.consecutive_failures, self.last_error, self.last_ok = 0, None, now()
+            except Exception as e:  # noqa: BLE001  (network, hub errors: retry until it lands, never crash the page)
                 self.failures += 1
-                print(f"[label] push failed ({tries}/{self.retries}): {e}", flush=True)
-                if tries < self.retries:
-                    with self._cv:
-                        self._pending = True
-                    time.sleep(min(2 ** tries, 60))
+                self.consecutive_failures += 1
+                self.last_error = f"{type(e).__name__}: {str(e)[:200]}"
+                wait = min(2 ** self.consecutive_failures, self.max_backoff)
+                print(f"[label] WARNING: push failed ({self.consecutive_failures} in a row): {self.last_error}; the "
+                      f"labels are kept locally and the push is retried in {wait:.0f} s", flush=True)
+                with self._cv:
+                    self._pending = True
+                self._sleep(wait)
+
+    def status(self) -> str:
+        """A warning for the page while saves are not on the hub, else ''."""
+        with self._cv:
+            if not (self._pending or self._running) or not self.last_error:
+                return ""
+            return (f"**Warning: your latest saves are not on the hub yet** (since {str(self.unsynced_since)[:19]} "
+                    f"UTC; last error: {self.last_error}). They are kept on this server and retried automatically; "
+                    "keep labelling, nothing is lost unless this server's disk is.")
 
     def flush(self, timeout: float = 60.0) -> bool:
         with self._cv:
@@ -144,26 +184,67 @@ class Store:
             return any((human.label_key(r), human.label_time(r)) not in theirs for r in merged)
 
 
-def hub_sync(store: Store, repo: str, api=None, download=None) -> Callable[[], None]:
-    """Upload function for ``Uploader``: merge the hub copy in first, then push the merged file."""
+LABELS_IN_REPO = "data/human_labels.jsonl"
+
+
+def is_conflict(e: Exception) -> bool:
+    """The hub refused a commit because its head moved (``parent_commit`` no longer the head)."""
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    return code in (409, 412)
+
+
+def is_missing(e: Exception) -> bool:
+    """The labels file does not exist on the hub (yet). Anything else (network, auth, hub errors) is not that."""
+    names = {c.__name__ for c in type(e).__mro__}
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    return bool(names & {"EntryNotFoundError", "RemoteEntryNotFoundError"}) or code == 404
+
+
+def hub_sync(store: Store, repo: str, api=None, download=None, attempts: int = 6,
+             sleep: Callable[[float], None] = time.sleep) -> Callable[[], None]:
+    """Upload function for ``Uploader``: a compare-and-swap commit of the merged labels.
+
+    Each attempt reads the hub's head commit, merges the labels file of that commit into the local file and
+    commits the merged file with ``parent_commit`` = that head. If someone else committed in between, the hub
+    refuses (409/412): re-read, re-merge, retry with backoff. Other errors raise, and ``Uploader`` retries later."""
+    import random
+
     from huggingface_hub import HfApi, hf_hub_download
 
     api = api or HfApi()
     download = download or hf_hub_download
 
-    def pull_labels() -> list[dict]:
+    def head() -> str:
+        return api.repo_info(repo, repo_type="dataset").sha
+
+    def pull_labels(revision: str | None = None) -> list[dict]:
         try:
-            return jsonl.read(download(repo, "data/human_labels.jsonl", repo_type="dataset", force_download=True))
-        except Exception as e:  # noqa: BLE001  (first run: no labels on the hub yet)
-            print(f"[label] no labels pulled from {repo}: {type(e).__name__}", flush=True)
-            return []
+            return jsonl.read(download(repo, LABELS_IN_REPO, repo_type="dataset", revision=revision,
+                                       force_download=True))
+        except Exception as e:
+            if is_missing(e):  # first run: no labels on the hub yet
+                print(f"[label] no labels on {repo} yet", flush=True)
+                return []
+            raise  # never merge "nothing" over the hub's labels because a download failed
 
     def upload() -> None:
-        with store.lock:
-            store.merge_in(pull_labels())
-            data = store.path.read_bytes()
-        api.upload_file(path_or_fileobj=data, path_in_repo="data/human_labels.jsonl", repo_id=repo,
-                        repo_type="dataset", commit_message="human labels")
+        for attempt in range(attempts):
+            parent = head()
+            with store.lock:
+                store.merge_in(pull_labels(parent))
+                data = store.path.read_bytes()
+            try:
+                api.upload_file(path_or_fileobj=data, path_in_repo=LABELS_IN_REPO, repo_id=repo,
+                                repo_type="dataset", commit_message="human labels", parent_commit=parent)
+                return
+            except Exception as e:
+                if not is_conflict(e):
+                    raise
+                wait = min(0.5 * 2 ** attempt, 10.0) * (1 + random.random())
+                print(f"[label] the hub moved during the push (attempt {attempt + 1}/{attempts}); re-reading and "
+                      f"merging its labels, retrying in {wait:.1f} s", flush=True)
+                sleep(wait)
+        raise RuntimeError(f"{repo} kept changing during {attempts} attempts; retrying later")
 
     upload.pull_labels = pull_labels  # type: ignore[attr-defined]
     return upload
@@ -222,12 +303,13 @@ class Labeler:
     """View and save logic, independent of Gradio so it can be tested. Items are looked up server-side by
     position; nothing that identifies an item (its id, variant or group) leaves this object."""
 
-    def __init__(self, items: list[dict], store: Store) -> None:
+    def __init__(self, items: list[dict], store: Store, sync_status: Callable[[], str] | None = None) -> None:
         why = check_blind(items)
         if why:
             raise ValueError(why)
         self.items = items
         self.store = store
+        self.sync_status = sync_status or (lambda: "")
 
     def next_index(self, labeler: str, start: int = 0) -> int:
         done = self.store.mine(labeler)
@@ -240,11 +322,13 @@ class Labeler:
     def render(self, i: int, labeler: str) -> dict:
         n_done = len(set(self.store.mine(labeler)) & {it["uid"] for it in self.items})
         progress = f"you have labelled {n_done} of {len(self.items)}"
+        warn = self.sync_status()
+        warn = f"\n\n{warn}" if warn else ""
         if i < 0:
-            return {"state": {"i": -1, "shown_at": now()}, "head": f"**All done** · {progress}.", "rubric": "",
+            return {"state": {"i": -1, "shown_at": now()}, "head": f"**All done** · {progress}.{warn}", "rubric": "",
                     "body": "", "grounding": False}
         it = self.items[i]
-        head = f"**Item {i + 1} of {len(self.items)}** · {it['kind']} · {it['lang']} · {progress}"
+        head = f"**Item {i + 1} of {len(self.items)}** · {it['kind']} · {it['lang']} · {progress}{warn}"
         if it["kind"] == "reward":
             body = f"### Instruction\n{it['instruction']}\n\n### Response\n{it['response']}"
             rubric = REWARD_RUBRIC
@@ -310,7 +394,7 @@ def build_app(lab: Labeler, labeler_of: Callable[[object], str], title: str = "L
 
     with gr.Blocks(title=title) as demo:
         gr.Markdown("# Lorde · human labels\nScore each item with the gate's own rubric. Every item needs an "
-                    "explicit score (and, for grounding, a verdict); nothing is filled in for you.")
+                    "explicit score (and, for grounding, a verdict); nothing is filled in for you.\n\n" + DO_NOT_LOOK)
         st = gr.State({"i": -1, "shown_at": ""})
         head = gr.Markdown()
         rubric = gr.Markdown()
@@ -337,8 +421,9 @@ def exposed(args) -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sample", default=str(config.DATA / "human_sample.jsonl"))
-    ap.add_argument("--out", default=str(config.DATA / "human_labels.jsonl"))
+    ap.add_argument("--sample", default=str(data_dir() / "human_sample.jsonl"))
+    ap.add_argument("--out", default=str(data_dir() / "human_labels.jsonl"),
+                    help="labels file (the outbox in hosted mode); default <LORDE_LABEL_DATA_DIR or data/>")
     ap.add_argument("--labeler", default=os.environ.get("LABEL_NAME", "anon"),
                     help="labeller name when no login is required (local use)")
     ap.add_argument("--share", action="store_true")
@@ -352,7 +437,17 @@ def main() -> None:
         sys.exit("[label] refusing to start: this page would be reachable beyond localhost without a login. "
                  "Set LABEL_PASSWORD (and LABEL_USER or LABEL_NAME), or LABEL_USERS=name:password,...")
 
+    out_dir = Path(args.out).parent
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        probe = out_dir / ".write_test"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as e:
+        sys.exit(f"[label] cannot write labels to {out_dir} ({e}). Set LORDE_LABEL_DATA_DIR to a writable directory "
+                 "(hosted: a mounted volume the container user can write).")
     store = Store(Path(args.out))
+    uploader = None
     if args.hub:
         from huggingface_hub import hf_hub_download
 
@@ -387,7 +482,7 @@ def main() -> None:
         if why:
             sys.exit(NOT_BLIND.format(why=why, hub=""))
 
-    lab = Labeler(items, store)
+    lab = Labeler(items, store, sync_status=uploader.status if uploader else None)
     if users:
         def labeler_of(request) -> str:
             return getattr(request, "username", None) or ""
