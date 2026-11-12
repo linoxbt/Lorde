@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { codeForAuthRedirect, friendlyAuthError, GENERIC_SIGNIN_ERROR, SIGNIN_ERRORS, signinErrorMessage } from "../../lib/auth-errors.ts";
+import { codeForAuthRedirect, friendlyAuthError, GENERIC_SIGNIN_ERROR, SIGNIN_ERRORS, signinErrorMessage, signinMessage } from "../../lib/auth-errors.ts";
+import { codeForExchangeError, codeForOtpError, flowOf, OTP_TYPES, planAuth } from "../../lib/auth-flow.ts";
 import { destination, safeNext } from "../../lib/safe-next.ts";
 
 test("safeNext keeps Console paths with their query string", () => {
@@ -50,4 +51,52 @@ test("Supabase auth errors map to friendly text", () => {
   assert.match(friendlyAuthError(e("Email address not authorized")).text, /can't send email/);
   assert.match(friendlyAuthError(e("email rate limit exceeded", "over_email_send_rate_limit")).text, /Too many emails/);
   assert.equal(friendlyAuthError(e("TypeError: fetch failed at internal/xyz")).text, "Something went wrong. Try again.");
+  assert.match(friendlyAuthError(e("captcha protection: request disallowed (invalid-input-response)", "captcha_failed")).text, /security check/);
+});
+
+const O = "https://lorde.example";
+const plan = (qs: string, enabled = true) => planAuth(new URLSearchParams(qs), O, enabled);
+
+test("/auth/confirm verifies every email type Supabase sends, and lands each on the right page", () => {
+  // The five templates in supabase/templates, plus `email` (Supabase's newer name for signup/magic-link confirmation).
+  const cases: [string, string][] = [
+    ["signup", "/console"], ["email", "/console"], ["magiclink", "/console"],
+    ["recovery", "/reset-password"], ["email_change", "/console/settings"], ["invite", "/reset-password?invited=1"],
+  ];
+  for (const [type, to] of cases) {
+    const next = type === "email_change" ? "/console/settings" : "/console";
+    assert.deepEqual(plan(`token_hash=h1&type=${type}&next=${encodeURIComponent(next)}`), { kind: "otp", type, tokenHash: "h1", to }, type);
+  }
+  for (const t of OTP_TYPES) assert.equal(plan(`token_hash=h&type=${t}`).kind, "otp", t);
+  // {{ .RedirectTo }} unwraps to the inner next; the recovery type wins over any next
+  assert.deepEqual(plan(`token_hash=h&type=signup&next=${encodeURIComponent(`${O}/auth/callback?next=/console/keys&flow=signup`)}`),
+    { kind: "otp", type: "signup", tokenHash: "h", to: "/console/keys" });
+  assert.equal((plan("token_hash=h&type=recovery&next=/console/keys") as { to: string }).to, "/reset-password");
+  assert.deepEqual(plan("token_hash=h&type=bogus"), { kind: "fail", code: "link_invalid" });
+  assert.deepEqual(plan("token_hash=h"), { kind: "fail", code: "link_invalid" });
+  assert.deepEqual(plan(""), { kind: "fail", code: "link_invalid" });
+  assert.deepEqual(plan("next=/console/keys", false), { kind: "go", to: "/console/keys" });
+});
+
+test("a PKCE link opened in another browser says what to do next instead of failing", () => {
+  assert.deepEqual(plan("code=c1&next=%2Fconsole&flow=signup"), { kind: "exchange", code: "c1", to: "/console", flow: "signup" });
+  assert.equal(codeForExchangeError("pkce_code_verifier_not_found", "signup"), "email_confirmed");
+  assert.equal(SIGNIN_ERRORS.email_confirmed, "Your email is confirmed: sign in to continue.");
+  assert.equal(signinMessage("email_confirmed")?.tone, "notice");
+  for (const flow of ["magiclink", "recovery", null] as const) {
+    assert.equal(codeForExchangeError("pkce_code_verifier_not_found", flow), "other_browser", String(flow));
+  }
+  assert.match(SIGNIN_ERRORS.other_browser, /opened in a different browser\. Request a new link here, or open it in the browser you used/);
+  assert.equal(signinMessage("other_browser")?.tone, "error");
+  // older reset emails carry no flow, but their next is the reset page
+  assert.equal(flowOf(new URLSearchParams("code=c&next=%2Freset-password")), "recovery");
+  assert.equal((plan("code=c&next=%2Freset-password") as { to: string }).to, "/reset-password");
+  assert.equal(flowOf(new URLSearchParams("code=c&next=%2Fconsole&flow=evil")), null);
+  assert.equal(codeForExchangeError("flow_state_expired", "signup"), "link_expired");
+  assert.equal(codeForExchangeError("unexpected_failure", null), "session_failed");
+  assert.equal(codeForOtpError("otp_expired"), "link_expired");
+  assert.equal(codeForOtpError("bad_jwt"), "link_invalid");
+  // Supabase redirecting back with a verifier error gets the same messages
+  assert.deepEqual(plan("error=invalid_request&error_code=pkce_code_verifier_not_found&flow=signup"), { kind: "fail", code: "email_confirmed" });
+  assert.equal(codeForAuthRedirect("server_error", "pkce_code_verifier_not_found"), "other_browser");
 });

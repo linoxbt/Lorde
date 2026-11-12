@@ -5,8 +5,10 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
+import { CaptchaMissing, useCaptcha } from "@/components/console/turnstile";
 import { Button, LinkButton } from "@/components/ui";
 import { friendlyAuthError } from "@/lib/auth-errors";
+import type { Flow } from "@/lib/auth-flow";
 
 export type AuthMode = "signin" | "signup";
 type Method = "password" | "link";
@@ -32,6 +34,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
   const [busy, setBusy] = useState<string | null>(null), [slow, setSlow] = useState(false);
   /** Address that may need its confirmation email again (after sign-up, or "email not confirmed" at sign-in). */
   const [resendTo, setResendTo] = useState<string | null>(null), [cooldown, setCooldown] = useState(0);
+  const captcha = useCaptcha();
   useEffect(() => {
     if (cooldown <= 0) return;
     const t = setTimeout(() => setCooldown((c) => c - 1), 1000);
@@ -54,7 +57,12 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
     );
   }
   const signup = mode === "signup";
-  const redirect = (to = next) => `${window.location.origin}/auth/callback?next=${encodeURIComponent(to)}`;
+  /**
+   * Where the email link lands. `flow` says which email it was, so a PKCE link opened in another browser can say
+   * "your email is confirmed" (sign-up) or "request a new link here" (sign-in link, reset) instead of failing.
+   */
+  const redirect = (flow: Flow | null, to = next) =>
+    `${window.location.origin}/auth/callback?next=${encodeURIComponent(to)}${flow ? `&flow=${flow}` : ""}`;
   const client = async () => (await import("@/lib/supabase/client")).supabaseBrowser();
 
   async function submit(e: React.FormEvent) {
@@ -70,11 +78,13 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
     try {
       const sb = await client();
       if (method === "link") {
-        const { error } = await withTimeout(sb.auth.signInWithOtp({ email, options: { emailRedirectTo: redirect(), shouldCreateUser: signup } }), GIVE_UP_MS);
+        const { error } = await withTimeout(sb.auth.signInWithOtp({ email,
+          options: { emailRedirectTo: redirect("magiclink"), shouldCreateUser: signup, ...captcha.captchaOptions() } }), GIVE_UP_MS);
         if (error) throw error;
         setMsg({ text: signup ? "Check your email: the link creates your account and signs you in." : "Check your email for a sign-in link." });
       } else if (signup) {
-        const { data, error } = await withTimeout(sb.auth.signUp({ email, password, options: { emailRedirectTo: redirect() } }), GIVE_UP_MS);
+        const { data, error } = await withTimeout(sb.auth.signUp({ email, password,
+          options: { emailRedirectTo: redirect("signup"), ...captcha.captchaOptions() } }), GIVE_UP_MS);
         if (error) throw error;
         if (data.session) return router.replace(next);
         // Supabase answers an existing, confirmed address with a user that has no identities.
@@ -85,7 +95,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
           setResendTo(email); setCooldown(60);
         }
       } else {
-        const { error } = await withTimeout(sb.auth.signInWithPassword({ email, password }), GIVE_UP_MS);
+        const { error } = await withTimeout(sb.auth.signInWithPassword({ email, password, options: captcha.captchaOptions() }), GIVE_UP_MS);
         if (error) throw error;
         return router.replace(next);
       }
@@ -95,6 +105,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
       if (f.unconfirmed) setResendTo(email);
     } finally {
       setBusy(null);
+      captcha.reset();
     }
   }
 
@@ -103,7 +114,8 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
     setBusy("Sending email…");
     setMsg(null);
     try {
-      const { error } = await withTimeout((await client()).auth.resend({ type: "signup", email: resendTo, options: { emailRedirectTo: redirect() } }), GIVE_UP_MS);
+      const { error } = await withTimeout((await client()).auth.resend({ type: "signup", email: resendTo,
+        options: { emailRedirectTo: redirect("signup"), ...captcha.captchaOptions() } }), GIVE_UP_MS);
       if (error) throw error;
       setMsg({ text: `Sent a new confirmation email to ${resendTo}. It can take a few minutes; check spam too.` });
       setCooldown(60);
@@ -111,6 +123,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
       setMsg({ text: friendly(err).text, error: true });
     } finally {
       setBusy(null);
+      captcha.reset();
     }
   }
 
@@ -120,18 +133,20 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
     setBusy("Sending email…");
     setMsg(null);
     try {
-      const { error } = await withTimeout((await client()).auth.resetPasswordForEmail(email, { redirectTo: redirect("/reset-password") }), GIVE_UP_MS);
+      const { error } = await withTimeout((await client()).auth.resetPasswordForEmail(email,
+        { redirectTo: redirect("recovery", "/reset-password"), ...captcha.captchaOptions() }), GIVE_UP_MS);
       if (error) throw error;
       setMsg({ text: "If that email has an account, a reset link is on its way." });
     } catch (err) {
       setMsg({ text: friendly(err).text, error: true });
     } finally {
       setBusy(null);
+      captcha.reset();
     }
   }
 
   async function github() {
-    const { error } = await (await client()).auth.signInWithOAuth({ provider: "github", options: { redirectTo: redirect() } });
+    const { error } = await (await client()).auth.signInWithOAuth({ provider: "github", options: { redirectTo: redirect(null) } });
     if (error) setMsg({ text: friendly(error).text, error: true });
   }
 
@@ -176,6 +191,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
             <p className="text-[12px] text-faint">At least {MIN_PASSWORD} characters.</p>
           </div>
         )}
+        {captcha.widget}
         <Button type="submit" size="lg" className="w-full" disabled={!!busy}>
           {busy ?? (method === "link" ? (signup ? "Email me a sign-up link" : "Email me a sign-in link")
             : signup ? "Create account" : "Sign in")}
@@ -205,6 +221,7 @@ export function SignInForm({ enabled, next, mode = "signin" }: { enabled: boolea
 }
 
 function friendly(err: unknown) {
+  if (err instanceof CaptchaMissing) return { text: "Complete the security check above the button first." };
   if (err instanceof SlowEmail) {
     return { text: "No answer from the sign-in service yet. If an email arrives in the next few minutes, its link works; otherwise try again." };
   }

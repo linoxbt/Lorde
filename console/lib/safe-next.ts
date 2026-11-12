@@ -24,9 +24,11 @@ const DESTINATIONS = ["/console", "/reset-password"] as const;
 /**
  * Where to go after the link. `next` may be a path, or the full emailRedirectTo URL a template passed as
  * {{ .RedirectTo }} (https://<site>/auth/callback?next=/console/...), whose own `next` is then used.
+ * A recovery link always goes to the reset page; an invite to the same page, to choose a first password.
  */
 export function destination(rawNext: string | null, origin: string, type?: string | null): string {
   if (type === "recovery") return "/reset-password";
+  if (type === "invite") return "/reset-password?invited=1";
   let next = rawNext;
   if (next && /^https?:\/\//i.test(next)) {
     try {

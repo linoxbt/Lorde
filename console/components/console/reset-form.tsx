@@ -18,12 +18,19 @@ export function ResetForm() {
     e.preventDefault();
     if (password.length < MIN_PASSWORD) return setMsg(`Use at least ${MIN_PASSWORD} characters.`);
     if (password !== confirm) return setMsg("The passwords do not match.");
-    setBusy(true);
-    const { supabaseBrowser } = await import("@/lib/supabase/client");
-    const { error } = await supabaseBrowser().auth.updateUser({ password });
-    setBusy(false);
-    if (error) return setMsg(/session/i.test(error.message) ? "This reset link has expired. Request a new one from the sign-in page." : friendlyAuthError(error).text);
-    router.replace("/console");
+    if (busy) return;
+    setBusy(true); setMsg("");
+    try {
+      const { supabaseBrowser } = await import("@/lib/supabase/client");
+      const { error } = await supabaseBrowser().auth.updateUser({ password });
+      if (error) return setMsg(/session/i.test(error.message) ? "This reset link has expired. Request a new one from the sign-in page." : friendlyAuthError(error).text);
+      router.replace("/console");
+    } catch {
+      // A network error (or a failed chunk load) must not leave the button stuck on "Saving…".
+      setMsg("Could not reach the sign-in service. Check your connection and try again.");
+    } finally {
+      setBusy(false);
+    }
   }
   return (
     <form onSubmit={submit} className="space-y-3">
