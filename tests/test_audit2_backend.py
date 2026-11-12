@@ -299,6 +299,25 @@ def test_hub_file_size_is_checked_before_download_and_the_revision_is_pinned(tmp
     assert calls["download"] == ["c0ffee"] and out["hf_revision"] == "c0ffee" and out["format"] == "jsonl"
 
 
+def test_upstream_timeout_covers_queueing_behind_job_judgments_in_serve(tmp_path):
+    """B9: with one Serve slot shared by API calls and the job worker, an API call may wait in Serve for a job
+    judgment before its own runs; its HTTP timeout covers both, so it is not timed out (and charged) for that."""
+    one = Settings(upstream_concurrency=1, upstream_timeout_s=30)
+    assert one.api_upstream_slots == 1 and one.upstream_read_timeout_s == 60
+    assert Settings(upstream_concurrency=3, upstream_timeout_s=30).upstream_read_timeout_s == 30  # 2 API + 1 job
+    assert Settings(upstream_concurrency=1, upstream_timeout_s=30,
+                    worker_shares_upstream=False).upstream_read_timeout_s == 30
+    from gateway.upstream import Upstream
+
+    up = Upstream(Settings(upstream_concurrency=1, upstream_timeout_s=7))
+    assert up.client.timeout.read == 14
+    from gateway.errors import ModelUnavailable, refundable
+
+    timeout = ModelUnavailable("upstream timeout")
+    timeout.charged = True  # a reply that really took longer than the whole budget is still charged
+    assert not refundable(timeout)
+
+
 def test_default_job_row_cap_fits_the_time_limit_on_one_cpu_slot():
     s = Settings()
     assert s.job_max_rows * 2 * 30 <= s.job_max_seconds  # 2 gates x 30 s per judgment, worst case on CPU

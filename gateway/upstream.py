@@ -49,7 +49,7 @@ class Upstream:
     def __init__(self, s: Settings, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.s = s
         self.client = httpx.AsyncClient(
-            base_url=s.vllm_base_url.rstrip("/") + "/", timeout=s.upstream_timeout_s, transport=transport,
+            base_url=s.vllm_base_url.rstrip("/") + "/", timeout=s.upstream_read_timeout_s, transport=transport,
             headers={"Authorization": f"Bearer {s.vllm_api_key}"},
             limits=httpx.Limits(max_connections=s.api_upstream_slots + 2))
         self.breaker = CircuitBreaker(s.breaker_failures, s.breaker_window_s)

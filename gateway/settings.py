@@ -14,6 +14,10 @@ Tenant fairness (audit N1; see gateway/slots.py and gateway/quota.py):
   deployment Serve sees at most one API call plus one job judgment at a time, and an API call waits for at most
   one job judgment inside Serve.
 - ``LORDE_ORG_UPSTREAM_CONCURRENCY`` (1): API calls in flight per organization.
+- ``LORDE_UPSTREAM_TIMEOUT`` (30): seconds one judgment may take in Serve. The HTTP timeout is that times the
+  calls that can be ahead of it inside Serve (``upstream_read_timeout_s``), so an API call queued in Serve behind a
+  job judgment is not timed out (and charged) for the job's time. Set ``LORDE_UPSTREAM_CONCURRENCY`` to Serve's
+  real parallelism (1 for one llama.cpp slot) so this and the slot pool match the hardware.
 - ``LORDE_UPSTREAM_QUEUE_TIMEOUT_S`` (30) and ``LORDE_UPSTREAM_MAX_WAITERS`` (32): how long, and how many
   requests may, wait for a slot; past either, 429 ``rate_limited`` "model busy, retry later".
 - ``LORDE_ORG_DAILY_JUDGMENTS`` (5000, 0 = unlimited): judgments per organization per UTC day, API and jobs
@@ -125,6 +129,17 @@ class Settings:
         if self.worker_shares_upstream:
             return max(1, self.upstream_concurrency - self.worker_judge_concurrency)
         return max(1, self.upstream_concurrency)
+
+    @property
+    def upstream_read_timeout_s(self) -> float:
+        """How long one call may wait for Serve's reply (audit 2, B9). ``LORDE_UPSTREAM_TIMEOUT`` is the budget for
+        one judgment; when the Gateway's API calls plus the worker's job judgments can exceed Serve's own slots
+        (``LORDE_UPSTREAM_CONCURRENCY``), a call can sit in Serve's queue behind them first, so the timeout covers
+        that many judgments. On the one-slot CPU deployment (LORDE_UPSTREAM_CONCURRENCY=1) an API call may wait for
+        one job judgment, then run its own: 2 x 30 s. Without this, such calls timed out and were charged."""
+        in_flight = self.api_upstream_slots + (self.worker_judge_concurrency if self.worker_shares_upstream else 0)
+        rounds = -(-in_flight // max(1, self.upstream_concurrency))  # ceil
+        return self.upstream_timeout_s * max(1, rounds)
 
     @property
     def model_label(self) -> str:
