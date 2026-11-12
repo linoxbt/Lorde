@@ -1,7 +1,7 @@
 # runtime: Lorde Gateway (and, in Phase 1, the job worker).
 curatorkit==0.1.23            # LSAL v1.1: prompts are rendered and parsed by CuratorKIT itself
 jsonschema>=4
-fastapi>=0.115
+fastapi>=0.162.2
 uvicorn[standard]>=0.30
 httpx>=0.27
 pydantic>=2.7
