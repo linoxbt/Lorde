@@ -164,3 +164,16 @@ without it nothing is loaded and nothing changes. Email links (`/auth/confirm`) 
 To turn it off, disable CAPTCHA in Supabase first, then remove the variable and redeploy. The CSP
 (`console/lib/csp.ts`) adds `https://challenges.cloudflare.com` to `script-src`, `frame-src` and `connect-src` only
 while the site key is set. `pnpm test:e2e:live` builds with Cloudflare's test site key and a stand-in Turnstile script.
+
+## Console: relay timeouts and security headers
+
+- The `/api/gateway/*` relay gives judging, jobs and uploads 120 s and everything else 30 s, then answers JSON 504
+  (`console/lib/relay.ts`); its route sets `maxDuration = 130` so Vercel does not stop the function first (needs
+  Fluid compute, the default for new projects; the Hobby limit without it is 60 s). Keep the Gateway's
+  `LORDE_UPSTREAM_TIMEOUT` plus `LORDE_UPSTREAM_QUEUE_TIMEOUT_S` at or below 120 s for Console users; above it, the
+  Console reports a timeout for a judgment the Gateway may still finish and meter.
+- `/api/status` is cached for 10 s (in process, and `s-maxage=10` at the CDN), so the public status page costs the
+  Gateway at most one `/healthz` + `/readyz` pair per 10 s per instance.
+- Every page carries a per-response nonce-based Content-Security-Policy (`console/proxy.ts`, `console/lib/csp.ts`),
+  so pages render per request instead of being prerendered. The Supabase session cookies stay readable by JavaScript
+  (`@supabase/ssr` needs that); see `console/README.md`, "Security headers".
