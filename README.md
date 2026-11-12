@@ -211,10 +211,17 @@ come: staging deployment (HF Inference Endpoint, Railway, Supabase, Vercel).
 - **Deterministic data.** Prompt sampling, variant assignment, degradations, splits and the human sample are
   derived from SHA-256 hashes of stable ids, not from a global RNG. Generation uses temperature 0.1 (judges) and
   fixed seeds (training).
-- **No leakage.** Splits are grouped by prompt (reward) and source passage (grounding). The downstream raw and
+- **Leakage.** Splits are grouped by prompt (reward) and source passage (grounding), so no test prompt or
+  passage appears verbatim in training. Near-duplicates did cross the published v1 splits (17 of 348 test reward
+  prompts have a >= 0.9-similar training prompt; 12 test gold responses equal a training one); step 3 now merges
+  near-duplicate groups before splitting and reports the check in `splits_summary.json`. The downstream raw and
   eval sets come from Wikipedia articles never used for judge training.
-- **Pinned versions.** `requirements/*.txt`; three separate environments because AlignTune pins `trl==1.7.1`
-  and `torch<2.14` while vLLM brings its own torch.
+- **Pinned versions.** `requirements/forge-data.txt` and `forge-train.txt` are pinned (vLLM in `forge-serve.txt`
+  is not); three separate environments because AlignTune pins `trl==1.7.1` and `torch<2.14` while vLLM brings
+  its own torch.
+- **Prediction caches** are keyed by the weights' fingerprint; the published v1 step-6 predictions are a legacy
+  cache reused with `--trust-legacy-cache` (see the article). `train_meta.json`'s `train_seconds` now sums every
+  session of a resumed run (the v1 value is the last session only).
 - **Template fingerprints.** SHA-256 of each CuratorKIT template with its slots removed is recorded in
   `results/labels_summary.json`, every eval report and the model card. A CuratorKIT upgrade that changes the
   prompts shows up as a new fingerprint.
