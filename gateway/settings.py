@@ -39,11 +39,13 @@ otherwise starve real ones.
 
 Per-IP limit (audit N2): ``LORDE_IP_RPM`` (300, 0 = off) requests per minute per client IP on every keyed route,
 checked before the API key is looked up, so a flood of made-up keys from one address is refused without
-reaching the database. The client IP is the TCP peer as uvicorn reports it. Behind Railway's proxy run uvicorn
-with ``--proxy-headers --forwarded-allow-ips='*'`` (infra/start-api.sh does): uvicorn then reports the first
-X-Forwarded-For hop, the address Railway's edge saw. Without uvicorn's proxy headers, list the proxy addresses
-(IPs or CIDRs, or ``*``) in ``LORDE_TRUSTED_PROXIES`` and the Gateway reads X-Forwarded-For's first hop itself,
-only for requests that come from one of them. The Console relays its users' calls from Vercel's few egress
+reaching the database. The client IP is the TCP peer as uvicorn reports it. Behind Railway's proxy,
+infra/start-api.sh runs uvicorn with ``--proxy-headers --forwarded-allow-ips=<private and CGNAT ranges>``
+(``FORWARDED_ALLOW_IPS`` overrides): uvicorn then reports the right-most X-Forwarded-For hop that is not one of
+those proxies, i.e. the address Railway's edge saw; hops a client wrote itself are to its left and ignored
+(audit 2, S7: ``'*'`` used to make uvicorn take the left-most, client-supplied hop). Without uvicorn's proxy
+headers, list the proxy addresses (IPs or CIDRs) in ``LORDE_TRUSTED_PROXIES`` and the Gateway applies the same
+right-most-untrusted rule itself, only for requests that come from one of them. The Console relays its users' calls from Vercel's few egress
 addresses; with ``LORDE_RELAY_SECRET`` set (32+ characters, the same value in the Console), a request carrying
 ``x-lorde-relay-secret: <secret>`` is limited by its ``x-lorde-client-ip`` header instead. IPv6 clients are
 limited per /64.

@@ -157,16 +157,25 @@ class Gateway:
             raise RateLimited(f"rate limit of {key.rpm} judgments/minute exceeded", headers={"Retry-After": retry})
 
     # ------------------------------------------------------------------ per-IP limit (audit N2)
+    def trusted_proxy(self, ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None) -> bool:
+        return ip is not None and any(ip in n for n in self.trusted)
+
     def client_ip(self, scope: Mapping[str, Any], headers: Mapping[str, str]) -> str:
-        """The address to limit: the Console relay's forwarded user address (with the relay secret), X-Forwarded-
-        For's first hop when the peer is a trusted proxy, else the peer. IPv6 is grouped per /64."""
+        """The address to limit: the Console relay's forwarded user address (with the relay secret); when the peer
+        is a trusted proxy, the right-most X-Forwarded-For hop that is not itself a trusted proxy (audit 2, S7:
+        hops to its left are whatever the client sent, so never trusted); else the peer. ``*`` trusts the peer as
+        one proxy hop and takes the hop it appended. IPv6 is grouped per /64."""
         peer_s = (scope.get("client") or ("unknown", 0))[0] or "unknown"
         ip = _ip(peer_s)
         relay = self.s.relay_secret
         if relay and secrets.compare_digest(headers.get("x-lorde-relay-secret", "").encode(), relay.encode()):
             ip = _ip(headers.get("x-lorde-client-ip", "")) or ip
-        elif ip is not None and (self.trust_all or any(ip in n for n in self.trusted)):
-            ip = _ip(headers.get("x-forwarded-for", "").split(",")[0]) or ip
+        elif ip is not None and (self.trust_all or self.trusted_proxy(ip)):
+            hops = [h for h in (_ip(x) for x in headers.get("x-forwarded-for", "").split(",")) if h is not None]
+            for hop in reversed(hops):
+                ip = hop
+                if not self.trusted_proxy(hop):
+                    break
         if ip is None:
             return peer_s[:64]
         if isinstance(ip, ipaddress.IPv6Address):
@@ -442,7 +451,9 @@ class RequestContext:
             cl = headers.get("content-length")
             if cl and cl.isdigit() and int(cl) > limit:
                 raise PayloadTooLarge(f"request body over {limit // (1024 * 1024)} MB")
-            if not storage and method in ("POST", "PUT", "PATCH", "DELETE"):
+            # Only the keyed API (/v1/*, /mcp; the key was checked above) is buffered. Anything else is answered
+            # (404/405) without reading its body, so an anonymous POST to a made-up path costs no memory (audit 2, S4).
+            if not storage and method in ("POST", "PUT", "PATCH", "DELETE") and self.needs_key(method, path):
                 receive = await self._buffer(receive, limit)
             await self.app(scope, receive, send_wrapper)
         except _Disconnected:

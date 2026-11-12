@@ -10,6 +10,7 @@ import os
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import httpx
 import pytest
@@ -664,3 +665,90 @@ def test_orphan_dataset_objects_are_purged(env, tmp_path):
         fn = "public.orphan_dataset_objects(int)"
         assert not c.execute("select has_function_privilege('authenticated', %s, 'execute')", (fn,)).fetchone()[0]
         assert c.execute("select file_size_limit from storage.buckets where id='datasets'").fetchone()[0] == 200 << 20
+
+
+# ------------------------------------------------------------------ S4, S7, S10: the HTTP edge
+
+START_API = Path(__file__).resolve().parent.parent / "infra" / "start-api.sh"
+
+
+def test_unrouted_bodies_are_not_buffered(tmp_path):
+    """S4: an anonymous POST to a path outside the keyed API is answered without its body being read."""
+    app, _, _ = gateway_app(tmp_path)
+
+    async def go():
+        reads = 0
+
+        async def receive():
+            nonlocal reads
+            reads += 1
+            return {"type": "http.request", "body": b"x" * 65536, "more_body": True}  # an endless body
+
+        sent = []
+
+        async def send(msg):
+            sent.append(msg)
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+                 "scheme": "http", "path": "/anything", "raw_path": b"/anything", "query_string": b"",
+                 "root_path": "", "client": ("203.0.113.9", 1), "server": ("t", 80), "headers": [(b"host", b"t")]}
+        await asyncio.wait_for(app(scope, receive, send), 5)
+        return reads, next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+    reads, status = asyncio.run(go())
+    assert status == 404 and reads == 0
+
+
+def test_start_script_trusts_only_the_proxy_hop_and_disables_uvicorns_access_log():
+    import re
+
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    text = START_API.read_text()
+    assert "--forwarded-allow-ips='*'" not in text and "--no-access-log" in text
+    assert "--limit-concurrency" in text and "--timeout-keep-alive" in text
+    hops = re.search(r'PROXY_HOPS="\$\{FORWARDED_ALLOW_IPS:-([^}]+)\}"', text).group(1)
+
+    async def peer_seen(client, xff):
+        seen = {}
+
+        async def app(scope, receive, send):
+            seen["client"] = scope["client"][0]
+
+        scope = {"type": "http", "client": (client, 1), "headers": [(b"x-forwarded-for", xff.encode())]}
+        await ProxyHeadersMiddleware(app, trusted_hosts=hops)(scope, None, None)
+        return seen["client"]
+
+    # Railway's edge (a CGNAT address) appends the real client; a client-written hop to its left is ignored
+    assert asyncio.run(peer_seen("100.64.0.2", "6.6.6.6, 203.0.113.5")) == "203.0.113.5"
+    assert asyncio.run(peer_seen("100.64.0.2", "203.0.113.5")) == "203.0.113.5"
+    # a request that does not come from a proxy keeps its own address whatever it claims
+    assert asyncio.run(peer_seen("198.51.100.7", "6.6.6.6")) == "198.51.100.7"
+
+
+def test_gateway_client_ip_is_the_right_most_untrusted_hop_and_the_relay_still_works(tmp_path):
+    from test_gateway_fairness import make
+
+    app, _ = make(tmp_path, orgs=(), trusted_proxies=["10.0.0.0/8"], relay_secret="r" * 32)
+    gw = app.gw
+    spoofed = {"x-forwarded-for": "6.6.6.6, 203.0.113.5, 10.1.2.3"}
+    assert gw.client_ip({"client": ("10.9.9.9", 1)}, spoofed) == "203.0.113.5"
+    assert gw.client_ip({"client": ("10.9.9.9", 1)}, {"x-forwarded-for": "10.1.1.1, 10.2.2.2"}) == "10.1.1.1"
+    assert gw.client_ip({"client": ("198.51.100.7", 1)}, spoofed) == "198.51.100.7"
+    relay = {"x-lorde-relay-secret": "r" * 32, "x-lorde-client-ip": "192.0.2.44", **spoofed}
+    assert gw.client_ip({"client": ("54.1.2.3", 1)}, relay) == "192.0.2.44"
+    assert gw.client_ip({"client": ("10.9.9.9", 1)}, {**relay, "x-lorde-relay-secret": "nope"}) == "203.0.113.5"
+
+
+def test_access_log_masks_storage_tokens(tmp_path, caplog):
+    import logging
+
+    app, _, _ = gateway_app(tmp_path, storage_dir=str(tmp_path / "st"))
+    token = app.gw.storage.token("put", "datasets", "o/d/x.jsonl")
+    with caplog.at_level(logging.INFO, logger="lorde.access"), TestClient(app) as c:
+        assert c.put(f"/v1/_storage/{token}", content=b"{}\n").status_code == 200
+        assert c.get(f"/v1/_storage/{token}").status_code == 404  # a put token cannot read
+    lines = [r for r in caplog.records if r.name == "lorde.access"]
+    assert len(lines) == 2 and all(token not in r.getMessage() and token not in json.dumps(r.fields, default=str)
+                                   for r in lines)
+    assert {r.fields["route"] for r in lines} == {"/v1/_storage/{token}"}
