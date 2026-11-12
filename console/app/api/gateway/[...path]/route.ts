@@ -2,14 +2,13 @@ import { type NextRequest, NextResponse } from "next/server";
 
 import { apiError, sessionUserId, unauthenticated } from "@/lib/api";
 import { env, supabaseEnabled } from "@/lib/env";
+import { ALLOWED, timeoutFor } from "@/lib/relay";
 
 export const dynamic = "force-dynamic";
-const ALLOWED = /^v1\/(judge\/(reward|grounding|batch)|uploads|jobs(\/[0-9a-f-]{36}(\/(results|cancel))?)?|models|usage)$/;
+/** Seconds: longer than the relay's slowest timeout (RELAY_MAX_DURATION_S in lib/relay.ts; a unit test checks both). */
+export const maxDuration = 130;
 const PASS_HEADERS = ["content-type", "retry-after", "x-request-id", "x-lorde-model", "x-lorde-template",
   "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"];
-
-/** Judging and jobs can take a while on the CPU model; everything else should answer quickly. */
-const timeoutFor = (p: string) => (p.startsWith("v1/judge") || p.startsWith("v1/jobs") || p === "v1/uploads" ? 120_000 : 30_000);
 
 /**
  * Forwards allow-listed Gateway calls with the caller's own key (x-lorde-key). With Supabase accounts configured the
