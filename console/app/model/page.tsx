@@ -33,7 +33,7 @@ export default function Model() {
   return (
     <>
       <SiteHeader />
-      <main>
+      <main id="main" tabIndex={-1} className="outline-none">
         <PageHero eyebrow="Model card" title="Lorde, Tiny Aya Global trained to judge."
           lead="A 3.35B judge for CuratorKIT's RewardGate and HallucinationGate, distilled from an Aya Expanse teacher on CuratorKIT's exact prompts.">
           <LinkButton href="/bench" arrow>Lorde Bench</LinkButton>

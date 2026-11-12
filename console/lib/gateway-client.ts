@@ -1,6 +1,6 @@
 "use client";
 
-import { type ErrorBody, friendlyGatewayError } from "./gateway-errors";
+import { type ErrorBody, friendlyGatewayError } from "./gateway-errors.ts";
 import type { Scope } from "./scopes";
 
 /**
@@ -27,8 +27,13 @@ export async function errorMessage(r: Response, fallback = `Request failed (${r.
 }
 
 const NIL = "00000000-0000-0000-0000-000000000000";
-/** A cheap call per scope: each answers 404/200 when the key has the scope, 403 when it lacks it. */
-const PROBES: Record<Exclude<Scope, "judge">, [string, RequestInit]> = {
+/**
+ * A cheap call per scope: each answers 403 when the key lacks the scope, and otherwise 400/404/200 without doing
+ * work. The Gateway checks the key's scope before it validates the body, so an empty judge request is refused with
+ * 400 (no model call, nothing charged) for a key that has `judge`, and with 403 for one that lacks it.
+ */
+export const PROBES: Record<Scope, [string, RequestInit]> = {
+  judge: ["/v1/judge/reward", { method: "POST", body: "{}" }],
   "jobs:read": [`/v1/jobs/${NIL}`, {}],
   "jobs:write": [`/v1/jobs/${NIL}/cancel`, { method: "POST", body: "{}" }],
   "usage:read": ["/v1/usage?days=1", {}],
@@ -47,10 +52,8 @@ export async function checkKey(key: string, need: Scope[]): Promise<{ ok: true }
     const msg = await errorMessage(r);
     return { ok: false, message: /sign in/i.test(msg) ? "Your Console session has ended. Sign in again." : "This key is not recognised. Check it, or create a new one under API keys." };
   }
-  if (r.status === 403) {
-    const msg = await errorMessage(r);
-    if (!/lacks/i.test(msg)) return { ok: false, message: "This key has been revoked. Create a new one under API keys." };
-    if (need.includes("judge")) return { ok: false, message: "This key lacks the judge scope needed here." };
+  if (r.status === 403) {  // /v1/models needs no scope: a 403 here is a revoked key
+    return { ok: false, message: "This key has been revoked. Create a new one under API keys." };
   } else if (unavailable(r)) {
     return { ok: false, message: await errorMessage(r, "The Gateway is unavailable right now. Try again shortly.") };
   } else if (!r.ok) {
@@ -58,7 +61,6 @@ export async function checkKey(key: string, need: Scope[]): Promise<{ ok: true }
   }
   const missing: string[] = [];
   for (const s of need) {
-    if (s === "judge") continue;
     const [path, init] = PROBES[s];
     const p = await gatewayFetch(path, init, key).catch(() => null);
     if (!p || unavailable(p)) {

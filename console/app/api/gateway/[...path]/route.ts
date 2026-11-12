@@ -2,14 +2,13 @@ import { type NextRequest, NextResponse } from "next/server";
 
 import { apiError, sessionUserId, unauthenticated } from "@/lib/api";
 import { env, supabaseEnabled } from "@/lib/env";
+import { ALLOWED, IDEMPOTENCY_KEY, timeoutFor } from "@/lib/relay";
 
 export const dynamic = "force-dynamic";
-const ALLOWED = /^v1\/(judge\/(reward|grounding|batch)|uploads|jobs(\/[0-9a-f-]{36}(\/(results|cancel))?)?|models|usage)$/;
+/** Seconds: longer than the relay's slowest timeout (RELAY_MAX_DURATION_S in lib/relay.ts; a unit test checks both). */
+export const maxDuration = 130;
 const PASS_HEADERS = ["content-type", "retry-after", "x-request-id", "x-lorde-model", "x-lorde-template",
   "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"];
-
-/** Judging and jobs can take a while on the CPU model; everything else should answer quickly. */
-const timeoutFor = (p: string) => (p.startsWith("v1/judge") || p.startsWith("v1/jobs") || p === "v1/uploads" ? 120_000 : 30_000);
 
 /**
  * Forwards allow-listed Gateway calls with the caller's own key (x-lorde-key). With Supabase accounts configured the
@@ -54,6 +53,8 @@ export { forward as GET, forward as POST };
 /** The caller's key, plus (with a relay secret) the end user's IP so the Gateway's per-IP limit applies per user. */
 function relayHeaders(req: NextRequest, key: string): Record<string, string> {
   const h: Record<string, string> = { authorization: `Bearer ${key}`, "content-type": "application/json" };
+  const idem = req.headers.get("idempotency-key");
+  if (idem && IDEMPOTENCY_KEY.test(idem)) h["idempotency-key"] = idem;  // job creation: a retried request returns the same job
   if (env.relaySecret) {
     const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0]!.trim() || req.headers.get("x-real-ip") || "";
     if (ip) {

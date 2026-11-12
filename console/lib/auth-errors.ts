@@ -7,19 +7,35 @@ export const SIGNIN_ERRORS = {
   oauth_failed: "Signing in with GitHub did not complete. Try again.",
   access_denied: "Sign-in was cancelled.",
   session_failed: "We could not start your session. Try again.",
+  // A PKCE link opened in another browser or device: Supabase has confirmed the address, but cannot sign in here.
+  email_confirmed: "Your email is confirmed: sign in to continue.",
+  other_browser: "This link was opened in a different browser. Request a new link here, or open it in the browser you used to request it.",
 } as const;
+/** Codes that are good news or a next step, shown as a notice rather than an error. */
+const NOTICES: ReadonlySet<SigninErrorCode> = new Set(["email_confirmed"]);
 export type SigninErrorCode = keyof typeof SIGNIN_ERRORS;
 export const GENERIC_SIGNIN_ERROR = "Sign-in failed. Try again.";
 
 /** The message for an `?error=` code on /signin; unknown codes get the generic message. */
 export function signinErrorMessage(code: unknown): string | undefined {
-  if (typeof code !== "string" || !code) return undefined;
-  return Object.hasOwn(SIGNIN_ERRORS, code) ? SIGNIN_ERRORS[code as SigninErrorCode] : GENERIC_SIGNIN_ERROR;
+  return signinMessage(code)?.text;
 }
 
-/** Map a Supabase redirect error (error / error_code query params) to one of our codes. */
-export function codeForAuthRedirect(error: string | null, errorCode: string | null): SigninErrorCode {
+/** The message for an `?error=` code, and whether it is an error or a notice (e.g. "your email is confirmed"). */
+export function signinMessage(code: unknown): { text: string; tone: "error" | "notice" } | undefined {
+  if (typeof code !== "string" || !code) return undefined;
+  if (!Object.hasOwn(SIGNIN_ERRORS, code)) return { text: GENERIC_SIGNIN_ERROR, tone: "error" };
+  const c = code as SigninErrorCode;
+  return { text: SIGNIN_ERRORS[c], tone: NOTICES.has(c) ? "notice" : "error" };
+}
+
+/**
+ * Map a Supabase redirect error (error / error_code query params) to one of our codes. `flow` is the email the link
+ * came from, when known (see lib/auth-flow.ts).
+ */
+export function codeForAuthRedirect(error: string | null, errorCode: string | null, flow: "signup" | "magiclink" | "recovery" | null = null): SigninErrorCode {
   if (errorCode === "otp_expired" || errorCode === "flow_state_expired") return "link_expired";
+  if (errorCode === "pkce_code_verifier_not_found") return flow === "signup" ? "email_confirmed" : "other_browser";
   if (errorCode && /oauth|provider/i.test(errorCode)) return "oauth_failed";
   if (error === "access_denied" && !errorCode) return "access_denied";
   return "link_invalid";
@@ -32,6 +48,7 @@ export function friendlyAuthError(err: unknown): FriendlyAuthError {
   const code = typeof err === "object" && err && "code" in err ? String((err as { code?: unknown }).code ?? "") : "";
   const m = err instanceof Error ? err.message : typeof err === "string" ? err : "";
   if (code === "invalid_credentials" || /invalid login credentials/i.test(m)) return { text: "Wrong email or password." };
+  if (code === "captcha_failed" || /captcha/i.test(m)) return { text: "The security check failed or expired. Complete it again and retry." };
   if (code === "email_not_confirmed" || /email not confirmed/i.test(m)) {
     return { text: "Confirm your email first: open the link we sent you, or send a new one.", unconfirmed: true };
   }

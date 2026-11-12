@@ -29,3 +29,44 @@ test("code tabs switch", async ({ page }) => {
   await page.getByRole("tab", { name: "CuratorKIT" }).first().click();
   await expect(page.getByRole("tabpanel").first()).toContainText("judge_llm=judge_llm()");
 });
+
+test("the menu closes after a same-page hash link", async ({ page }) => {
+  await page.goto("/docs");
+  const menu = page.getByRole("dialog", { name: "Menu" });
+  await expect(async () => {
+    await page.getByRole("button", { name: "Open menu" }).click();
+    await expect(menu).toBeVisible({ timeout: 1000 });
+  }).toPass({ timeout: 15_000 });
+  const link = menu.getByRole("link", { name: /API reference/ });
+  if (!(await link.isVisible())) await menu.getByRole("button", { name: "Developers" }).click();  // phone: groups collapse
+  await link.click();
+  await expect(page).toHaveURL(/\/docs#api$/);
+  await expect(menu).toBeHidden();
+  await expect(page.locator("#api")).toBeInViewport();
+});
+
+test("keyboard users can skip straight to the content, on the site and in the Console", async ({ page }) => {
+  for (const path of ["/docs", "/console/jobs"]) {
+    await page.goto(path, { waitUntil: "load" });
+    await page.keyboard.press("Tab");
+    const skip = page.getByRole("link", { name: "Skip to main content" });
+    await expect(skip).toBeFocused();
+    await expect(skip).toBeInViewport();
+    await page.keyboard.press("Enter");
+    await expect(page.locator("main#main")).toBeFocused();
+  }
+});
+
+test("menu groups say what they expand", async ({ page }) => {
+  await page.goto("/");
+  const open = page.getByRole("button", { name: "Open menu" });
+  await expect(open).not.toHaveAttribute("aria-controls");  // nothing to control while closed
+  await expect(async () => {
+    await open.click();
+    await expect(page.getByRole("dialog", { name: "Menu" })).toBeVisible({ timeout: 1000 });
+  }).toPass({ timeout: 15_000 });
+  const group = page.getByRole("button", { name: "Developers" });
+  const id = await group.getAttribute("aria-controls");
+  expect(id).toBe("menu-group-developers");
+  await expect(page.locator(`#${id}`)).toBeAttached();
+});

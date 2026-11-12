@@ -1,15 +1,21 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ConnectKey } from "@/components/console/connect-key";
 import { Button, Card } from "@/components/ui";
+import { DATASET_STATE_LABEL, datasetState, readPending } from "@/lib/datasets";
 import { pct } from "@/lib/format";
 import { errorMessage, gatewayFetch, getKey } from "@/lib/gateway-client";
 import type { Dataset, Judgment } from "@/lib/types";
 
 type Basis = { rows: number; sameDataset: boolean; name: string; jobId: string } | null;
+
+function newIdempotencyKey(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 function Gate({ id, label, desc, on, setOn, thr, setThr, rate }:
   { id: string; label: string; desc: string; on: boolean; setOn: (b: boolean) => void; thr: number; setThr: (n: number) => void; rate: number | null }) {
@@ -24,10 +30,10 @@ function Gate({ id, label, desc, on, setOn, thr, setThr, rate }:
       </div>
       <div className="mt-5">
         <div className="flex items-center justify-between text-sm">
-          <label htmlFor={`${id}-thr`} className="text-muted">Threshold</label>
+          <label htmlFor={`${id}-thr`} className="text-muted">Threshold<span className="sr-only"> for the {label.toLowerCase()}</span></label>
           <span className="tnum font-mono">{thr.toFixed(2)}</span>
         </div>
-        <input id={`${id}-thr`} type="range" min={0.3} max={0.95} step={0.05} value={thr} disabled={!on}
+        <input id={`${id}-thr`} type="range" min={0.3} max={0.95} step={0.05} value={thr} disabled={!on} aria-valuetext={thr.toFixed(2)}
           onChange={(e) => setThr(Number(e.target.value))} className="mt-2 w-full accent-[var(--color-accent)]" />
         <p className="tnum mt-2 text-[13px] text-muted">Preview pass rate <span className="font-medium text-ink">{pct(rate)}</span></p>
       </div>
@@ -35,11 +41,22 @@ function Gate({ id, label, desc, on, setOn, thr, setThr, rate }:
   );
 }
 
-export function NewJobForm({ datasets, sample, demo, selected, basis }:
-  { datasets: Dataset[]; sample: Pick<Judgment, "gate" | "score">[]; demo: boolean; selected?: string; basis: Basis }) {
+export function NewJobForm({ datasets, sample, demo, selected, basis, clock }:
+  { datasets: Dataset[]; sample: Pick<Judgment, "gate" | "score">[]; demo: boolean; selected?: string; basis: Basis; clock?: number }) {
   const router = useRouter();
   const [ds, setDs] = useState(selected ?? "");
   const pick = (id: string) => { setDs(id); router.replace(`/console/jobs/new?dataset=${encodeURIComponent(id)}`, { scroll: false }); };
+  // Expired datasets and this browser's unfinished uploads cannot start a job (lib/datasets.ts).
+  const [pending, setPending] = useState<Record<string, number>>({});
+  const [now, setNow] = useState(() => clock ?? Date.now());
+  useEffect(() => { setPending(readPending(window.localStorage)); setNow(clock ?? Date.now()); }, [clock]);
+  const states = useMemo(() => new Map(datasets.map((d) => [d.id, datasetState(d, now, pending[d.id])])), [datasets, now, pending]);
+  const usable = (id: string) => states.get(id) === "ready";
+  useEffect(() => {
+    if (ds && !usable(ds)) setDs(datasets.find((d) => usable(d.id))?.id ?? "");
+  }, [states]); // eslint-disable-line react-hooks/exhaustive-deps
+  /** One Idempotency-Key per job request, reused when the same request is retried (a lost answer cannot start two jobs). */
+  const idem = useRef<{ body: string; key: string } | null>(null);
   const [g, setG] = useState(true), [gt, setGt] = useState(0.7);
   const [r, setR] = useState(true), [rt, setRt] = useState(0.7);
   const [pii, setPii] = useState(false), [dedup, setDedup] = useState("exact");
@@ -58,12 +75,15 @@ export function NewJobForm({ datasets, sample, demo, selected, basis }:
     if (busy) return;
     if (!g && !r) return setMsg("Enable at least one gate.");
     if (!ds) return setMsg("Upload a dataset first.");
+    if (!usable(ds)) return setMsg("This dataset cannot start a job: it has expired or its upload did not finish.");
     const body = { upload_id: ds, gates: { grounding: g ? gt : null, reward: r ? rt : null }, options: { pii, dedup } };
     if (demo) return setMsg(`Demo: would POST /v1/jobs ${JSON.stringify(body)}`);
     if (!getKey()) return setMsg("Connect an API key with the jobs:write scope first.");
+    const json = JSON.stringify(body);
+    if (idem.current?.body !== json) idem.current = { body: json, key: newIdempotencyKey() };
     setBusy(true); setMsg("");
     try {
-      const res = await gatewayFetch("/v1/jobs", { method: "POST", body: JSON.stringify(body) });
+      const res = await gatewayFetch("/v1/jobs", { method: "POST", body: json, headers: { "idempotency-key": idem.current.key } });
       if (!res.ok) return setMsg(`Could not start the job: ${await errorMessage(res)}`);
       const j = await res.json() as { id: string };
       router.push(`/console/jobs/${j.id}`);
@@ -82,7 +102,10 @@ export function NewJobForm({ datasets, sample, demo, selected, basis }:
           <label htmlFor="ds" className="font-medium">Dataset</label>
           {datasets.length ? (
             <select id="ds" value={ds} onChange={(e) => pick(e.target.value)} className="mt-3 h-11 w-full rounded-xl border border-line bg-white px-3 text-[14px]">
-              {datasets.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+              {datasets.map((d) => {
+                const st = states.get(d.id) ?? "ready";
+                return <option key={d.id} value={d.id} disabled={st !== "ready"}>{st === "ready" ? d.name : `${d.name} (${DATASET_STATE_LABEL[st].toLowerCase()})`}</option>;
+              })}
             </select>
           ) : (
             <p className="mt-3 text-sm text-muted">No datasets yet. <a href="/console/datasets" className="text-accent hover:underline">Upload one</a> first.</p>
@@ -115,7 +138,7 @@ export function NewJobForm({ datasets, sample, demo, selected, basis }:
               ? <>Estimated on {basis.rows} judgments from {basis.sameDataset ? "the most recent job on this dataset" : <>your most recent job (on {basis.name}), not on this dataset</>}. The real pass rate depends on your data.</>
               : "No finished job yet to estimate from: the preview appears after your first job."}
           </p>
-          <Button className="mt-6 w-full" size="lg" onClick={submit} disabled={busy || !ds}>{busy ? "Starting…" : "Start job"}</Button>
+          <Button className="mt-6 w-full" size="lg" onClick={submit} disabled={busy || !ds || !usable(ds)}>{busy ? "Starting…" : "Start job"}</Button>
           {msg && <p role="status" className="mt-3 break-words text-[12px] text-muted">{msg}</p>}
         </Card>
       </aside>

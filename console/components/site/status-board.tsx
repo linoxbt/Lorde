@@ -7,8 +7,8 @@ import { Badge, Button, Card } from "@/components/ui";
 import type { Check, ServedModel } from "@/lib/status";
 
 type Data = { summary: { state: string; label: string }; checks: Check[]; model?: ServedModel | null };
-const TONE = { ok: "pass", degraded: "warn", down: "reject", demo: "accent" } as const;
-const WORD = { ok: "Responding", degraded: "Degraded", down: "Down", demo: "Demo mode" };
+const TONE = { ok: "pass", degraded: "warn", down: "reject", unknown: "neutral", demo: "accent" } as const;
+const WORD = { ok: "Responding", degraded: "Degraded", down: "Down", unknown: "Unknown", demo: "Demo mode" };
 
 export function StatusBoard() {
   const [d, setD] = useState<Data | null>(null);
@@ -17,7 +17,7 @@ export function StatusBoard() {
     fetch("/api/status", { cache: "no-store" }).then((r) => r.json()).then((x: Data) => {
       setD(x);
       setAt(new Date().toLocaleTimeString());
-    }).catch(() => setD({ summary: { state: "down", label: "Status unavailable" }, checks: [] }));
+    }).catch(() => setD({ summary: { state: "unknown", label: "Status unknown: could not reach this site's status check" }, checks: [] }));
   }, []);
   useEffect(() => {
     load();

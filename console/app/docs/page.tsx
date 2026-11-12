@@ -45,7 +45,7 @@ export default function Docs() {
   return (
     <>
       <SiteHeader />
-      <main>
+      <main id="main" tabIndex={-1} className="outline-none">
         <PageHero eyebrow="Docs" title="Judge your first item in five minutes."
           lead="Lorde speaks OpenAI-compatible chat, a native judge API, Python, and MCP. Pick the surface you already use.">
           <LinkButton href="/console/keys" arrow>Get an API key</LinkButton>
@@ -99,7 +99,8 @@ export default function Docs() {
                 <p>For whole datasets, upload a JSONL, CSV or Parquet file (up to 200 MB) and create a job. A worker runs CuratorKIT
                   exactly as you would, with Lorde as the judge, and returns <code>passed.jsonl</code>, <code>rejected.jsonl</code>
                   with reasons, <code>report.md</code>, the CuratorKIT manifest and <code>lexsi_provenance.json</code>. Each
-                  organization can have three jobs queued or running at once.</p>
+                  organization can have a few jobs queued or running at once (three by default; the Gateway answers 429
+                  with Retry-After beyond its limit).</p>
               </Prose>
               <div className="grid gap-3 sm:grid-cols-3">
                 {[["1. Upload", "POST /v1/uploads returns a signed URL; PUT the file to it."],

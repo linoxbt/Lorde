@@ -4,30 +4,37 @@ import { AutoRefresh } from "@/components/console/auto-refresh";
 import { Empty, JobStatusBadge, PageHeader, Table } from "@/components/console/bits";
 import { LinkButton } from "@/components/ui";
 import { getWorkspace, JOBS_PER_PAGE, listJobs } from "@/lib/data";
+import { jobDatasetLabel } from "@/lib/datasets";
 import { ago, nf, pct } from "@/lib/format";
+import { isPastEnd, pageCount, parsePage } from "@/lib/paging";
 
 export const metadata = { title: "Jobs" };
 
 export default async function Jobs(props: PageProps<"/console/jobs">) {
   const sp = await props.searchParams;
-  const page = Math.max(1, Number.parseInt(typeof sp.page === "string" ? sp.page : "1", 10) || 1) - 1;
+  const page = parsePage(sp.page);
   const [ws, jobs] = await Promise.all([getWorkspace(), listJobs(page)]);
-  const pages = Math.max(1, Math.ceil(jobs.total / JOBS_PER_PAGE));
+  const pages = pageCount(jobs.total, JOBS_PER_PAGE);
   const active = jobs.rows.some((j) => j.status === "queued" || j.status === "running");
   return (
     <>
       <AutoRefresh active={active && ws.mode === "live"} every={10_000} />
-      <PageHeader title="Jobs" lead="Gating jobs run CuratorKIT with Lorde as the judge. Three can be queued or running at once."
+      <PageHeader title="Jobs" lead="Gating jobs run CuratorKIT with Lorde as the judge. A few can be queued or running at once (the Gateway's limit); beyond it, a new job is refused until one finishes."
         actions={<LinkButton href="/console/jobs/new" size="sm">New job</LinkButton>} />
       {jobs.total === 0 ? (
         <Empty title="No jobs yet">Upload a dataset, then start a job to get passed rows, rejected rows with reasons, and provenance.</Empty>
+      ) : isPastEnd(page, jobs.total, JOBS_PER_PAGE) ? (
+        <Empty title={`Page ${page + 1} is past the end`}>
+          There {pages === 1 ? "is 1 page" : `are ${pages} pages`} of jobs ({nf.format(jobs.total)} in all).{" "}
+          <Link href={pages > 1 ? `?page=${pages}` : "/console/jobs"} className="text-accent hover:underline">Go to the last page</Link>
+        </Empty>
       ) : (
         <>
           <Table head={["Job", "Dataset", "Gates", "Status", "Rows", "Passed", "Pass rate", "Created"]} minWidth={860}>
             {jobs.rows.map((j) => (
               <tr key={j.id} className="hover:bg-wash/60">
                 <td className="px-4 py-3 font-mono text-[13px]"><Link href={`/console/jobs/${j.id}`} className="text-accent hover:underline">{j.id.slice(0, 8)}</Link></td>
-                <td className="max-w-[220px] truncate px-4 py-3">{j.dataset_name ?? "Hub dataset"}</td>
+                <td className="max-w-[220px] truncate px-4 py-3">{jobDatasetLabel(j)}</td>
                 <td className="px-4 py-3 font-mono text-[12px] text-muted">
                   {j.config.gates.grounding !== null && <span className="mr-2">G≥{j.config.gates.grounding}</span>}
                   {j.config.gates.reward !== null && <span>R≥{j.config.gates.reward}</span>}

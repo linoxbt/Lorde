@@ -15,7 +15,11 @@ export type JobCounts = {
 };
 export type Job = {
   id: string; status: JobStatus; dataset_id: string | null; dataset_name?: string;
-  config: { gates: { grounding: number | null; reward: number | null }; options: { pii: boolean; dedup: string } };
+  config: {
+    gates: { grounding: number | null; reward: number | null }; options: { pii: boolean; dedup: string };
+    /** What the Gateway recorded: an upload's storage path, or a Hub dataset URL (hf://datasets/...). */
+    source?: { storage_path?: string; format?: string; dataset_url?: string | null };
+  };
   model_revision: string | null; counts: JobCounts; error: string | null; cancel_requested?: boolean;
   created_at: string; started_at: string | null; finished_at: string | null;
 };

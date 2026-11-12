@@ -1,11 +1,14 @@
 import "server-only";
 
+import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { cache } from "react";
 
 import { demoDatasets, demoJobs, demoJudgments, demoKeys, demoMembers, demoReview, demoUsage, demoWorkspace } from "./demo";
 import { supabaseEnabled } from "./env";
 import { type Client, DataError, primaryMembership, UUID } from "./membership";
+import { isRangePastEnd } from "./paging";
+import { safeNext } from "./safe-next";
 import type {
   ActiveModel, ApiKeyRow, Dataset, Gate, GateRates, HistCell, Job, Judgment, JudgmentFilters, Member, Page, ReviewItem,
   ReviewLabel, Role, UsageDay, Workspace,
@@ -22,12 +25,15 @@ const JOB_COLS = "id, status, dataset_id, config, model_revision, counts, error,
 
 type Live = { sb: Client; userId: string; email: string; orgId: string; role: Role };
 
-/** The signed-in user and their organization, once per request. No session → /signin; no organization → /welcome. */
+/**
+ * The signed-in user and their organization, once per request. No session → /signin, coming back to this page
+ * afterwards (proxy.ts passes the path in x-lorde-path); no organization → /welcome.
+ */
 const live = cache(async (): Promise<Live> => {
   const { supabaseServer } = await import("./supabase/server");
   const sb = await supabaseServer();
   const { data: auth } = await sb.auth.getUser();
-  if (!auth.user) redirect("/signin?next=/console");
+  if (!auth.user) redirect(`/signin?next=${encodeURIComponent(safeNext((await headers()).get("x-lorde-path")))}`);
   const m = await primaryMembership(sb, auth.user.id);
   if (!m) redirect("/welcome");
   return { sb, userId: auth.user.id, email: auth.user.email ?? "", orgId: m.org_id, role: m.role };
@@ -39,6 +45,21 @@ function must<T>(res: { data: T | null; error: { message?: string; code?: string
 }
 
 const n = (v: unknown) => Number(v ?? 0) || 0;
+
+type Ranged = { data: unknown[] | null; error: { message?: string; code?: string } | null; count: number | null; status: number };
+
+/**
+ * One page of a list. A page past the end is an empty page, not an error: PostgREST answers 416 / PGRST103 and
+ * sends no usable count, so the total comes from a second, head-only count of the same filtered query.
+ */
+async function rangedPage<T>(res: Ranged, recount: () => PromiseLike<{ count: number | null; error: Ranged["error"] }>, what: string) {
+  if (res.error && isRangePastEnd({ ...res.error, status: res.status })) {
+    const c = await recount();
+    if (c.error) throw new DataError(what, c.error);
+    return { rows: [] as T[], total: c.count ?? 0 };
+  }
+  return { rows: must(res, what) as T[], total: res.count ?? 0 };
+}
 
 export const getWorkspace = cache(async (): Promise<Workspace> => {
   if (!supabaseEnabled()) return demoWorkspace();
@@ -65,10 +86,13 @@ export async function listJobs(page = 0, opts: { status?: Job["status"]; size?: 
     return { rows: all.slice(page * size, page * size + size), total: all.length };
   }
   const l = await live();
-  let q = l.sb.from("jobs").select(JOB_COLS, { count: "exact" }).eq("org_id", l.orgId);
-  if (opts.status) q = q.eq("status", opts.status);
-  const res = await q.order("created_at", { ascending: false }).order("id").range(page * size, page * size + size - 1);
-  return { rows: must(res, "jobs").map((j) => toJob(j as unknown as JobRow)), total: res.count ?? 0 };
+  const q = (cols: string, head = false) => {
+    const b = l.sb.from("jobs").select(cols, { count: "exact", head }).eq("org_id", l.orgId);
+    return opts.status ? b.eq("status", opts.status) : b;
+  };
+  const res = await q(JOB_COLS).order("created_at", { ascending: false }).order("id").range(page * size, page * size + size - 1);
+  const p = await rangedPage<JobRow>(res, () => q("id", true), "jobs");
+  return { rows: p.rows.map(toJob), total: p.total };
 }
 
 export async function getJob(id: string): Promise<Job | null> {
@@ -158,14 +182,17 @@ export async function judgmentsPage(jobId: string, f: JudgmentFilters): Promise<
     return { rows: all.slice(from, from + ROWS_PER_PAGE), total: all.length };
   }
   const l = await live();
-  let q = l.sb.from("judgments").select("row_idx, gate, lang, score, decision, verdict", { count: "exact" }).eq("job_id", jobId);
-  if (f.gate) q = q.eq("gate", f.gate);
-  if (f.decision === "none") q = q.is("decision", null);
-  else if (f.decision) q = q.eq("decision", f.decision === "pass");
-  if (f.lang === "?") q = q.is("lang", null);
-  else if (f.lang) q = q.eq("lang", f.lang);
-  const res = await q.order("row_idx").order("gate").range(from, from + ROWS_PER_PAGE - 1);
-  return { rows: must(res, "judgments") as Judgment[], total: res.count ?? 0 };
+  const q = (cols: string, head = false) => {
+    let b = l.sb.from("judgments").select(cols, { count: "exact", head }).eq("job_id", jobId);
+    if (f.gate) b = b.eq("gate", f.gate);
+    if (f.decision === "none") b = b.is("decision", null);
+    else if (f.decision) b = b.eq("decision", f.decision === "pass");
+    if (f.lang === "?") b = b.is("lang", null);
+    else if (f.lang) b = b.eq("lang", f.lang);
+    return b;
+  };
+  const res = await q("row_idx, gate, lang, score, decision, verdict").order("row_idx").order("gate").range(from, from + ROWS_PER_PAGE - 1);
+  return rangedPage<Judgment>(res, () => q("row_idx", true), "judgments");
 }
 
 /**

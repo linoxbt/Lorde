@@ -10,6 +10,8 @@ function rng(seed: number) {
   };
 }
 const NOW = Date.parse("2026-11-10T09:00:00Z");
+/** The demo workspace's own "now": its datasets never expire, whatever the real date. */
+export const DEMO_NOW = NOW;
 const ago = (h: number) => new Date(NOW - h * 3600_000).toISOString();
 export const LANGS = ["en", "hi", "fr", "ar", "es", "pt", "id", "tr"] as const;
 

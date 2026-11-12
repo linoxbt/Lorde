@@ -7,7 +7,9 @@ import { JobActions } from "@/components/console/job-actions";
 import { RowTable } from "@/components/console/row-table";
 import { Card } from "@/components/ui";
 import { getJob, getWorkspace, jobStats, judgmentsPage, ROWS_PER_PAGE } from "@/lib/data";
+import { jobDatasetLabel } from "@/lib/datasets";
 import { nf, pct, when } from "@/lib/format";
+import { parsePage } from "@/lib/paging";
 import type { JudgmentFilters } from "@/lib/types";
 
 export const metadata = { title: "Job" };
@@ -16,7 +18,7 @@ const one = (v: string | string[] | undefined) => (typeof v === "string" ? v : u
 
 function filtersFrom(sp: Record<string, string | string[] | undefined>): JudgmentFilters {
   const gate = one(sp.gate), decision = one(sp.decision), lang = one(sp.lang);
-  const page = Math.max(1, Math.min(100_000, Number.parseInt(one(sp.page) ?? "1", 10) || 1)) - 1;
+  const page = parsePage(one(sp.page));
   return {
     gate: gate === "reward" || gate === "grounding" ? gate : undefined,
     decision: decision === "pass" || decision === "reject" || decision === "none" ? decision : undefined,
@@ -41,7 +43,7 @@ export default async function JobDetail(props: PageProps<"/console/jobs/[id]">) 
     <>
       <AutoRefresh active={active && ws.mode === "live"} />
       <PageHeader title={`Job ${id.slice(0, 8)}`}
-        lead={<span className="flex flex-wrap items-center gap-2"><JobStatusBadge status={job.status} />{job.dataset_name ?? "Hub dataset"}{job.model_revision ? ` · ${job.model_revision}` : ""}</span>}
+        lead={<span className="flex flex-wrap items-center gap-2"><JobStatusBadge status={job.status} />{jobDatasetLabel(job)}{job.model_revision ? ` · ${job.model_revision}` : ""}</span>}
         actions={<JobActions id={id} status={job.status} demo={ws.mode === "demo"} cancelRequested={job.cancel_requested} />} />
       {job.error && <Card className="mb-6 border-[#f6cfb3] bg-reject-wash p-4 font-mono text-[13px] text-[#9a4300]">{job.error}</Card>}
       <Card className="mb-6 p-5">

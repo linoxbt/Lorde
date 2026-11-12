@@ -106,6 +106,74 @@ access to `datasets/Oxlino/lorde-work` only), optional `LABEL_USERS=name:pw,...`
 
 Vercel adds `NEXT_PUBLIC_SITE_URL=https://lorde-console.vercel.app`.
 
-Still to do by the account owner: Supabase email templates → `/auth/confirm?token_hash=...` links (see
-`console/README.md`) for cross-device email links; custom SMTP; CAPTCHA (Turnstile) on sign-up; leaked-password
-protection needs the Supabase Pro plan; the unused Railway `Postgres` service can be removed.
+Still to do by the account owner: apply the email templates below (cross-device email links); custom SMTP; CAPTCHA
+(Turnstile, below); leaked-password protection needs the Supabase Pro plan; the unused Railway `Postgres` service can
+be removed.
+
+## Supabase Auth: email templates
+
+The default templates link to `{{ .ConfirmationURL }}`, a PKCE link: it only works in the browser that asked for the
+email, so a link opened in a phone's mail app or on another device fails (`pkce_code_verifier_not_found`). The five
+templates in `supabase/templates/` link to `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=<type>&next={{ .RedirectTo }}`
+instead, which the Console verifies server-side (`verifyOtp`), so they work anywhere. Apply them once per project:
+
+1. Supabase Dashboard → project `lorde` → Authentication → URL Configuration: Site URL
+   `https://lorde-console.vercel.app` (it is `{{ .SiteURL }}` in the links), redirect allow-list
+   `https://lorde-console.vercel.app/**`.
+2. Authentication → Emails → Templates (older dashboards: Authentication → Email Templates). For each template,
+   set the subject and paste the whole file as the message body (Source view), then Save:
+
+   | Template | Subject | File | `type` |
+   |---|---|---|---|
+   | Confirm sign up | `Confirm your Lorde account` | `supabase/templates/confirm-signup.html` | `email` |
+   | Invite user | `You have been invited to Lorde` | `supabase/templates/invite.html` | `invite` |
+   | Magic link | `Your Lorde sign-in link` | `supabase/templates/magic-link.html` | `magiclink` |
+   | Change email address | `Confirm your new email for Lorde` | `supabase/templates/email-change.html` | `email_change` |
+   | Reset password | `Reset your Lorde password` | `supabase/templates/recovery.html` | `recovery` |
+
+   The subject is also in the comment at the top of each file. Leave "Reauthentication" as is (the Console does
+   not use it).
+3. Check: sign up on one browser, open the confirmation email on another device; it must land in the Console signed in.
+   Request a password reset and open it elsewhere; it must land on "Choose a new password".
+
+`/auth/confirm` accepts `type` = `signup`, `email`, `magiclink`, `recovery`, `email_change` and `invite` (unit test
+`tests/unit/auth.test.ts` renders each template and checks it). Recovery always lands on `/reset-password`, an invite on
+`/reset-password?invited=1` (choose a first password); the others follow `next`, limited to `/console/*`. Until the
+templates are applied, the old PKCE links still work in the browser that requested them; opened elsewhere, the sign-in
+page says "Your email is confirmed: sign in to continue" (sign-up) or that the link was opened in a different browser
+and to request a new one (sign-in link, password reset), instead of "We could not start your session".
+
+## Supabase Auth: CAPTCHA (Cloudflare Turnstile)
+
+Optional bot protection on sign-up, password sign-in, email-link sign-in, "resend confirmation" and password-reset
+requests (audit S1/S12: open sign-up is otherwise free to script). The Console shows the Turnstile widget and passes
+its single-use token to supabase-js (`options.captchaToken`) only when `NEXT_PUBLIC_TURNSTILE_SITE_KEY` is set;
+without it nothing is loaded and nothing changes. Email links (`/auth/confirm`) and GitHub sign-in need no token.
+
+1. Cloudflare dashboard → Turnstile → Add widget: hostnames `lorde-console.vercel.app` (add `localhost` for local
+   testing), widget mode **Managed**. Copy the site key and the secret key.
+2. Vercel → `lorde-console` → Settings → Environment Variables: `NEXT_PUBLIC_TURNSTILE_SITE_KEY` = the site key
+   (Production and Preview), then redeploy: it is inlined at build time. Deploy this **before** step 3, or sign-ins
+   fail for lack of a token.
+3. Supabase Dashboard → project `lorde` → Authentication → Attack Protection (older dashboards: Authentication →
+   Settings → Bot and Abuse Protection) → Enable CAPTCHA protection → provider **Turnstile by Cloudflare** → paste
+   the secret key → Save.
+4. Check: sign in on the live site (the widget appears above the button); with the widget blocked, a sign-in attempt
+   must say "Complete the security check above the button first."
+
+To turn it off, disable CAPTCHA in Supabase first, then remove the variable and redeploy. The CSP
+(`console/lib/csp.ts`) adds `https://challenges.cloudflare.com` to `script-src`, `frame-src` and `connect-src` only
+while the site key is set. `pnpm test:e2e:live` builds with Cloudflare's test site key and a stand-in Turnstile script.
+
+## Console: relay timeouts and security headers
+
+- The `/api/gateway/*` relay gives judging, jobs and uploads 120 s and everything else 30 s, then answers JSON 504
+  (`console/lib/relay.ts`); its route sets `maxDuration = 130` so Vercel does not stop the function first (needs
+  Fluid compute, the default for new projects; the Hobby limit without it is 60 s). Keep the Gateway's
+  `LORDE_UPSTREAM_TIMEOUT` plus `LORDE_UPSTREAM_QUEUE_TIMEOUT_S` at or below 120 s for Console users; above it, the
+  Console reports a timeout for a judgment the Gateway may still finish and meter.
+- `/api/status` is cached for 10 s (in process, and `s-maxage=10` at the CDN), so the public status page costs the
+  Gateway at most one `/healthz` + `/readyz` pair per 10 s per instance.
+- Every page carries a per-response nonce-based Content-Security-Policy (`console/proxy.ts`, `console/lib/csp.ts`),
+  so pages render per request instead of being prerendered. The Supabase session cookies stay readable by JavaScript
+  (`@supabase/ssr` needs that); see `console/README.md`, "Security headers".

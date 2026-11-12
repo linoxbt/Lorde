@@ -4,6 +4,7 @@ import Link from "next/link";
 import { JobStatusBadge, PageHeader, Table } from "@/components/console/bits";
 import { Badge, Card, LinkButton } from "@/components/ui";
 import { getWorkspace, listJobs } from "@/lib/data";
+import { jobDatasetLabel } from "@/lib/datasets";
 import { pct, when } from "@/lib/format";
 
 export const metadata = { title: "Reports" };
@@ -60,7 +61,7 @@ export default async function Reports() {
         {done.map((j) => (
           <tr key={j.id} className="hover:bg-wash/60">
             <td className="px-4 py-3 font-mono text-[13px]">{j.id.slice(0, 8)}</td>
-            <td className="max-w-[240px] truncate px-4 py-3">{j.dataset_name ?? "–"}</td>
+            <td className="max-w-[240px] truncate px-4 py-3">{jobDatasetLabel(j)}</td>
             <td className="px-4 py-3"><JobStatusBadge status={j.status} /></td>
             <td className="px-4 py-3">{pct(j.counts.pass_rate)}</td>
             <td className="px-4 py-3">{j.counts.judge_errors ?? 0}</td>
