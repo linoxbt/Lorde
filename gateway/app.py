@@ -117,6 +117,8 @@ class Gateway:
         self.upstream = Upstream(s, transport)
         self.service = JudgeService(s, self.upstream, self.metrics)
         self._ready: tuple[float, dict[str, Any]] = (0.0, {})
+        self.active_fingerprints: dict[str, Any] | None = None  # stored with the active registry version (M5)
+        self.active_bench: dict[str, Any] | None = None
         self._model_task: asyncio.Task | None = None
 
     async def resolve_key(self, headers: Mapping[str, str]) -> ApiKey:
@@ -298,9 +300,23 @@ class Gateway:
         return n - back
 
     def model_info(self) -> dict[str, Any]:
-        return {"model": self.s.model_label, "repo": self.s.model_repo, "revision": self.s.model_revision,
-                "api_version": API_MAJOR, "gateway_version": __version__,
-                "bench": load_bench(_env_bench()), **contract.fingerprints()}
+        """The served model. Template fingerprints come from the active registry version, stored when it was
+        registered (audit 2, M5), not from the CuratorKIT installed now; ``templates_match`` says whether the
+        installed CuratorKIT still renders those templates (False: the prompts drifted from what the model was
+        trained on). Without a registry version (env fallback) the installed CuratorKIT's are reported."""
+        runtime = contract.fingerprints()
+        stored = self.active_fingerprints
+        info: dict[str, Any] = {"model": self.s.model_label, "repo": self.s.model_repo, "revision": self.s.model_revision,
+                                "api_version": API_MAJOR, "gateway_version": __version__,
+                                "bench": self.active_bench or load_bench(_env_bench())}
+        if stored:
+            want = {k: (v or {}).get("sha256") for k, v in (stored.get("templates") or {}).items()}
+            have = {k: v["sha256"] for k, v in runtime["templates"].items()}
+            info.update({**stored, "fingerprints_source": "model registry", "templates_match": want == have,
+                         "installed": runtime})
+        else:
+            info.update({**runtime, "fingerprints_source": "installed CuratorKIT (no registry version)"})
+        return info
 
     # ------------------------------------------------------------------ model registry (spec FR-12)
     async def load_active_model(self) -> bool:
@@ -309,14 +325,16 @@ class Gateway:
             return False
         try:
             async with self.pool.connection() as c:
-                r: Any = await (await c.execute("select hf_repo, revision from model_versions where state = 'active' "
-                                           "order by promoted_at desc nulls last limit 1")).fetchone()
+                r: Any = await (await c.execute(
+                    "select hf_repo, revision, bench, template_fingerprints from model_versions "
+                    "where state = 'active' order by promoted_at desc nulls last limit 1")).fetchone()
         except Exception:  # noqa: BLE001
             log.warning("could not read model_versions; keeping %s", self.s.model_label, exc_info=True)
             return False
         if not r:
             return False
         repo, rev = r["hf_repo"] or self.s.model_repo, r["revision"]
+        self.active_fingerprints, self.active_bench = r["template_fingerprints"], r["bench"]
         if (repo, rev) != (self.s.model_repo, self.s.model_revision):
             log.info("active model from registry: %s@%s", repo, rev)
             self.s.model_repo, self.s.model_revision = repo, rev

@@ -901,3 +901,77 @@ def test_image_installs_the_hashed_runtime_lock():
     dependabot = (root / ".github" / "dependabot.yml").read_text()
     for eco in ("pip", "npm", "github-actions", "docker"):
         assert f"package-ecosystem: {eco}" in dependabot
+
+
+# ------------------------------------------------------------------ M5: promotion gated on Lorde Bench
+
+FAILING_BENCH = {"promotable": False, "acceptance": [
+    {"criterion": "Cohen's κ ≥ 0.75", "value": 0.748, "met": False, "blocking": True},
+    {"criterion": "human agreement ≥ 85%", "value": "–", "met": None, "blocking": True, "reason": "0 labels"},
+    {"criterion": "p95 latency", "value": "2 s", "met": False, "blocking": False}]}
+PASSING_BENCH = {"promotable": True, "acceptance": [{"criterion": "κ", "value": 0.8, "met": True, "blocking": True}]}
+
+
+def test_bench_verdict():
+    from gateway.models_cli import bench_verdict
+
+    ok, failing = bench_verdict(FAILING_BENCH)
+    assert not ok and len(failing) == 2 and "0.748" in failing[0] and "0 labels" in failing[1]
+    assert bench_verdict(PASSING_BENCH) == (True, [])
+    assert not bench_verdict(None)[0] and not bench_verdict({"acceptance": {"promotable": False}})[0]
+    assert bench_verdict({"acceptance": {"promotable": True}})[0]  # the shape the audit names, too
+    assert not bench_verdict({"promotable": True, "acceptance": FAILING_BENCH["acceptance"]})[0]  # contradictory
+
+
+@pg
+def test_promote_refuses_unpromotable_models_and_stores_fingerprints(env, monkeypatch, capsys):
+    from gateway import models_cli
+    from gateway.models_cli import NotPromotable, installed_fingerprints, promote
+    from lorde_forge import contract
+
+    repo = "Oxlino/lorde-m5"
+    with pytest.raises(NotPromotable, match="no Lorde Bench result"):
+        promote(env["db"], repo, "r1")
+    with pytest.raises(NotPromotable, match="0.748"):
+        promote(env["db"], repo, "r1", bench=FAILING_BENCH)
+    monkeypatch.setattr(models_cli, "fetch_fingerprints", lambda repo, rev: None)
+    with pytest.raises(NotPromotable, match="template_fingerprints.json"):  # promotable, but no fingerprints
+        promote(env["db"], repo, "r1", bench=PASSING_BENCH)
+    with db(env) as c:
+        assert c.execute("select count(*) from model_versions where hf_repo=%s", (repo,)).fetchone()[0] == 0
+
+    # the fingerprints of the release (here: altered, as if CuratorKIT changed its prompts since training)
+    released = installed_fingerprints()
+    released["templates"]["reward"] = {**released["templates"]["reward"], "sha256": "0" * 64}
+    monkeypatch.setattr(models_cli, "fetch_fingerprints", lambda r, rev: released if rev == "r2" else None)
+    out = promote(env["db"], repo, "r2", bench=PASSING_BENCH)
+    assert out["promotable"] and out["active"] == f"{repo}@r2"
+    with db(env) as c:
+        stored = c.execute("select template_fingerprints from model_versions where hf_repo=%s and revision='r2'",
+                           (repo,)).fetchone()[0]
+    assert stored["templates"]["reward"]["sha256"] == "0" * 64
+    with TestClient(create_app(Settings(**{**env["s"].__dict__}))) as c:
+        info = c.get("/v1/models/lorde", headers=env["keys"]["all"]).json()
+    assert info["revision"] == "r2" and info["fingerprints_source"] == "model registry"
+    assert info["templates"]["reward"]["sha256"] == "0" * 64  # what the model was released with ...
+    assert info["templates_match"] is False  # ... which today's CuratorKIT no longer renders
+    assert info["installed"]["templates"]["reward"]["sha256"] == contract.fingerprint("reward")
+    assert info["bench"]["promotable"] is True
+
+    # --force with a reason promotes a failing model and audits why
+    monkeypatch.setenv("DATABASE_URL", env["db"])
+    bench = env["tmp"] / "failing.json"
+    bench.write_text(json.dumps(FAILING_BENCH))
+    assert models_cli.main(["promote", repo, "r3", "--bench", str(bench)]) == 1
+    assert "not promotable" in capsys.readouterr().err
+    assert models_cli.main(["promote", repo, "r3", "--bench", str(bench), "--force", "x"]) == 2  # reason too short
+    assert models_cli.main(["promote", repo, "r3", "--bench", str(bench), "--force",
+                            "demo needs a model tonight; human labels pending"]) == 0
+    assert "WARNING: forced" in capsys.readouterr().err
+    with db(env) as c:
+        detail = c.execute("select detail from audit_log where action='model.promote' and target=%s order by id desc "
+                           "limit 1", (f"{repo}@r3",)).fetchone()[0]
+        fps = c.execute("select template_fingerprints from model_versions where revision='r3'").fetchone()[0]
+        c.execute("update model_versions set state='retired'")
+    assert detail["promotable"] is False and detail["forced"].startswith("demo needs") and len(detail["failing"]) == 2
+    assert fps["source"].startswith("installed CuratorKIT")  # forced without fingerprints: marked as such

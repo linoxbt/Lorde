@@ -234,11 +234,14 @@ def test_idempotency_key_and_mcp_not_found(env):
 
 
 def test_model_registry_promotion(env):
-    from gateway.models_cli import promote
+    from gateway.models_cli import installed_fingerprints, promote
 
     h = env["keys"]["all"]
-    promote(env["db"], "Oxlino/lorde-tiny-aya", "v1.0.0-rc1")
-    out = promote(env["db"], "Oxlino/lorde-tiny-aya", "v1.0.1", name="Lorde 1.0.1")
+    # audit 2 (M5): promotion needs a promotable Lorde Bench result and the model's stored template fingerprints
+    ok = {"promotable": True, "acceptance": [{"criterion": "κ", "value": 0.8, "met": True, "blocking": True}]}
+    fps = installed_fingerprints()
+    promote(env["db"], "Oxlino/lorde-tiny-aya", "v1.0.0-rc1", bench=ok, fingerprints=fps)
+    out = promote(env["db"], "Oxlino/lorde-tiny-aya", "v1.0.1", name="Lorde 1.0.1", bench=ok, fingerprints=fps)
     assert out["retired"] == ["Oxlino/lorde-tiny-aya@v1.0.0-rc1"]
     with db(env) as c:
         states = dict(c.execute("select revision, state from model_versions").fetchall())

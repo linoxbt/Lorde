@@ -97,7 +97,7 @@ about 4,300 judgments a day in total): `LORDE_METRICS_TOKEN`, `LORDE_UPSTREAM_QU
 `LORDE_UPSTREAM_MAX_WAITERS=4`, `LORDE_ORG_DAILY_JUDGMENTS=500`, `LORDE_IP_RPM=300`, `LORDE_WORKER_JUDGE_CONCURRENCY=1`,
 and `LORDE_RELAY_SECRET` (same value on Vercel, so the Console relay passes each user's IP). Migration
 `0007_fairness.sql` adds round-robin job claiming across organizations.
-Promote a model with `python -m gateway.models_cli promote <repo> <revision>`.
+Promote a model with `python -m gateway.models_cli promote <repo> <revision> --bench results/judge_eval.json` (refused unless the report says `promotable: true`; `--force "<reason>"` overrides and is audited; the template fingerprints are taken from the model repo's `template_fingerprints.json` at that revision, or `--fingerprints FILE`).
 
 Label service (`lorde-label`, `infra/Dockerfile.label`): `LABEL_HUB_REPO=Oxlino/lorde-work`, `LABEL_PASSWORD`,
 `LABEL_USER=lorde` (login name, recorded as the labeller), `HF_TOKEN` (should be a fine-grained token with write
