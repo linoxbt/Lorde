@@ -4,6 +4,7 @@ import { JobStatusBadge, Kpi, PageHeader, Table } from "@/components/console/bit
 import { UsageChart } from "@/components/console/charts";
 import { Card, LinkButton } from "@/components/ui";
 import { gatePassRates, getWorkspace, listJobs, usageDaily } from "@/lib/data";
+import { jobDatasetLabel } from "@/lib/datasets";
 import { ago, nf, pct, when } from "@/lib/format";
 import { weekTotals } from "@/lib/usage";
 
@@ -74,7 +75,7 @@ export default async function Overview() {
             {recent.rows.map((j) => (
               <tr key={j.id} className="hover:bg-wash/60">
                 <td className="px-4 py-3 font-mono text-[13px]"><Link href={`/console/jobs/${j.id}`} className="text-accent hover:underline">{j.id.slice(0, 8)}</Link></td>
-                <td className="max-w-[240px] truncate px-4 py-3">{j.dataset_name ?? "–"}</td>
+                <td className="max-w-[240px] truncate px-4 py-3">{jobDatasetLabel(j)}</td>
                 <td className="px-4 py-3"><JobStatusBadge status={j.status} /></td>
                 <td className="px-4 py-3">{j.counts.passed !== undefined ? nf.format(j.counts.passed) : "–"}</td>
                 <td className="px-4 py-3">{pct(j.counts.pass_rate)}</td>

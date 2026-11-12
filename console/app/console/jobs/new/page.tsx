@@ -1,6 +1,7 @@
 import { PageHeader } from "@/components/console/bits";
 import { NewJobForm } from "@/components/console/new-job-form";
 import { getWorkspace, listDatasets, previewSample } from "@/lib/data";
+import { jobDatasetLabel } from "@/lib/datasets";
 
 export const metadata = { title: "New job" };
 
@@ -12,7 +13,7 @@ export default async function NewJob(props: PageProps<"/console/jobs/new">) {
   const preview = await previewSample(selected);
   const basis = !preview.from ? null : {
     rows: preview.sample.length, sameDataset: preview.sameDataset,
-    name: preview.from.dataset_name ?? "a Hub dataset", jobId: preview.from.id,
+    name: jobDatasetLabel(preview.from), jobId: preview.from.id,
   };
   return (
     <>

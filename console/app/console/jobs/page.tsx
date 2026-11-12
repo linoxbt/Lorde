@@ -4,6 +4,7 @@ import { AutoRefresh } from "@/components/console/auto-refresh";
 import { Empty, JobStatusBadge, PageHeader, Table } from "@/components/console/bits";
 import { LinkButton } from "@/components/ui";
 import { getWorkspace, JOBS_PER_PAGE, listJobs } from "@/lib/data";
+import { jobDatasetLabel } from "@/lib/datasets";
 import { ago, nf, pct } from "@/lib/format";
 import { isPastEnd, pageCount, parsePage } from "@/lib/paging";
 
@@ -33,7 +34,7 @@ export default async function Jobs(props: PageProps<"/console/jobs">) {
             {jobs.rows.map((j) => (
               <tr key={j.id} className="hover:bg-wash/60">
                 <td className="px-4 py-3 font-mono text-[13px]"><Link href={`/console/jobs/${j.id}`} className="text-accent hover:underline">{j.id.slice(0, 8)}</Link></td>
-                <td className="max-w-[220px] truncate px-4 py-3">{j.dataset_name ?? "Hub dataset"}</td>
+                <td className="max-w-[220px] truncate px-4 py-3">{jobDatasetLabel(j)}</td>
                 <td className="px-4 py-3 font-mono text-[12px] text-muted">
                   {j.config.gates.grounding !== null && <span className="mr-2">G≥{j.config.gates.grounding}</span>}
                   {j.config.gates.reward !== null && <span>R≥{j.config.gates.reward}</span>}
