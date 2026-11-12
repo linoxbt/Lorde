@@ -752,3 +752,84 @@ def test_access_log_masks_storage_tokens(tmp_path, caplog):
     assert len(lines) == 2 and all(token not in r.getMessage() and token not in json.dumps(r.fields, default=str)
                                    for r in lines)
     assert {r.fields["route"] for r in lines} == {"/v1/_storage/{token}"}
+
+
+# ------------------------------------------------------------------ S5: membership needs consent
+
+@pytest.fixture(scope="module")
+def sqldb():
+    from test_supabase_sql import FILES
+
+    name = f"lorde_a2_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(URL, autocommit=True) as c:
+        c.execute(f"create database {name}")
+    url = URL.rsplit("/", 1)[0] + "/" + name
+    with psycopg.connect(url, autocommit=True) as c:
+        for f in FILES:
+            c.execute(f.read_text())
+    yield url
+    with psycopg.connect(URL, autocommit=True) as c:
+        c.execute(f"drop database {name} with (force)")
+
+
+@pg
+def test_members_join_only_by_accepting_an_invitation(sqldb):
+    from test_supabase_sql import admin, as_user, signup
+
+    owner, org = signup(sqldb, "own@inv.io")
+    adm, _ = signup(sqldb, "adm@inv.io")
+    victim, victim_org = signup(sqldb, "victim@inv.io")
+    other, _ = signup(sqldb, "other@inv.io")
+    with admin(sqldb) as c:
+        c.execute("insert into org_members (org_id, user_id, role) values (%s, %s, 'admin')", (org, adm))
+        unconfirmed = c.execute("insert into auth.users (email) values ('late@inv.io') returning id").fetchone()[0]
+
+    def as_(uid):
+        c = admin(sqldb)
+        as_user(c, uid)
+        return c
+
+    for uid in (owner, adm):  # no direct inserts any more, not even of a plain member
+        with as_(uid) as c, pytest.raises(psycopg.errors.InsufficientPrivilege):
+            c.execute("insert into org_members (org_id, user_id, role) values (%s, %s, 'member')", (org, victim))
+    with as_(adm) as c, pytest.raises(psycopg.errors.InsufficientPrivilege):  # admins invite members only
+        c.execute("select create_invite(%s, 'victim@inv.io', 'admin')", (org,))
+    with as_(other) as c, pytest.raises(psycopg.errors.InsufficientPrivilege):  # outsiders cannot invite
+        c.execute("select create_invite(%s, 'victim@inv.io')", (org,))
+    with as_(owner) as c:
+        inv = c.execute("select create_invite(%s, ' Victim@INV.io ', 'admin')", (org,)).fetchone()[0]
+        late = c.execute("select create_invite(%s, 'late@inv.io')", (org,)).fetchone()[0]
+        assert c.execute("select email, role from org_invites where id=%s", (inv,)).fetchone() == ("victim@inv.io",
+                                                                                                  "admin")
+    with as_(other) as c:  # someone else cannot see or take the invitation
+        assert c.execute("select count(*) from my_invites()").fetchone()[0] == 0
+        assert c.execute("select count(*) from org_invites").fetchone()[0] == 0
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            c.execute("select accept_invite(%s)", (inv,))
+    with as_(unconfirmed) as c, pytest.raises(psycopg.errors.InsufficientPrivilege):  # email not confirmed yet
+        c.execute("select accept_invite(%s)", (late,))
+    with admin(sqldb) as c:
+        assert c.execute("select count(*) from org_members where org_id=%s and user_id=%s",
+                         (org, victim)).fetchone()[0] == 0  # nothing happened without the victim's consent
+    with as_(victim) as c:
+        assert [r[0] for r in c.execute("select org_id from my_invites()")] == [org]
+        assert c.execute("select accept_invite(%s)", (inv,)).fetchone()[0] == org
+    with as_(victim) as c, pytest.raises(psycopg.errors.InvalidParameterValue):  # used once
+        c.execute("select accept_invite(%s)", (inv,))
+    with admin(sqldb) as c:
+        roles = dict(c.execute("select org_id, role from org_members where user_id=%s", (victim,)).fetchall())
+        assert roles == {victim_org: "owner", org: "admin"}  # their own org is untouched
+        actions = [r[0] for r in c.execute("select action from audit_log where org_id=%s and action like 'member.%%' "
+                                           "order by id", (org,))]
+        assert actions == ["member.invite", "member.invite", "member.join"]
+        c.execute("update org_invites set expires_at = now() - interval '1 second' where id=%s", (late,))
+        c.execute("update auth.users set email_confirmed_at = now() where id=%s", (unconfirmed,))
+    with as_(unconfirmed) as c, pytest.raises(psycopg.errors.InvalidParameterValue):  # expired
+        c.execute("select accept_invite(%s)", (late,))
+    with admin(sqldb) as c:
+        for fn in ("public.create_invite(uuid, text, org_role)", "public.my_invites()", "public.accept_invite(uuid)"):
+            assert not c.execute("select has_function_privilege('anon', %s, 'execute')", (fn,)).fetchone()[0]
+            assert c.execute("select has_function_privilege('authenticated', %s, 'execute')", (fn,)).fetchone()[0]
+        cfg = dict(c.execute("select proname, array_to_string(proconfig, ',') from pg_proc where proname in "
+                             "('create_invite', 'my_invites', 'accept_invite')").fetchall())
+        assert all("search_path=public" in v for v in cfg.values()) and len(cfg) == 3

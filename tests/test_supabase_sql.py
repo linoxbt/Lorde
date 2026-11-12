@@ -282,7 +282,13 @@ def test_org_member_roles_and_last_owner(db):
         assert c.execute("update org_members set role = 'member' where user_id = %s returning 1",
                          (owner,)).fetchall() == []
         assert c.execute("delete from org_members where user_id = %s returning 1", (owner,)).fetchall() == []
-        c.execute("insert into org_members (org_id, user_id, role) values (%s, %s, 'member')", (org, stranger))
+        # since 0008 (audit 2, S5) members join by accepting an invitation, not by a direct insert
+        invite = c.execute("select create_invite(%s, 'stranger@x.io', 'member')", (org,)).fetchone()[0]
+    with admin(db) as c:
+        as_user(c, stranger)
+        c.execute("select accept_invite(%s)", (invite,))
+    with admin(db) as c:
+        as_user(c, adm)
         with pytest.raises(psycopg.errors.InsufficientPrivilege):  # cannot promote the member either
             c.execute("update org_members set role = 'owner' where user_id = %s and org_id = %s", (stranger, org))
     with admin(db) as c:

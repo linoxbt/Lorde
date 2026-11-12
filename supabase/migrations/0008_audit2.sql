@@ -83,3 +83,118 @@ begin
 end $$;
 
 revoke execute on function public.orphan_dataset_objects(int) from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------------------------------- S5
+-- Membership needs the member's consent. 0005's members_insert policy let an owner or admin add any user id to
+-- their org; adding a user before they confirmed their email also pre-empted their own org (handle_new_user skips
+-- users who already have a membership), so their data landed in the inviter's org. Now an owner or admin creates
+-- an invitation for an email address, and only a signed-in user with that confirmed email can accept it.
+-- Direct inserts into org_members by users are no longer allowed (role changes and removals are unchanged).
+
+create table if not exists public.org_invites (
+  id          uuid primary key default gen_random_uuid(),
+  org_id      uuid not null references public.orgs on delete cascade,
+  email       text not null check (email = lower(email) and length(email) between 3 and 320 and email like '%_@_%'),
+  role        org_role not null default 'member' check (role in ('admin', 'member')),
+  invited_by  uuid references auth.users on delete set null,
+  created_at  timestamptz not null default now(),
+  expires_at  timestamptz not null default now() + interval '7 days',
+  accepted_at timestamptz,
+  accepted_by uuid references auth.users on delete set null
+);
+create index if not exists org_invites_org on public.org_invites (org_id, created_at desc);
+create index if not exists org_invites_email on public.org_invites (email) where accepted_at is null;
+create index if not exists org_invites_invited_by on public.org_invites (invited_by) where invited_by is not null;
+create index if not exists org_invites_accepted_by on public.org_invites (accepted_by) where accepted_by is not null;
+create unique index if not exists org_invites_one_open on public.org_invites (org_id, email) where accepted_at is null;
+
+alter table public.org_invites enable row level security;
+revoke all on public.org_invites from anon, authenticated;
+grant select, delete on public.org_invites to authenticated;
+drop policy if exists invites_read on public.org_invites;
+create policy invites_read on public.org_invites for select to authenticated using (is_admin(org_id));
+drop policy if exists invites_revoke on public.org_invites;
+create policy invites_revoke on public.org_invites for delete to authenticated
+  using (accepted_at is null and (is_owner(org_id) or (is_admin(org_id) and role = 'member')));
+
+-- No direct membership inserts by users: accept_invite() (and onboarding) are the only ways in.
+drop policy if exists members_insert on public.org_members;
+revoke insert on public.org_members from authenticated, anon;
+
+-- Invite an email address to `o` as `r` (owners: admin or member; admins: member only). Re-inviting the same open
+-- address refreshes the invitation. Returns the invitation id.
+create or replace function public.create_invite(o uuid, invitee_email text, r org_role default 'member')
+  returns uuid language plpgsql security definer set search_path = public, pg_temp as
+$$
+declare
+  uid uuid := auth.uid();
+  e text := lower(trim(invitee_email));
+  iid uuid;
+begin
+  if uid is null or not (is_owner(o) or (is_admin(o) and r = 'member')) then
+    raise exception 'owners invite admins and members; admins invite members' using errcode = '42501';
+  end if;
+  if r = 'owner' then
+    raise exception 'invite as admin or member; promote to owner once they have joined' using errcode = '22023';
+  end if;
+  if e is null or e !~ '^[^@\s]+@[^@\s]+$' then
+    raise exception 'not an email address' using errcode = '22023';
+  end if;
+  if exists (select 1 from org_members m join auth.users u on u.id = m.user_id
+              where m.org_id = o and lower(u.email) = e) then
+    raise exception 'already a member' using errcode = '23505';
+  end if;
+  insert into org_invites (org_id, email, role, invited_by) values (o, e, r, uid)
+  on conflict (org_id, email) where accepted_at is null
+  do update set role = excluded.role, invited_by = excluded.invited_by, created_at = now(),
+                expires_at = now() + interval '7 days'
+  returning id into iid;
+  insert into audit_log (org_id, actor, action, target, detail)
+  values (o, uid::text, 'member.invite', e, jsonb_build_object('role', r, 'invite', iid));
+  return iid;
+end $$;
+
+-- Open invitations addressed to the signed-in user's confirmed email (with the organization's name).
+create or replace function public.my_invites()
+  returns table (id uuid, org_id uuid, org_name text, role org_role, created_at timestamptz, expires_at timestamptz)
+  language sql stable security definer set search_path = public, pg_temp as
+$$
+  select i.id, i.org_id, o.name, i.role, i.created_at, i.expires_at
+    from org_invites i join orgs o on o.id = i.org_id join auth.users u on u.id = auth.uid()
+   where u.email_confirmed_at is not null and i.email = lower(u.email)
+     and i.accepted_at is null and i.expires_at > now()
+   order by i.created_at desc
+$$;
+
+-- Accept an invitation: only its addressee (signed in, email confirmed), once, before it expires.
+create or replace function public.accept_invite(invite uuid) returns uuid
+  language plpgsql security definer set search_path = public, pg_temp as
+$$
+declare
+  uid uuid := auth.uid();
+  inv record;
+begin
+  if uid is null then
+    raise exception 'sign in to accept an invitation' using errcode = '42501';
+  end if;
+  select i.* into inv from org_invites i join auth.users u on u.id = uid
+   where i.id = invite and i.email = lower(u.email) and u.email_confirmed_at is not null
+   for update of i;
+  if not found then
+    raise exception 'no such invitation for this account' using errcode = '42501';
+  end if;
+  if inv.accepted_at is not null or inv.expires_at <= now() then
+    raise exception 'this invitation was already used or has expired' using errcode = '22023';
+  end if;
+  insert into org_members (org_id, user_id, role) values (inv.org_id, uid, inv.role)
+  on conflict (org_id, user_id) do nothing;
+  update org_invites set accepted_at = now(), accepted_by = uid where id = inv.id;
+  insert into audit_log (org_id, actor, action, target, detail)
+  values (inv.org_id, uid::text, 'member.join', uid::text, jsonb_build_object('role', inv.role, 'invite', inv.id));
+  return inv.org_id;
+end $$;
+
+revoke execute on function public.create_invite(uuid, text, org_role), public.my_invites(),
+  public.accept_invite(uuid) from public, anon;
+grant execute on function public.create_invite(uuid, text, org_role), public.my_invites(),
+  public.accept_invite(uuid) to authenticated;
