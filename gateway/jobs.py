@@ -30,6 +30,7 @@ from .errors import (
     NotFound,
     PayloadTooLarge,
     RateLimited,
+    StorageQuotaExceeded,
     UnsupportedDataset,
 )
 from .keys import ApiKey
@@ -43,6 +44,7 @@ FORMATS = {".jsonl": "jsonl", ".json": "jsonl", ".csv": "csv", ".parquet": "parq
 HF_DATASET = re.compile(r"^hf://datasets/[\w.-]+/[\w.-]+(/[\w./-]+)?$")
 HF_FILE = re.compile(r"^hf://datasets/[\w.-]+/[\w.-]+/[\w./-]*[\w-]\.(jsonl|json|csv|parquet)$")
 IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
+UPLOAD_URL_TTL_S = 2 * 3600  # the longest a signed upload URL lives (Supabase: two hours; local: 15 minutes)
 
 
 class UploadRequest(BaseModel):
@@ -170,6 +172,16 @@ def build_router(gw: Gateway, auth) -> APIRouter:
             raise InvalidRequest("upload JSONL, CSV or Parquet (.jsonl, .json, .csv, .parquet)")
         if req.bytes and req.bytes > gw.s.max_upload_bytes:
             raise PayloadTooLarge(f"uploads are limited to {gw.s.max_upload_bytes // (1024 * 1024)} MB")
+        # per-org storage caps (audit 2, S3); a new upload counts at the upload limit until it is done
+        n, used = await jobs.dataset_usage(key.org_id, gw.s.max_upload_bytes, UPLOAD_URL_TTL_S)
+        if n >= gw.s.org_max_datasets or used + gw.s.max_upload_bytes > gw.s.org_max_dataset_bytes:
+            mb = 1024 * 1024
+            raise StorageQuotaExceeded(
+                f"this organization holds {n} datasets ({used // mb} MB, pending uploads counted at "
+                f"{gw.s.max_upload_bytes // mb} MB); the limits are {gw.s.org_max_datasets} datasets and "
+                f"{gw.s.org_max_dataset_bytes // mb} MB. Delete datasets or wait for them to expire",
+                extra={"datasets": n, "bytes": used, "max_datasets": gw.s.org_max_datasets,
+                       "max_bytes": gw.s.org_max_dataset_bytes})
         ds = await jobs.create_dataset(key.org_id, name, fmt, req.bytes, None, actor=key.prefix)
         signed = await storage.signed_upload("datasets", ds["storage_path"])
         return {"upload_id": str(ds["id"]), "upload_url": signed["url"], "method": signed["method"],
@@ -251,7 +263,7 @@ def build_router(gw: Gateway, auth) -> APIRouter:
             raise PayloadTooLarge(f"upload over {limit // (1024 * 1024)} MB") from e
         if gw.jobs:
             async with gw.jobs.pool.connection() as c:
-                await c.execute("update datasets set bytes=%s where storage_path=%s", (n, path))
+                await c.execute("update datasets set bytes=%s, uploaded_at=now() where storage_path=%s", (n, path))
         return {"ok": True, "bytes": n}
 
     @r.get("/v1/_storage/{token}")

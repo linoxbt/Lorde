@@ -580,3 +580,87 @@ def test_busy_refusals_past_the_free_budget_cost_one_judgment(tmp_path):
         assert sum(u["judgments"] for u in usage if u["org_id"] == "orgB") == 2  # metered as charged
 
     asyncio.run(go())
+
+
+# ------------------------------------------------------------------ S3: storage abuse
+
+def dataset_usage(env, s):
+    from gateway.db import JobStore, make_pool
+    from gateway.jobs import UPLOAD_URL_TTL_S
+
+    async def go():
+        pool = make_pool(env["db"], max_size=1)
+        await pool.open()
+        try:
+            return await JobStore(pool).dataset_usage(str(env["org"]), s.max_upload_bytes, UPLOAD_URL_TTL_S)
+        finally:
+            await pool.close()
+    return asyncio.run(go())
+
+
+@pg
+def test_uploads_are_capped_per_org_by_count_and_bytes(env):
+    h = env["keys"]["all"]
+    n, used = dataset_usage(env, env["s"])
+    s = Settings(**{**env["s"].__dict__, "org_max_datasets": n + 1, "org_max_dataset_bytes": 1 << 40})
+    with TestClient(create_app(s)) as c:
+        up = upload(c, h, ROWS[:1])  # one more fits; once uploaded it counts at its real size
+        r = c.post("/v1/uploads", headers=h, json={"filename": "more.jsonl"})
+        assert r.status_code == 429 and r.json()["error"]["code"] == "storage_quota_exceeded"
+        assert r.json()["error"]["max_datasets"] == n + 1
+    n2, used2 = dataset_usage(env, s)
+    assert n2 == n + 1 and used2 - used < 10_000  # the completed upload counts at its size, not 200 MB
+    # bytes: a pending upload counts at the upload limit, so only one fits in limit = used + 200 MB
+    s = Settings(**{**env["s"].__dict__, "org_max_dataset_bytes": used2 + s.max_upload_bytes})
+    with TestClient(create_app(s)) as c:
+        assert c.post("/v1/uploads", headers=h, json={"filename": "a.jsonl"}).status_code == 200
+        r = c.post("/v1/uploads", headers=h, json={"filename": "b.jsonl"})
+        assert r.status_code == 429 and r.json()["error"]["code"] == "storage_quota_exceeded"
+    with db(env) as c:  # expired datasets free their share
+        c.execute("update datasets set expires_at = now() - interval '1 minute' where org_id=%s", (env["org"],))
+    with TestClient(create_app(s)) as c:
+        assert c.post("/v1/uploads", headers=h, json={"filename": "c.jsonl"}).status_code == 200
+    with db(env) as c:
+        assert up and c.execute("select uploaded_at is not null from datasets where id=%s", (up,)).fetchone()[0]
+
+
+@pg
+def test_orphan_dataset_objects_are_purged(env, tmp_path):
+    from test_jobs import work
+
+    w = work(env)
+    root = env["tmp"] / "storage" / "datasets"
+    orphan = root / str(env["org"]) / str(uuid.uuid4()) / "orphan.jsonl"
+    fresh = root / str(env["org"]) / str(uuid.uuid4()) / "fresh.jsonl"
+    for f in (orphan, fresh):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("{}\n")
+    with TestClient(create_app(env["s"])) as c:
+        kept_id = upload(c, env["keys"]["all"], ROWS[:1])
+    with db(env) as c:
+        kept = root / c.execute("select storage_path from datasets where id=%s", (kept_id,)).fetchone()[0]
+    old = time.time() - 2 * 86400
+    for f in (orphan, kept):
+        os.utime(f, (old, old))
+
+    async def go():
+        await w.connect()
+        try:
+            return await w.purge_orphans()
+        finally:
+            await w.conn.close()
+    assert asyncio.run(go()) >= 1
+    assert not orphan.exists() and kept.exists() and fresh.exists()  # a day old and unknown: deleted
+
+    with db(env) as c:  # Supabase Storage: the same rule, from storage.objects
+        did = uuid.uuid4()
+        kept_path = c.execute("select storage_path from datasets where id=%s", (kept_id,)).fetchone()[0]
+        c.execute("insert into storage.objects (bucket_id, name, created_at) values ('datasets', %s, "
+                  "now() - interval '2 days'), ('datasets', %s, now() - interval '2 days'), ('datasets', %s, now())",
+                  (f"{env['org']}/{did}/gone.jsonl", kept_path, f"{env['org']}/{did}/new.jsonl"))
+        paths = {r[0] for r in c.execute("select path from orphan_dataset_objects()")}
+        assert f"{env['org']}/{did}/gone.jsonl" in paths
+        assert f"{env['org']}/{did}/new.jsonl" not in paths and kept_path not in paths
+        fn = "public.orphan_dataset_objects(int)"
+        assert not c.execute("select has_function_privilege('authenticated', %s, 'execute')", (fn,)).fetchone()[0]
+        assert c.execute("select file_size_limit from storage.buckets where id='datasets'").fetchone()[0] == 200 << 20

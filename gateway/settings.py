@@ -108,6 +108,11 @@ class Settings:
     public_url: str = field(default_factory=lambda: _env("LORDE_PUBLIC_URL", "") or "")
     max_upload_bytes: int = 200 * 1024 * 1024
     max_active_jobs: int = 3
+    # per-org dataset storage (audit 2, S3): datasets uploaded or still uploadable, and their bytes (a pending upload
+    # counts at max_upload_bytes until its signed URL has expired)
+    org_max_datasets: int = field(default_factory=lambda: int(_env("LORDE_ORG_MAX_DATASETS", "20")))
+    org_max_dataset_bytes: int = field(
+        default_factory=lambda: int(_env("LORDE_ORG_MAX_DATASET_BYTES", str(1024 * 1024 * 1024))))
     # worker limits (spec Section 11.4; audit S4)
     job_max_seconds: int = field(default_factory=lambda: int(_env("LORDE_JOB_MAX_SECONDS", "3600")))
     # 60 rows x 2 gates x 30 s (one CPU llama.cpp slot, worst case) = 3600 s = LORDE_JOB_MAX_SECONDS: a job of

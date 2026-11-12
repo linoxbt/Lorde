@@ -194,6 +194,7 @@ class Worker:
         if now - self._last_purge > 6 * 3600:
             self._last_purge = now
             await self.purge()
+            await self.purge_orphans()
 
     async def purge(self) -> None:
         """Delete data past retention. Each object is handled on its own: a bad row is logged and skipped,
@@ -225,6 +226,30 @@ class Worker:
         if done_ds or done_jobs:
             await self.q("select finish_purge(%s, %s)", (done_ds, done_jobs))
             log.info("retention purge: %s datasets, %s job result sets", len(done_ds), len(done_jobs))
+
+    async def purge_orphans(self, age_s: float = 86400) -> int:
+        """Delete dataset objects older than a day that no datasets row points at (audit 2, S3): left by the
+        direct-upload policy 0008 dropped, or by a failed purge. Errors are logged, never raised."""
+        try:
+            from gateway.storage import LocalStorage
+
+            if isinstance(self.storage, LocalStorage):
+                candidates = await asyncio.to_thread(self.storage.older_than, "datasets", age_s)
+            else:
+                candidates = [r["path"] for r in await self.q("select path from orphan_dataset_objects()")]
+            if not candidates:
+                return 0
+            known = {r["storage_path"] for r in await self.q(
+                "select storage_path from datasets where storage_path = any(%s)", (candidates,))}
+            orphans = [p for p in candidates if p not in known]
+            for i in range(0, len(orphans), 100):
+                await self.storage.delete("datasets", orphans[i:i + 100])
+            if orphans:
+                log.info("deleted %s orphan dataset objects", len(orphans))
+            return len(orphans)
+        except Exception:  # noqa: BLE001
+            log.exception("orphan dataset purge failed; will retry with the next purge")
+            return 0
 
     # ------------------------------------------------------------------ one job
     async def process_one(self) -> bool:

@@ -96,13 +96,21 @@ def test_rls_isolates_orgs_and_hides_key_hash(db):
 
 
 def test_storage_paths_are_scoped_to_org(db):
+    """Users write no storage objects at all, not even in their own org's folder: since 0008 (audit 2, S3) objects
+    are written only through Gateway-issued uploads, which always have a datasets row. Reads stay org-scoped."""
     a, org_a = signup(db, "s@x.io")
     _, org_b = signup(db, "t@x.io")
+    for path in (f"{org_a}/d1/data.jsonl", f"{org_b}/d1/x.jsonl"):
+        with admin(db) as c:
+            as_user(c, a)
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                c.execute("insert into storage.objects (bucket_id, name) values ('datasets', %s)", (path,))
     with admin(db) as c:
+        c.execute("insert into storage.objects (bucket_id, name) values ('datasets', %s), ('datasets', %s)",
+                  (f"{org_a}/d2/mine.jsonl", f"{org_b}/d2/theirs.jsonl"))
         as_user(c, a)
-        c.execute("insert into storage.objects (bucket_id, name) values ('datasets', %s)", (f"{org_a}/d1/data.jsonl",))
-        with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            c.execute("insert into storage.objects (bucket_id, name) values ('datasets', %s)", (f"{org_b}/d1/x.jsonl",))
+        assert [r[0] for r in c.execute("select name from storage.objects where name like '%%/d2/%%'")] == [
+            f"{org_a}/d2/mine.jsonl"]
 
 
 @pytest.mark.parametrize("round_", range(5))

@@ -46,3 +46,40 @@ end $$;
 
 revoke execute on function public.request_org_data_deletion(uuid) from public, anon;
 grant execute on function public.request_org_data_deletion(uuid) to authenticated;
+
+-- ---------------------------------------------------------------------------------------------- S3
+-- Storage abuse. 0002's datasets_objects_upload policy let any member write any object under their org's folder
+-- in the datasets bucket with their session, with no datasets row (so the retention purge never saw it) and no
+-- size or count limit. Objects are now written only through Gateway-issued uploads: a Supabase signed upload URL
+-- (created with the service key; it needs no policy) or the Gateway's own /v1/_storage route.
+drop policy if exists datasets_objects_upload on storage.objects;
+
+-- The bucket refuses objects over the Gateway's upload limit (Settings.max_upload_bytes, 200 MB), which also bounds
+-- a signed upload whose declared size was a lie. (The column exists in Supabase; the test shim mirrors it.)
+do $$ begin
+  if exists (select 1 from information_schema.columns where table_schema = 'storage' and table_name = 'buckets'
+             and column_name = 'file_size_limit') then
+    update storage.buckets set file_size_limit = 200 * 1024 * 1024 where id = 'datasets';
+  end if;
+end $$;
+
+-- When an upload completed (the Gateway's local storage route sets it; for Supabase Storage the object's own
+-- metadata says so). Per-org dataset caps count completed uploads at their real size and pending ones (a signed
+-- URL that may still be used) at the upload limit.
+alter table public.datasets add column if not exists uploaded_at timestamptz;
+
+-- Objects in the datasets bucket with no datasets row, older than a day: written before this migration through
+-- the dropped policy, or left behind by a failed purge. The worker deletes them (every 6 hours, with the purge).
+create or replace function public.orphan_dataset_objects(max_rows int default 1000) returns table (path text)
+  language plpgsql stable set search_path = public, pg_temp as
+$$
+begin
+  return query
+  select o.name::text from storage.objects o
+   where o.bucket_id = 'datasets' and o.created_at < now() - interval '1 day'
+     and not exists (select 1 from public.datasets d where d.storage_path = o.name)
+   order by o.created_at
+   limit greatest(1, least(coalesce(max_rows, 1000), 10000));
+end $$;
+
+revoke execute on function public.orphan_dataset_objects(int) from public, anon, authenticated;

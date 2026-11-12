@@ -183,6 +183,22 @@ class JobStore:
                 (did, org_id, name, dataset_path(org_id, str(did), name), fmt, size, ret))).fetchone()
         return r
 
+    async def dataset_usage(self, org_id: str, pending_bytes: int, signed_ttl_s: int) -> tuple[int, int]:
+        """(datasets, bytes) the org holds in storage: uploads at their real size (the storage object's, or the
+        size the Gateway's local route wrote), and uploads whose signed URL may still be used at ``pending_bytes``.
+        Expired datasets and never-used upload URLs do not count (audit 2, S3)."""
+        async with self.pool.connection() as c:
+            r = await (await c.execute(
+                "with d as (select case when o.size is not null then o.size "
+                "  when ds.uploaded_at is not null then coalesce(ds.bytes, 0) "
+                "  when ds.created_at > now() - make_interval(secs => %s) then %s::bigint end as size "
+                "  from datasets ds left join lateral (select (x.metadata->>'size')::bigint as size from storage.objects x "
+                "   where x.bucket_id = 'datasets' and x.name = ds.storage_path limit 1) o on true "
+                "  where ds.org_id = %s and (ds.expires_at is null or ds.expires_at > now())) "
+                "select count(size) as n, coalesce(sum(size), 0)::bigint as bytes from d",
+                (signed_ttl_s, pending_bytes, org_id))).fetchone()
+        return int(r["n"]), int(r["bytes"])
+
     async def get_dataset(self, org_id: str, dataset_id: str) -> dict | None:
         async with self.pool.connection() as c:
             return await (await c.execute("select * from datasets where id=%s and org_id=%s",
