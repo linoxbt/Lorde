@@ -9,7 +9,7 @@ import { friendlyAuthError } from "@/lib/auth-errors";
 
 const input = "h-11 w-full rounded-xl border border-line px-3.5 text-[15px]";
 
-/** Set a new password. The reset email's link signs the user in through /auth/callback first. */
+/** Set a new password. The reset (or invite) email link signs the user in through /auth/confirm first. */
 export function ResetForm() {
   const router = useRouter();
   const [password, setPassword] = useState(""), [confirm, setConfirm] = useState("");
