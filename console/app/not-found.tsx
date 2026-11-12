@@ -6,7 +6,7 @@ export default function NotFound() {
   return (
     <>
       <SiteHeader />
-      <main>
+      <main id="main" tabIndex={-1} className="outline-none">
         <Container className="flex min-h-[60vh] flex-col items-center justify-center py-24 text-center">
           <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-muted">404 · verdict: not found</p>
           <h1 className="mt-4 text-[48px] font-medium tracking-[-0.045em]">This page didn&apos;t pass the gate.</h1>

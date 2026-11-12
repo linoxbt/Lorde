@@ -53,7 +53,7 @@ export function ConsoleShell({ ws, children }: { ws: Workspace; children: ReactN
             <div className="lg:hidden"><HamburgerMenu links={consoleNav} title="Console" cta={{ label: "New job", href: "/console/jobs/new" }} /></div>
           </div>
         </header>
-        <main className="px-5 py-8 lg:px-8 lg:py-10">{children}</main>
+        <main id="main" tabIndex={-1} className="px-5 py-8 outline-none lg:px-8 lg:py-10">{children}</main>
       </div>
     </div>
   );

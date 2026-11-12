@@ -45,7 +45,7 @@ export default function Docs() {
   return (
     <>
       <SiteHeader />
-      <main>
+      <main id="main" tabIndex={-1} className="outline-none">
         <PageHero eyebrow="Docs" title="Judge your first item in five minutes."
           lead="Lorde speaks OpenAI-compatible chat, a native judge API, Python, and MCP. Pick the surface you already use.">
           <LinkButton href="/console/keys" arrow>Get an API key</LinkButton>

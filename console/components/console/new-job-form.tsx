@@ -30,10 +30,10 @@ function Gate({ id, label, desc, on, setOn, thr, setThr, rate }:
       </div>
       <div className="mt-5">
         <div className="flex items-center justify-between text-sm">
-          <label htmlFor={`${id}-thr`} className="text-muted">Threshold</label>
+          <label htmlFor={`${id}-thr`} className="text-muted">Threshold<span className="sr-only"> for the {label.toLowerCase()}</span></label>
           <span className="tnum font-mono">{thr.toFixed(2)}</span>
         </div>
-        <input id={`${id}-thr`} type="range" min={0.3} max={0.95} step={0.05} value={thr} disabled={!on}
+        <input id={`${id}-thr`} type="range" min={0.3} max={0.95} step={0.05} value={thr} disabled={!on} aria-valuetext={thr.toFixed(2)}
           onChange={(e) => setThr(Number(e.target.value))} className="mt-2 w-full accent-[var(--color-accent)]" />
         <p className="tnum mt-2 text-[13px] text-muted">Preview pass rate <span className="font-medium text-ink">{pct(rate)}</span></p>
       </div>

@@ -188,7 +188,7 @@ export function ReviewQueue({ items, initialLabels, demo, orgId, userId }:
           </p>
           <div role="radiogroup" aria-label="Score" className="mt-4 flex flex-wrap gap-1.5">
             {SCORES.map((s) => (
-              <button key={s} role="radio" aria-checked={score === s} onClick={() => setScore(s)} data-enter-saves=""
+              <button key={s} type="button" role="radio" aria-checked={score === s} aria-label={`Score ${s.toFixed(1)}`} onClick={() => setScore(s)} data-enter-saves=""
                 className={clsx("tnum h-10 w-12 rounded-xl border font-mono text-[13px] transition-colors",
                   score === s ? (s >= 0.7 ? "border-pass bg-pass text-white" : "border-reject bg-reject text-white")
                     : "border-line hover:bg-wash")}>

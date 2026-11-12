@@ -79,7 +79,7 @@ export default function Landing() {
   return (
     <>
       <SiteHeader />
-      <main>
+      <main id="main" tabIndex={-1} className="outline-none">
         {/* Hero */}
         <section className="relative isolate overflow-hidden">
           <HeroArt />

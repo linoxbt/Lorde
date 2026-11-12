@@ -54,7 +54,7 @@ export function HamburgerMenu({ groups, links, cta = { label: "Open console", hr
         type="button"
         aria-label="Open menu"
         aria-expanded={open}
-        aria-controls="site-menu"
+        aria-controls={open ? "site-menu" : undefined}
         onClick={() => setOpen(true)}
         className="inline-flex size-10 items-center justify-center rounded-full border border-line bg-white text-ink transition-colors hover:bg-wash"
       >
@@ -92,6 +92,7 @@ export function HamburgerMenu({ groups, links, cta = { label: "Open console", hr
                     <button
                       type="button"
                       aria-expanded={isOpen}
+                      aria-controls={`menu-group-${g.label.toLowerCase()}`}
                       onClick={() => setExpanded(isOpen ? null : g.label)}
                       className="flex w-full items-center justify-between py-5 text-left text-[22px] font-medium tracking-[-0.02em] sm:text-[26px] md:pointer-events-none md:pb-3"
                     >
@@ -99,7 +100,7 @@ export function HamburgerMenu({ groups, links, cta = { label: "Open console", hr
                       <ChevronRight className={clsx("size-5 transition-transform md:hidden", isOpen && "rotate-90")} aria-hidden />
                     </button>
                     {(
-                      <ul className={clsx("gap-1 pb-5 md:-mx-3 md:grid", isOpen ? "grid" : "hidden")}>
+                      <ul id={`menu-group-${g.label.toLowerCase()}`} className={clsx("gap-1 pb-5 md:-mx-3 md:grid", isOpen ? "grid" : "hidden")}>
                         {g.links.map((l) => (
                           <li key={l.href + l.label}>
                             <Link href={l.href} className="group block rounded-xl px-3 py-2.5 hover:bg-wash">
