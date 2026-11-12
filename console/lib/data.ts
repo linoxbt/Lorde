@@ -1,5 +1,6 @@
 import "server-only";
 
+import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { cache } from "react";
 
@@ -7,6 +8,7 @@ import { demoDatasets, demoJobs, demoJudgments, demoKeys, demoMembers, demoRevie
 import { supabaseEnabled } from "./env";
 import { type Client, DataError, primaryMembership, UUID } from "./membership";
 import { isRangePastEnd } from "./paging";
+import { safeNext } from "./safe-next";
 import type {
   ActiveModel, ApiKeyRow, Dataset, Gate, GateRates, HistCell, Job, Judgment, JudgmentFilters, Member, Page, ReviewItem,
   ReviewLabel, Role, UsageDay, Workspace,
@@ -23,12 +25,15 @@ const JOB_COLS = "id, status, dataset_id, config, model_revision, counts, error,
 
 type Live = { sb: Client; userId: string; email: string; orgId: string; role: Role };
 
-/** The signed-in user and their organization, once per request. No session → /signin; no organization → /welcome. */
+/**
+ * The signed-in user and their organization, once per request. No session → /signin, coming back to this page
+ * afterwards (proxy.ts passes the path in x-lorde-path); no organization → /welcome.
+ */
 const live = cache(async (): Promise<Live> => {
   const { supabaseServer } = await import("./supabase/server");
   const sb = await supabaseServer();
   const { data: auth } = await sb.auth.getUser();
-  if (!auth.user) redirect("/signin?next=/console");
+  if (!auth.user) redirect(`/signin?next=${encodeURIComponent(safeNext((await headers()).get("x-lorde-path")))}`);
   const m = await primaryMembership(sb, auth.user.id);
   if (!m) redirect("/welcome");
   return { sb, userId: auth.user.id, email: auth.user.email ?? "", orgId: m.org_id, role: m.role };

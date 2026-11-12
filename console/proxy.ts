@@ -9,10 +9,15 @@ import { safeNext } from "@/lib/safe-next";
  * getClaims() (a local JWT check with asymmetric keys); pages that need the verified user still call getUser().
  * Without Supabase configured, the Console runs in demo mode.
  */
+/** The path and query being served, for server code that must send the user back here after signing in. */
+const PATH_HEADER = "x-lorde-path";  // read by lib/data.ts
+
 export async function proxy(request: NextRequest) {
+  // Set by the proxy only: a value sent by the client is overwritten.
+  request.headers.set(PATH_HEADER, `${request.nextUrl.pathname}${request.nextUrl.search}`);
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  if (!url || !key) return NextResponse.next();
+  if (!url || !key) return NextResponse.next({ request });
 
   let response = NextResponse.next({ request });
   const extraHeaders: Record<string, string> = {};
