@@ -606,17 +606,12 @@ def tldr() -> str:
     return s
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--rows", type=int, default=100_000)
-    ap.add_argument("--gpu", choices=list(config.GPU_HOURLY), default=None,
-                    help="price class when judge_eval.json has no gpu_hourly; must match the measured GPU")
-    ap.add_argument("--out", default=str(DOCS / "HF_ARTICLE.md"))
-    args = ap.parse_args()
+def build(rows: int = 100_000, gpu: str | None = None) -> str:
+    """The article as markdown, from the template and the result files under config.ROOT."""
     t = TEMPLATE.read_text()
     fills = {
         "<!-- tldr -->": tldr(),
-        "<!-- roi -->": roi(args.rows, args.gpu),
+        "<!-- roi -->": roi(rows, gpu),
         "<!-- acceptance -->": acceptance_md(),
         "<!-- labels_note -->": labels_note(),
         "<!-- human_status -->": human_status(),
@@ -632,7 +627,17 @@ def main() -> None:
         fills[f"<!-- results:{name} -->"] = section(name)
     for k, v in fills.items():
         t = t.replace(k, v)
-    t = re.sub(r"\n{3,}", "\n\n", t)
+    return re.sub(r"\n{3,}", "\n\n", t)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rows", type=int, default=100_000)
+    ap.add_argument("--gpu", choices=list(config.GPU_HOURLY), default=None,
+                    help="price class when judge_eval.json has no gpu_hourly; must match the measured GPU")
+    ap.add_argument("--out", default=str(DOCS / "HF_ARTICLE.md"))
+    args = ap.parse_args()
+    t = build(args.rows, args.gpu)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(t, encoding="utf-8")

@@ -5,6 +5,7 @@ visibility."""
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -219,3 +220,82 @@ def test_weight_file_patterns():
         assert pub.is_weight_file(p), p
     for p in ("README.md", "template_fingerprints.json", "train_meta.json", ".gitattributes"):
         assert not pub.is_weight_file(p), p
+
+
+# ----------------------------------------------------------------------------- audit 2, B5: honest cards
+
+FALSE_LINES = ("via the Cohere API (calibration slice)", "Human agreement is reported below", "κ = 0.75)",
+               "`labels_32b.jsonl`", "`human_labels.jsonl`")
+
+
+def results_world(tmp_path, monkeypatch, pub, kappa=0.7479):
+    for name, path in (("DATA", "data"), ("RESULTS", "results"), ("RUNS", "runs"), ("ROOT", ".")):
+        monkeypatch.setattr(pub.config, name, (tmp_path / path).resolve())
+    jsonl.write_json(tmp_path / "results" / "judge_eval.json", {
+        "n_test": 937, "promotable": False,
+        "judges": {"lorde": {"vs_teacher": {"gate_usable_rate": 1.0, "decision_agreement": 0.9114, "kappa": kappa}}}})
+    jsonl.write_json(tmp_path / "bench" / "results" / "lorde.json",
+                     {"vs_teacher_8b": {"n": 300, "decision_agreement": 0.8733, "kappa": 0.6906}})
+    jsonl.write_json(tmp_path / "runs" / "lorde-v1" / "train_meta.json",
+                     {"engine": "aligntune", "train_rows": 1234, "train_seconds": 100.0,
+                      "recipe": {"epochs": 3, "batch_size": 1, "grad_accum": 8, "lr": 0.0002, "max_len": 1024,
+                                 "lora_r": 8, "lora_alpha": 16, "lora_dropout": 0.1, "targets": ["q_proj"]}})
+    jsonl.write(tmp_path / "data" / "pool.jsonl", [{"uid": "a", "kind": "reward", "variant": "gold"}])
+    jsonl.write(tmp_path / "data" / "human_sample.jsonl", [{"uid": "h-1"}, {"uid": "h-2"}])
+    jsonl.write(tmp_path / "data" / "sft" / "train.jsonl", [{"uid": "a"}])
+    jsonl.write_json(tmp_path / "data" / "splits_summary.json", {"train": 1, "val": 0, "test": 937})
+
+
+def test_cards_say_only_what_the_files_support(tmp_path, monkeypatch):
+    pub = load_publish()
+    results_world(tmp_path, monkeypatch, pub)
+    card = pub.model_card("u", "v1.0.0")
+    for phrase in FALSE_LINES:
+        assert phrase not in card, phrase
+    assert "κ = 0.748" in card and "κ = 0.691" in card and "not promotable" in card
+    assert "imitation of the teacher" in card and "has not been measured" in card
+    # the training recipe is train_meta.json's (here through the embedded article), not a hard-coded one
+    assert "3 epoch(s) over 1,234 training rows" in card and "effective batch 8" in card
+    assert "## Template fingerprints" in card and card.index("## Template fingerprints") < card.index("## Licence\n")
+    assert "THIRD_PARTY_LICENSES.md" in card
+
+    staged = [dst for _, dst in pub.data_publish_set()]
+    assert {"pool.jsonl", "human_sample.jsonl", "sft/train.jsonl", "splits_summary.json",
+            "results/judge_eval.json", "bench/results/lorde.json"} <= set(staged)
+    assert "human_labels.jsonl" not in staged and "labels_32b.jsonl" not in staged
+    data = pub.data_card("u")
+    for phrase in FALSE_LINES:
+        assert phrase not in data, phrase
+    assert "| `pool.jsonl` | 1 judge items" in data and "`sft/train.jsonl`" in data and "`sft/val.jsonl`" not in data
+    assert "no hand labels have been collected yet" in data and "calibration slice was not run" in data
+    assert "do not consult this dataset while labelling" in data  # audit 2, S6
+    assert "includes CC BY-SA 4.0 content" in data and "continue to apply" in data
+    assert "`labels.jsonl`" not in data  # not in this publish set, so not listed
+
+
+def test_cards_list_calibration_and_human_labels_when_they_exist(tmp_path, monkeypatch):
+    pub = load_publish()
+    results_world(tmp_path, monkeypatch, pub)
+    jsonl.write(tmp_path / "data" / "labels_32b.jsonl", [{"uid": "a"}])
+    jsonl.write(tmp_path / "data" / "human_sample_key.jsonl", [{"id": "h-1", "uid": "a"}])
+    jsonl.write(tmp_path / "data" / "human_labels.jsonl", [{"uid": "h-1", "kind": "reward", "lang": "en",
+                                                            "human_score": 0.9}])
+    staged = [dst for _, dst in pub.data_publish_set()]
+    assert "labels_32b.jsonl" in staged and "human_labels.jsonl" in staged
+    data = pub.data_card("u")
+    assert "`labels_32b.jsonl`" in data and "`human_labels.jsonl`" in data
+    assert "via the Cohere API labels the golden-300 calibration slice" in data
+
+
+def test_data_card_lists_exactly_the_given_files():
+    """The live repo's file list (as the Hub API returns it) yields a card that names only those files."""
+    pub = load_publish()
+    files = ["README.md", "pool.jsonl", "labels.jsonl", "test.jsonl", "human_sample.jsonl", "sft/train.jsonl",
+             "sft/val.jsonl", "gated/lorde/passed.jsonl", "gated/lorde/lexsi_provenance.json",
+             "gated/ungated/passed.jsonl", "bench/golden-300.jsonl", "bench/adversarial-100.jsonl",
+             "results/judge_eval.json", "results/preds/lorde.jsonl"]
+    card = pub.data_card("u", files)
+    listed = set(re.findall(r"`([\w./<>+-]+\.(?:jsonl|json))`", card))
+    assert {"labels_32b.jsonl", "human_labels.jsonl", "downstream_raw.jsonl"}.isdisjoint(listed)
+    assert "gated/<judge>/" in card and "(lorde): passed" in card and "`gated/ungated/passed.jsonl`" in card and "adversarial-100, golden-300" in card
+    assert "judge_eval" in card and "results/preds/" in card
