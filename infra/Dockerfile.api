@@ -3,8 +3,9 @@
 FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
-COPY requirements/runtime.txt requirements/runtime.txt
-RUN pip install -r requirements/runtime.txt "curatorkit[generation]==0.1.23" pyarrow
+# Exact versions with sha256 hashes (audit 2, S11): requirements/runtime.lock, generated from image.in
+COPY requirements/runtime.lock requirements/runtime.lock
+RUN pip install --require-hashes --no-deps -r requirements/runtime.lock
 COPY lorde_forge/ lorde_forge/
 COPY gateway/ gateway/
 COPY worker/ worker/

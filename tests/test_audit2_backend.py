@@ -878,3 +878,26 @@ def test_entrypoints_mark_themselves_undumpable():
 
     assert "make_undumpable()" in inspect.getsource(worker.main.main)
     assert "make_undumpable()" in inspect.getsource(gateway.app.__getattr__)
+
+
+# ------------------------------------------------------------------ S11: the image installs a hashed lock
+
+def test_image_installs_the_hashed_runtime_lock():
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    docker = (root / "infra" / "Dockerfile.api").read_text()
+    assert "pip install --require-hashes --no-deps -r requirements/runtime.lock" in docker
+    lock = (root / "requirements" / "runtime.lock").read_text()
+    pins = dict(re.findall(r"^([A-Za-z0-9_.-]+)==([^\s\\]+) \\$", lock, re.M))
+    blocks = re.split(r"\n(?=[A-Za-z0-9_.-]+==)", lock.split("\n", 6)[-1].strip())
+    assert all("--hash=sha256:" in b for b in blocks) and len(blocks) == len(pins) > 50
+    wanted = ["curatorkit", "fastapi", "uvicorn", "httpx", "pydantic", "mcp", "prometheus-client", "psycopg",
+              "psycopg-pool", "redis", "huggingface-hub", "pyarrow", "jsonschema", "openai", "scipy", "tqdm"]
+    assert [w for w in wanted if w not in pins] == []
+    assert pins["curatorkit"] == "0.1.23" and "datasets" not in pins  # B10: the image has no `datasets`
+    ci = (root / ".github" / "workflows" / "ci.yml").read_text()
+    assert "pip-audit -r requirements/runtime.lock" in ci
+    dependabot = (root / ".github" / "dependabot.yml").read_text()
+    for eco in ("pip", "npm", "github-actions", "docker"):
+        assert f"package-ecosystem: {eco}" in dependabot
