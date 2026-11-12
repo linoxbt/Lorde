@@ -241,16 +241,13 @@ def main() -> None:
     max_rows = job.get("max_rows")
     quota_rows = job.get("quota_rows")  # the org's daily quota allows judging only this many rows
     langs: dict[int, str] = {}
-    if job.get("input_path"):
-        try:
-            stamped, n_rows = stamp_ids(Path(job["input_path"]), job.get("format", "jsonl"), job_dir, max_rows, langs,
-                                        keep=quota_rows)
-        except TooManyRows as e:
-            print(f"error: {e}", file=sys.stderr)
-            sys.exit(3)
-        dataset = str(stamped)
-    else:
-        dataset, n_rows = job["hf_dataset"], -1  # Hub datasets: CuratorKIT reads at most max_rows samples
+    try:  # uploads and Hub files alike arrive as a local file (whole Hub repos are refused: audit 2, B10)
+        stamped, n_rows = stamp_ids(Path(job["input_path"]), job.get("format", "jsonl"), job_dir, max_rows, langs,
+                                    keep=quota_rows)
+    except TooManyRows as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(3)
+    dataset = str(stamped)
     samples = max_rows if quota_rows is None else min(x for x in (max_rows, quota_rows) if x is not None)
     concurrency = max(1, int(job.get("judge_concurrency") or 16))
 

@@ -153,7 +153,7 @@ With `DATABASE_URL` (Supabase Postgres) and storage (`SUPABASE_URL` + `SUPABASE_
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/v1/uploads` | signed upload URL for a JSONL/CSV/Parquet dataset (≤ 200 MB) · scope `jobs:write` |
-| POST | `/v1/jobs` | `{upload_id \| dataset_url: "hf://datasets/..", gates, options}` · ≤ 3 queued or running per org |
+| POST | `/v1/jobs` | `{upload_id \| dataset_url: "hf://datasets/<owner>/<name>/<file>.jsonl", gates, options}` · ≤ 3 queued or running per org |
 | GET | `/v1/jobs/{id}`, `/v1/jobs/{id}/results` | status and counts; signed URLs for passed, rejected, report, manifest, provenance |
 | POST | `/v1/jobs/{id}/cancel` | queued jobs stop at once; running jobs are stopped by the worker within one heartbeat |
 | GET | `/v1/usage` | usage by day, key and endpoint · scope `usage:read` |

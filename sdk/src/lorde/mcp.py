@@ -48,7 +48,7 @@ def build(api_key: str | None = None, base_url: str | None = None):
               annotations=ToolAnnotations.model_validate({"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False,
                                           "openWorldHint": True}),
               description="Start a CuratorKIT gating job on an uploaded dataset (upload_id from POST /v1/uploads) "
-                          "or a Hub dataset (dataset_url hf://datasets/<owner>/<name>). Gates are thresholds (0-1) "
+                          "or one file of a Hub dataset (dataset_url hf://datasets/<owner>/<name>/<file>.jsonl|.csv|.parquet). Gates are thresholds (0-1) "
                           "or null to disable. Confirm with the user before starting: jobs consume quota.")
     async def create_job(upload_id: str | None = None, dataset_url: str | None = None,
                          grounding: float | None = 0.7, reward: float | None = 0.7) -> dict[str, Any]:

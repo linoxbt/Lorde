@@ -23,7 +23,15 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .db import job_view
-from .errors import Conflict, InvalidRequest, LordeError, NotFound, PayloadTooLarge, RateLimited
+from .errors import (
+    Conflict,
+    InvalidRequest,
+    LordeError,
+    NotFound,
+    PayloadTooLarge,
+    RateLimited,
+    UnsupportedDataset,
+)
 from .keys import ApiKey
 
 if TYPE_CHECKING:
@@ -32,6 +40,7 @@ if TYPE_CHECKING:
 NotConfigured = type("NotConfigured", (LordeError,), {"status": 503, "code": "not_configured"})
 FORMATS = {".jsonl": "jsonl", ".json": "jsonl", ".csv": "csv", ".parquet": "parquet"}
 HF_DATASET = re.compile(r"^hf://datasets/[\w.-]+/[\w.-]+(/[\w./-]+)?$")
+HF_FILE = re.compile(r"^hf://datasets/[\w.-]+/[\w.-]+/[\w./-]*[\w-]\.(jsonl|json|csv|parquet)$")
 IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 
 
@@ -62,7 +71,7 @@ class Options(BaseModel):
 class JobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     upload_id: uuid.UUID | None = None
-    dataset_url: str | None = Field(None, description="hf://datasets/<owner>/<name>[/<file>]")
+    dataset_url: str | None = Field(None, description="hf://datasets/<owner>/<name>/<file>.(jsonl|json|csv|parquet)")
     # defaults come from Field(); mypy runs without the pydantic plugin, hence the ignore
     gates: Gates = Gates()  # type: ignore[call-arg]
     options: Options = Options()
@@ -112,6 +121,12 @@ async def submit_job(gw: Gateway, key: ApiKey, req: JobRequest, idempotency_key:
 
     if await jobs.active_jobs(key.org_id) >= gw.s.max_active_jobs:  # fast path; re-checked under the lock
         raise busy_jobs()
+    if req.dataset_url and not HF_FILE.match(req.dataset_url):
+        # Audit 2 (B10): a whole Hub repo needs CuratorKIT's HuggingFaceReader and the `datasets` library, which the
+        # production image does not install (and whose download size the worker cannot bound before it starts).
+        raise UnsupportedDataset("dataset_url must name one file in the Hub dataset repo: "
+                                 "hf://datasets/<owner>/<name>/<path>.jsonl (or .json, .csv, .parquet); "
+                                 "whole repos (hf://datasets/<owner>/<name>) are not supported")
     if (lim := gw.s.org_daily_judgments) > 0:  # a job cannot start on a used-up daily quota (audit N1b)
         used = max(await gw.quota.used(key.org_id), await jobs.judgments_today(key.org_id))
         if used >= lim:

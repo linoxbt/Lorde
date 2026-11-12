@@ -226,6 +226,79 @@ def test_0008_applies_on_the_production_order_and_is_rerunnable():
             c.execute(f"drop database {name} with (force)")
 
 
+# ------------------------------------------------------------------ B10, B17: Hub datasets
+
+@pg
+def test_whole_hub_repos_are_refused_at_creation_and_in_the_worker(env):
+    """B10: the API image has no `datasets` library, so a repo-only dataset_url can never run: 422 up front."""
+    from test_gateway import mcp_call
+
+    from gateway.jobs import HF_FILE
+
+    clear_jobs(env)
+    h = env["keys"]["all"]
+    with TestClient(create_app(env["s"])) as c:
+        for url in ("hf://datasets/Oxlino/lorde-data", "hf://datasets/Oxlino/lorde-data/splits"):
+            r = c.post("/v1/jobs", headers=h, json={"dataset_url": url})
+            assert r.status_code == 422 and r.json()["error"]["code"] == "unsupported_dataset", r.text
+        r = mcp_call(c, h, "tools/call", {"name": "lorde_create_gating_job",
+                                          "arguments": {"dataset_url": "hf://datasets/a/b"}}).json()
+        assert r["result"]["isError"] and "unsupported_dataset: " in r["result"]["content"][0]["text"]
+        r = c.post("/v1/jobs", headers=h, json={"dataset_url": "hf://datasets/a/b/data/train.jsonl"})
+        assert r.status_code == 201
+    assert HF_FILE.match("hf://datasets/a/b/x.parquet") and not HF_FILE.match("hf://datasets/a/b/x.txt")
+    clear_jobs(env)
+    with db(env) as c:  # queued before the Gateway refused them: the worker fails it with the same advice
+        jid = c.execute("insert into jobs (org_id, config) values (%s, %s) returning id",
+                        (env["org"], json.dumps({"gates": {"grounding": 0.7, "reward": None}, "options": {},
+                                                 "source": {"dataset_url": "hf://datasets/a/b"}}))).fetchone()[0]
+    from test_jobs import work
+
+    assert run_one(work(env)) is True
+    status, error, *_ = job_state(env, jid)
+    assert status == "failed" and "whole Hub dataset repo is not supported" in error
+
+
+def test_hub_file_size_is_checked_before_download_and_the_revision_is_pinned(tmp_path, monkeypatch):
+    """B17: the size comes from Hub metadata at a resolved commit, before any download; the download is pinned to
+    that commit."""
+    import huggingface_hub
+
+    from worker.main import InputRejected
+
+    calls: dict = {"download": []}
+
+    class FakeApi:
+        def __init__(self, token=None):
+            assert token is False
+
+        def dataset_info(self, repo, **kw):
+            return type("Info", (), {"sha": "c0ffee"})()
+
+        def get_paths_info(self, repo, paths, repo_type=None, revision=None):
+            calls["revision"] = revision
+            return [type("F", (), {"path": paths[0], "size": calls["size"]})()]
+
+    def fake_download(repo, filename, repo_type=None, revision=None, local_dir=None, token=None):
+        calls["download"].append(revision)
+        out = tmp_path / "dl.jsonl"
+        out.write_text('{"instruction": "q", "output": "a"}\n')
+        return str(out)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    w = Worker(Settings(database_url="postgresql://unused/x", storage_dir=str(tmp_path / "st"), key_pepper="p" * 40),
+               work_dir=str(tmp_path / "w"))
+    job = {"org_id": uuid.uuid4(), "config": {"source": {"dataset_url": "hf://datasets/o/n/d.jsonl"}}}
+    calls["size"] = w.s.job_max_input_bytes + 1
+    with pytest.raises(InputRejected, match="MB; the limit is"):
+        asyncio.run(w.fetch_input(job, tmp_path))
+    assert calls["download"] == [] and calls["revision"] == "c0ffee"  # refused before downloading anything
+    calls["size"] = 10
+    out = asyncio.run(w.fetch_input(job, tmp_path))
+    assert calls["download"] == ["c0ffee"] and out["hf_revision"] == "c0ffee" and out["format"] == "jsonl"
+
+
 def test_default_job_row_cap_fits_the_time_limit_on_one_cpu_slot():
     s = Settings()
     assert s.job_max_rows * 2 * 30 <= s.job_max_seconds  # 2 gates x 30 s per judgment, worst case on CPU

@@ -270,21 +270,26 @@ class Worker:
             return {"input_path": str(local), "format": fmt}
         parts = src["dataset_url"].removeprefix("hf://datasets/").split("/", 2)
         repo = f"{parts[0]}/{parts[1]}"
-        size = await asyncio.to_thread(hf_size, repo, parts[2] if len(parts) == 3 else None)
+        if len(parts) < 3:  # audit 2 (B10): the Gateway refuses these now; jobs queued before fail clearly
+            raise InputRejected("a whole Hub dataset repo is not supported: name one file, "
+                                "hf://datasets/<owner>/<name>/<path>.jsonl (or .csv, .parquet)")
+        # Audit 2 (B17): the size comes from the Hub's file metadata before anything downloads, and the download is
+        # pinned to the commit that metadata was read at, so a push in between cannot swap in a bigger file.
+        revision, size = await asyncio.to_thread(hf_file_info, repo, parts[2])
+        if size is None:
+            raise InputRejected(f"{parts[2]} is not a file in the public Hub dataset {repo}")
         if size > cap:
-            raise InputRejected(f"Hub dataset {repo} is {size // (1024 * 1024)} MB; the limit is "
+            raise InputRejected(f"Hub dataset file {repo}/{parts[2]} is {size // (1024 * 1024)} MB; the limit is "
                                 f"{cap // (1024 * 1024)} MB")
-        if len(parts) == 3:  # a file inside a Hub dataset repo
-            from huggingface_hub import hf_hub_download
+        from huggingface_hub import hf_hub_download
 
-            # token=False: tenants only ever reach public datasets, never what the operator's token can see
-            local = Path(await asyncio.to_thread(hf_hub_download, repo, parts[2], repo_type="dataset",
-                                                 local_dir=str(job_dir), token=False))
-            if local.stat().st_size > cap:
-                raise InputRejected(f"dataset file is larger than {cap // (1024 * 1024)} MB")
-            fmt = {".csv": "csv", ".parquet": "parquet"}.get(local.suffix, "jsonl")
-            return {"input_path": str(local), "format": fmt}
-        return {"hf_dataset": repo}
+        # token=False: tenants only ever reach public datasets, never what the operator's token can see
+        local = Path(await asyncio.to_thread(hf_hub_download, repo, parts[2], repo_type="dataset", revision=revision,
+                                             local_dir=str(job_dir), token=False))
+        if local.stat().st_size > cap:
+            raise InputRejected(f"dataset file is larger than {cap // (1024 * 1024)} MB")
+        fmt = {".csv": "csv", ".parquet": "parquet"}.get(local.suffix, "jsonl")
+        return {"input_path": str(local), "format": fmt, "hf_revision": revision}
 
     async def run(self, job: dict) -> None:
         jid, org = str(job["id"]), str(job["org_id"])
@@ -333,8 +338,7 @@ class Worker:
         source = await self.fetch_input(job, job_dir)
         from worker.run_job import count_rows
 
-        rows = (await asyncio.to_thread(count_rows, Path(source["input_path"]), source["format"])
-                if source.get("input_path") else self.s.job_max_rows)
+        rows = await asyncio.to_thread(count_rows, Path(source["input_path"]), source["format"])
         if rows > self.s.job_max_rows:
             raise InputRejected(f"dataset has more than {self.s.job_max_rows} rows (LORDE_JOB_MAX_ROWS); "
                                 "split it into smaller jobs")
@@ -429,8 +433,9 @@ class Worker:
                 "judge_concurrency": self.s.worker_judge_concurrency, "max_rows": self.s.job_max_rows,
                 "quota_rows": quota_rows, **source}
         (job_dir / "job.json").write_text(json.dumps(spec, default=str))
+        started = {"progress": "running", **({"hf_revision": source["hf_revision"]} if "hf_revision" in source else {})}
         if not await self.q("update jobs set counts = counts || %s where id=%s and locked_by=%s returning id",
-                            (Jsonb({"progress": "running"}), jid, self.id)):
+                            (Jsonb(started), jid, self.id)):
             raise JobAbort("lost the job lease before starting")
 
         proc = await asyncio.create_subprocess_exec(
@@ -609,16 +614,18 @@ async def stop_process(proc: asyncio.subprocess.Process, grace_s: float = 5.0) -
         await proc.wait()
 
 
-def hf_size(repo: str, path: str | None) -> int:
-    """Bytes of a public Hub dataset file, or of every file in the repo (checked before anything downloads)."""
+def hf_file_info(repo: str, path: str) -> tuple[str, int | None]:
+    """(commit sha, bytes) of one file in a public Hub dataset, from metadata only (nothing is downloaded).
+    Bytes is None when ``path`` is not a file at that commit."""
     from huggingface_hub import HfApi
 
     api = HfApi(token=False)
-    if path:
-        infos = api.get_paths_info(repo, [path], repo_type="dataset")
-        return sum(getattr(i, "size", 0) or 0 for i in infos)
-    info = api.dataset_info(repo, files_metadata=True)
-    return sum((f.size or 0) for f in (info.siblings or []))
+    sha = api.dataset_info(repo).sha
+    if not sha:
+        raise InputRejected(f"could not resolve the current revision of the Hub dataset {repo}")
+    infos = api.get_paths_info(repo, [path], repo_type="dataset", revision=sha)
+    sizes = [getattr(i, "size", None) for i in infos if getattr(i, "path", None) == path]
+    return sha, next((int(x) for x in sizes if x is not None), None)
 
 
 def main() -> None:

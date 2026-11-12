@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     jb = sub.add_parser("jobs", help="gating jobs over whole datasets")
     jbs = jb.add_subparsers(dest="action", required=True)
     jc = jbs.add_parser("create", help="upload a dataset and gate it")
-    jc.add_argument("dataset", help="local .jsonl/.csv/.parquet file, or hf://datasets/<owner>/<name>")
+    jc.add_argument("dataset", help="local .jsonl/.csv/.parquet file, or hf://datasets/<owner>/<name>/<file>")
     jc.add_argument("--grounding", type=float, default=0.7)
     jc.add_argument("--reward", type=float, default=0.7)
     jc.add_argument("--no-grounding", action="store_true")
