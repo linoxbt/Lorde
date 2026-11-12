@@ -19,7 +19,7 @@ export default async function Jobs(props: PageProps<"/console/jobs">) {
   return (
     <>
       <AutoRefresh active={active && ws.mode === "live"} every={10_000} />
-      <PageHeader title="Jobs" lead="Gating jobs run CuratorKIT with Lorde as the judge. Three can be queued or running at once."
+      <PageHeader title="Jobs" lead="Gating jobs run CuratorKIT with Lorde as the judge. A few can be queued or running at once (the Gateway's limit); beyond it, a new job is refused until one finishes."
         actions={<LinkButton href="/console/jobs/new" size="sm">New job</LinkButton>} />
       {jobs.total === 0 ? (
         <Empty title="No jobs yet">Upload a dataset, then start a job to get passed rows, rejected rows with reasons, and provenance.</Empty>
