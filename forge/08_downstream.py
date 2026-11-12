@@ -78,6 +78,18 @@ def trained(out: Path, sha: str, trust_legacy: bool) -> tuple[bool, str]:
     return (True, "same gated data") if meta["data_sha"] == sha else (False, "the gated data changed")
 
 
+def gated_set_ok(name: str, trust_legacy: bool) -> tuple[bool, str]:
+    """Was data/gated/<set>/passed.jsonl gated from the current raw set? (its sidecar, written by step 7)"""
+    meta = fingerprint.read_meta(config.DATA / "gated" / name / "passed.jsonl")
+    raw = jsonl.read(config.DATA / "downstream_raw.jsonl")
+    if not meta or not meta.get("raw_sha"):
+        return (True, "legacy gated set, trusted") if trust_legacy else (
+            False, "gated set without a raw-set fingerprint (re-run step 7, or --trust-legacy-cache)")
+    if raw and meta["raw_sha"] != fingerprint.rows_sha(raw, ("instruction", "input", "output")):
+        return False, "gated from another raw set than data/downstream_raw.jsonl: re-run step 7"
+    return True, "gated from the current raw set"
+
+
 def stage_train(args) -> None:
     from transformers import AutoTokenizer
 
@@ -94,6 +106,9 @@ def stage_train(args) -> None:
         rows = jsonl.read(config.DATA / "gated" / s / "passed.jsonl")
         if not rows:
             sys.exit(f"no gated set for {s}: run forge/07_curatorkit_plugin.py first")
+        ok, why = gated_set_ok(s, args.trust_legacy_cache)
+        if not ok:
+            sys.exit(f"[downstream] {s}: {why}")
         if n_equal:
             rows = sorted(rows, key=lambda r: variants.rng_for("eq", r["uid"]).random())[:n_equal]
         if args.max_rows and len(rows) > args.max_rows:
