@@ -5,8 +5,8 @@ auditkit==1.1.6                  # LSAL v1.2; per-sample scoring and significanc
 litellm==1.108.3
 openai==3.48.0
 pydantic==2.14.3
-datasets==5.1.0
-scipy==1.17.1
+datasets==5.2.0
+scipy==1.18.1
 jsonschema==4.26.0
 tqdm==4.70.1
 huggingface_hub==1.33.0
