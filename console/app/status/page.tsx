@@ -6,7 +6,7 @@ import { PageHero } from "@/components/site/page-hero";
 import { StatusBoard } from "@/components/site/status-board";
 import { Container } from "@/components/ui";
 
-export const metadata: Metadata = { title: "Status", description: "Gateway, model and job queue health." };
+export const metadata: Metadata = { title: "Status", description: "Gateway, model server and database checks." };
 
 export default function Status() {
   return (
