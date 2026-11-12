@@ -1,4 +1,4 @@
--- Fixes after the second full audit (12 Nov 2026): B3/S2, S3, S5. Applied once, in one transaction.
+-- Fixes after the second full audit (12 Nov 2026): B3/S2, S3, S5, B17. Applied once, in one transaction.
 -- 0001-0007 are applied in production (0006 before 0005). Everything here is CREATE OR REPLACE, ALTER ... IF
 -- [NOT] EXISTS, DROP ... IF EXISTS or guarded by a catalog check, so it is correct after either order and
 -- safe to run again.
@@ -198,3 +198,23 @@ revoke execute on function public.create_invite(uuid, text, org_role), public.my
   public.accept_invite(uuid) from public, anon;
 grant execute on function public.create_invite(uuid, text, org_role), public.my_invites(),
   public.accept_invite(uuid) to authenticated;
+
+-- --------------------------------------------------------------------------------------------- B17
+-- At most 20 active (unrevoked) API keys per organization, whoever creates them (Console, CLI, SQL). A per-org
+-- advisory lock makes concurrent inserts count one after another. Revoke a key to make room.
+create or replace function public.api_keys_org_cap() returns trigger
+  language plpgsql security definer set search_path = public, pg_temp as
+$$
+begin
+  perform pg_advisory_xact_lock(hashtextextended('lorde.api_keys:' || new.org_id::text, 0));
+  if (select count(*) from api_keys where org_id = new.org_id and revoked_at is null) >= 20 then
+    raise exception 'an organization can have at most 20 active API keys; revoke one first'
+      using errcode = '54000', hint = 'api_key_limit';
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists api_keys_org_cap on public.api_keys;
+create trigger api_keys_org_cap before insert on public.api_keys
+  for each row execute function public.api_keys_org_cap();
+revoke execute on function public.api_keys_org_cap() from public, anon, authenticated;

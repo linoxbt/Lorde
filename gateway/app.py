@@ -42,6 +42,7 @@ from .errors import (
     InternalError,
     InvalidRequest,
     LordeError,
+    MethodNotAllowed,
     NotFound,
     PayloadTooLarge,
     QuotaExceeded,
@@ -504,15 +505,33 @@ class RequestContext:
 class McpAuth:
     """Only /mcp reaches the MCP transport (the key was checked by RequestContext; tools check scopes)."""
 
-    def __init__(self, app: Any, gw: Gateway) -> None:
-        self.app, self.gw = app, gw
+    def __init__(self, app: Any, gw: Gateway, routes: list | None = None) -> None:
+        self.app, self.gw, self.routes = app, gw, routes if routes is not None else []
+
+    def allowed(self, scope) -> list[str]:
+        """Methods of the API routes whose path matches (a wrong method reaches this mount, not a 405)."""
+        from starlette.routing import Match, Route
+
+        methods: set[str] = set()
+        todo = list(self.routes)
+        while todo:
+            r = todo.pop()
+            if hasattr(r, "original_router"):  # FastAPI's included router (jobs.py; included without a prefix)
+                todo.extend(r.original_router.routes)
+            elif (isinstance(r, Route) and r.methods and r.path != "/metrics"  # /metrics stays hidden (404)
+                  and r.matches(scope)[0] is Match.PARTIAL):
+                methods |= set(r.methods)
+        return sorted(methods)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             rid = scope.get("state", {}).get("request_id", "")
             if scope["path"].rstrip("/") != "/mcp":
-                err = NotFound("no such route")
-                return await JSONResponse(body(err, rid), status_code=404)(scope, receive, send)
+                allow = self.allowed(scope)
+                err = (MethodNotAllowed(f"{scope['method']} is not allowed here; use {', '.join(allow)}",
+                                        headers={"Allow": ", ".join(allow)}) if allow else NotFound("no such route"))
+                return await JSONResponse(body(err, rid), status_code=err.status, headers=err.headers)(
+                    scope, receive, send)
             headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
             try:
                 await self.gw.authenticate(headers, scope=None, state=scope.get("state"))
@@ -575,10 +594,15 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request: Request, e: StarletteHTTPException):
-        err = NotFound("no such route") if e.status_code == 404 else InvalidRequest(str(e.detail))
-        if e.status_code not in (404,):
+        err: LordeError
+        if e.status_code == 404:
+            err = NotFound("no such route")
+        elif e.status_code == 405:
+            err = MethodNotAllowed(f"{request.method} is not allowed here", headers=dict(e.headers or {}))
+        else:
+            err = InvalidRequest(str(e.detail))
             err.status = e.status_code
-        return JSONResponse(body(err, rid(request)), status_code=err.status)
+        return JSONResponse(body(err, rid(request)), status_code=err.status, headers=err.headers)
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, e: Exception):
@@ -696,7 +720,8 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
     from .jobs import build_router
 
     app.include_router(build_router(gw, need))
-    app.mount("/", McpAuth(mcp_app, gw))  # after every route: only /mcp reaches the MCP transport
+    # after every route: only /mcp reaches the MCP transport; a known path with the wrong method gets a 405
+    app.mount("/", McpAuth(mcp_app, gw, list(app.router.routes)))
     outer: Any = RequestContext(app, gw)
     if s.allowed_origins:  # outermost, so errors raised by RequestContext (401, 413) carry CORS headers too
         outer = CORSMiddleware(outer, allow_origins=s.allowed_origins, allow_methods=["GET", "POST", "PUT", "OPTIONS"],

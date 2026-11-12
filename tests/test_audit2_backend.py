@@ -975,3 +975,98 @@ def test_promote_refuses_unpromotable_models_and_stores_fingerprints(env, monkey
         c.execute("update model_versions set state='retired'")
     assert detail["promotable"] is False and detail["forced"].startswith("demo needs") and len(detail["failing"]) == 2
     assert fps["source"].startswith("installed CuratorKIT")  # forced without fingerprints: marked as such
+
+
+# ------------------------------------------------------------------ B17: smaller bugs
+
+def test_wrong_method_is_a_405_envelope_with_allow(tmp_path):
+    app, h, _ = gateway_app(tmp_path)
+    with TestClient(app) as c:
+        r = c.get("/v1/judge/reward", headers=h)
+        e = r.json()["error"]
+        assert r.status_code == 405 and e["code"] == "method_not_allowed" and r.headers["allow"] == "POST"
+        assert e["request_id"] == r.headers["x-request-id"]
+        r = c.post("/healthz")
+        assert r.status_code == 405 and r.headers["allow"] == "GET"
+        r = c.request("DELETE", f"/v1/jobs/{uuid.uuid4()}", headers=h)
+        assert r.status_code == 405 and r.headers["allow"] == "GET"
+        assert c.post("/metrics").status_code == 404  # stays hidden
+        assert c.get("/v1/nope", headers=h).status_code == 404
+
+
+def unparseable_upstream():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "lorde"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "I cannot judge this."}}],
+                                         "usage": {"prompt_tokens": 5, "completion_tokens": 3}})
+    return httpx.MockTransport(handler)
+
+
+def test_unparseable_replies_are_charged_and_metered_alike(tmp_path):
+    """B17: an unparseable reply used the model, so it is charged; it is now also metered (it was metered 0)."""
+    from test_gateway import PEPPER, mcp_call
+
+    from gateway.keys import KeyStore
+
+    s = Settings(key_pepper=PEPPER, keys_file=str(tmp_path / "keys.json"), usage_file=str(tmp_path / "u.jsonl"),
+                 model_revision="v1.0.0", vllm_base_url="http://vllm/v1", redis_url=None, org_daily_judgments=100)
+    key, _ = KeyStore(s.keys_file, PEPPER).create("t", "orgU", ["judge"], 6000)
+    h = {"Authorization": f"Bearer {key}"}
+    app = create_app(s, transport=unparseable_upstream())
+    body = {"instruction": "Explain X", "response": "X is a thing."}
+    with TestClient(app) as c:
+        r = c.post("/v1/judge/reward", headers=h, json=body)
+        assert r.status_code == 422 and r.json()["error"]["code"] == "judge_unparseable"
+        r = c.post("/v1/judge/batch", headers=h, json={"kind": "reward", "items": [body] * 3})
+        assert r.status_code == 200 and r.json()["summary"]["errors"] == 3
+        r = mcp_call(c, h, "tools/call", {"name": "lorde_judge_reward", "arguments": body}).json()
+        assert "judge_unparseable" in r["result"]["content"][0]["text"]
+    usage = [json.loads(x) for x in (tmp_path / "u.jsonl").read_text().splitlines()]  # flushed at shutdown
+    assert app.gw.quota.used_sync("orgU") == 5
+    assert sum(u["judgments"] for u in usage) == 5  # quota and metering agree
+
+
+def test_refunds_after_midnight_go_to_the_day_that_was_charged(tmp_path, monkeypatch):
+    """B17: a judgment spent at 23:59:59 and refunded after midnight used to be refunded on the new day's counter
+    (clamped at 0), leaving the old day overcharged. The refund now names the day that was charged."""
+    from test_gateway import PEPPER, stub_vllm
+
+    import gateway.app as gapp
+    from gateway.keys import KeyStore
+    from gateway.quota import LocalQuota
+
+    s = Settings(key_pepper=PEPPER, keys_file=str(tmp_path / "keys.json"), usage_file=str(tmp_path / "u.jsonl"),
+                 model_revision="v1.0.0", vllm_base_url="http://vllm/v1", redis_url=None, org_daily_judgments=100)
+    key, _ = KeyStore(s.keys_file, PEPPER).create("t", "orgM", ["judge"], 6000)
+    monkeypatch.setattr(gapp, "utc_day", lambda now=None: "19991231")  # the Gateway spends on "yesterday"
+    failing = create_app(s, transport=stub_vllm(fail=True))  # Serve 5xx: the judgment is refunded
+    with TestClient(failing) as c:
+        r = c.post("/v1/judge/reward", headers={"Authorization": f"Bearer {key}"},
+                   json={"instruction": "i", "response": "r"})
+        assert r.status_code == 503
+    q = failing.gw.quota
+    assert q._used == {("orgM", "19991231"): 0}  # spent and refunded on the same day; today's counter untouched
+    lq = LocalQuota()  # and the worker's settlement: reserve on one day, settle on it after midnight
+    assert lq.take_sync("o", 10, 100, day="19991231") == (True, 10)
+    assert lq.add_sync("o", -7, day="19991231") == 3 and lq.used_sync("o") == 0
+
+
+@pg
+def test_at_most_20_active_api_keys_per_org(sqldb):
+    from test_supabase_sql import admin, as_user, signup
+
+    owner, org = signup(sqldb, "keys20@x.io")
+    with admin(sqldb) as c:
+        as_user(c, owner)
+        for i in range(20):
+            c.execute("insert into api_keys (org_id, name, prefix, key_hash) values (%s, 'k', %s, 'h')",
+                      (org, f"lorde_sk_K20{i:05d}"))
+        with pytest.raises(psycopg.errors.ProgramLimitExceeded, match="at most 20 active API keys"):
+            c.execute("insert into api_keys (org_id, name, prefix, key_hash) values (%s, 'k', 'lorde_sk_K20xxxxx', 'h')",
+                      (org,))
+    with admin(sqldb) as c:
+        as_user(c, owner)
+        c.execute("update api_keys set revoked_at = now() where prefix = 'lorde_sk_K2000000'")
+        c.execute("insert into api_keys (org_id, name, prefix, key_hash) values (%s, 'k', 'lorde_sk_K20yyyyy', 'h')",
+                  (org,))  # a revoked key frees a place
