@@ -117,7 +117,7 @@ test("the five Supabase email templates link to /auth/confirm with a token_hash 
     const html = readFileSync(new URL(file, dir), "utf8");
     assert.match(html, /Subject: \S/, `${file} names its subject`);
     assert.doesNotMatch(html, /ConfirmationURL/, `${file} must not use the PKCE {{ .ConfirmationURL }}`);
-    const hrefs = [...html.matchAll(/href="([^"]+)"/g)].map((m) => m[1]);
+    const hrefs = [...html.matchAll(/href="([^"]+)"/g)].map((m) => m[1]!);
     assert.ok(hrefs.length >= 1, file);
     for (const href of hrefs) {
       const url = new URL(href.replace(/\{\{ \.(\w+) \}\}/g, (_, k: keyof typeof vars) => vars[k]));

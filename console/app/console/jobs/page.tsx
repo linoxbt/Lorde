@@ -5,14 +5,15 @@ import { Empty, JobStatusBadge, PageHeader, Table } from "@/components/console/b
 import { LinkButton } from "@/components/ui";
 import { getWorkspace, JOBS_PER_PAGE, listJobs } from "@/lib/data";
 import { ago, nf, pct } from "@/lib/format";
+import { isPastEnd, pageCount, parsePage } from "@/lib/paging";
 
 export const metadata = { title: "Jobs" };
 
 export default async function Jobs(props: PageProps<"/console/jobs">) {
   const sp = await props.searchParams;
-  const page = Math.max(1, Number.parseInt(typeof sp.page === "string" ? sp.page : "1", 10) || 1) - 1;
+  const page = parsePage(sp.page);
   const [ws, jobs] = await Promise.all([getWorkspace(), listJobs(page)]);
-  const pages = Math.max(1, Math.ceil(jobs.total / JOBS_PER_PAGE));
+  const pages = pageCount(jobs.total, JOBS_PER_PAGE);
   const active = jobs.rows.some((j) => j.status === "queued" || j.status === "running");
   return (
     <>
@@ -21,6 +22,11 @@ export default async function Jobs(props: PageProps<"/console/jobs">) {
         actions={<LinkButton href="/console/jobs/new" size="sm">New job</LinkButton>} />
       {jobs.total === 0 ? (
         <Empty title="No jobs yet">Upload a dataset, then start a job to get passed rows, rejected rows with reasons, and provenance.</Empty>
+      ) : isPastEnd(page, jobs.total, JOBS_PER_PAGE) ? (
+        <Empty title={`Page ${page + 1} is past the end`}>
+          There {pages === 1 ? "is 1 page" : `are ${pages} pages`} of jobs ({nf.format(jobs.total)} in all).{" "}
+          <Link href={pages > 1 ? `?page=${pages}` : "/console/jobs"} className="text-accent hover:underline">Go to the last page</Link>
+        </Empty>
       ) : (
         <>
           <Table head={["Job", "Dataset", "Gates", "Status", "Rows", "Passed", "Pass rate", "Created"]} minWidth={860}>

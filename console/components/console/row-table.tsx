@@ -5,6 +5,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTransition } from "react";
 
 import { DecisionBadge, Table } from "@/components/console/bits";
+import { isPastEnd, pageCount } from "@/lib/paging";
 import type { Judgment, JudgmentFilters } from "@/lib/types";
 
 /** Judgment rows, filtered and paginated on the server: filters live in the URL (?gate=&decision=&lang=&page=). */
@@ -21,7 +22,8 @@ export function RowTable({ rows, total, filters, langs, perPage, storeContent }:
     return s ? `${pathname}?${s}` : pathname;
   };
   const set = (k: string, v: string) => start(() => router.push(href({ [k]: v, page: null }), { scroll: false }));
-  const pages = Math.max(1, Math.ceil(total / perPage));
+  const pages = pageCount(total, perPage);
+  const pastEnd = isPastEnd(filters.page, total, perPage);
   const page = Math.min(filters.page, pages - 1);
   const sel = "h-9 rounded-full border border-line bg-white px-3 text-[13px]";
   return (
@@ -55,7 +57,13 @@ export function RowTable({ rows, total, filters, langs, perPage, storeContent }:
             {storeContent && <td className="max-w-[320px] truncate px-4 py-2.5 text-muted">{r.preview ?? "–"}</td>}
           </tr>
         ))}
-        {!rows.length && <tr><td colSpan={storeContent ? 7 : 6} className="px-4 py-6 text-center text-muted">No rows match these filters.</td></tr>}
+        {!rows.length && (
+          <tr><td colSpan={storeContent ? 7 : 6} className="px-4 py-6 text-center text-muted">
+            {pastEnd
+              ? <>Page {filters.page + 1} is past the end ({pages} {pages === 1 ? "page" : "pages"}). <Link scroll={false} href={href({ page: pages > 1 ? String(pages) : null })} className="text-accent hover:underline">Go to the last page</Link></>
+              : "No rows match these filters."}
+          </td></tr>
+        )}
       </Table>
       <nav aria-label="Pages" className="mt-3 flex items-center justify-end gap-2 text-[13px]">
         {page > 0

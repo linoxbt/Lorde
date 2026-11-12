@@ -8,6 +8,7 @@ import { RowTable } from "@/components/console/row-table";
 import { Card } from "@/components/ui";
 import { getJob, getWorkspace, jobStats, judgmentsPage, ROWS_PER_PAGE } from "@/lib/data";
 import { nf, pct, when } from "@/lib/format";
+import { parsePage } from "@/lib/paging";
 import type { JudgmentFilters } from "@/lib/types";
 
 export const metadata = { title: "Job" };
@@ -16,7 +17,7 @@ const one = (v: string | string[] | undefined) => (typeof v === "string" ? v : u
 
 function filtersFrom(sp: Record<string, string | string[] | undefined>): JudgmentFilters {
   const gate = one(sp.gate), decision = one(sp.decision), lang = one(sp.lang);
-  const page = Math.max(1, Math.min(100_000, Number.parseInt(one(sp.page) ?? "1", 10) || 1)) - 1;
+  const page = parsePage(one(sp.page));
   return {
     gate: gate === "reward" || gate === "grounding" ? gate : undefined,
     decision: decision === "pass" || decision === "reject" || decision === "none" ? decision : undefined,

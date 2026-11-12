@@ -51,3 +51,15 @@ test("job detail filters rows", async ({ page }) => {
   await expect(decisions.first()).toContainText("Reject");
   expect(await decisions.filter({ hasText: "Pass" }).count()).toBe(0);
 });
+
+test("a page past the end is an empty page with a way back, not the error screen", async ({ page }) => {
+  const r = await page.goto("/console/jobs?page=999");
+  expect(r?.status()).toBe(200);
+  await expect(page.getByText("Page 999 is past the end")).toBeVisible();
+  await page.getByRole("link", { name: "Go to the last page" }).click();
+  await expect(page.locator("tbody tr").first()).toBeVisible();
+  await page.goto("/console/jobs/2b8e4d70-5a9c-4f13-8e62-1d7c3b9a0f02?page=5000");
+  await expect(page.getByText("Page 5000 is past the end")).toBeVisible();
+  await page.getByRole("link", { name: "Go to the last page" }).click();
+  await expect(page.locator("tbody td:nth-child(5)").first()).toBeVisible();
+});
