@@ -7,9 +7,9 @@ type Call = { method: string; path: string; query: Record<string, string>; body:
 const calls = async (): Promise<Call[]> => (await fetch(`${FAKE}/__calls`)).json();
 const reset = () => fetch(`${FAKE}/__reset`, { method: "POST" });
 
-/** Sign the browser in as the fake's "noorg" user (a session cookie in @supabase/ssr's format). */
-async function signIn(context: BrowserContext, baseURL: string) {
-  const c = await (await fetch(`${FAKE}/__session?user=noorg`)).json() as { name: string; value: string };
+/** Sign the browser in as one of the fake's users (a session cookie in @supabase/ssr's format). */
+async function signIn(context: BrowserContext, baseURL: string, user: "noorg" | "member" = "noorg") {
+  const c = await (await fetch(`${FAKE}/__session?user=${user}`)).json() as { name: string; value: string };
   await context.addCookies([{ name: c.name, value: c.value, url: baseURL }]);
 }
 
@@ -116,4 +116,80 @@ test("signed in: /signin forwards to next with its query string", async ({ conte
   expect(r.headers().location).toMatch(/\/console\/jobs\?page=2$/);
   const evil = await page.request.get("/signin?next=%2F%5Cevil.example", { maxRedirects: 0 });
   expect(new URL(evil.headers().location!, "http://x").pathname).toBe("/console");
+});
+
+test("an org member's Jobs list renders the real rows, pages through them, and survives a page past the end", async ({ context, baseURL, page }) => {
+  await signIn(context, baseURL!, "member");
+  await page.goto("/console/jobs");
+  await expect(page.getByText("Demo workspace")).toHaveCount(0);
+  await expect(page.getByText("30 jobs")).toBeVisible();
+  await expect(page.getByText("Page 1 of 2")).toBeVisible();
+  await expect(page.locator("tbody tr")).toHaveCount(25);
+  await expect(page.locator("tbody tr").first()).toContainText("support-answers.jsonl");
+  await expect(page.locator("tbody tr").first()).toContainText("Running");
+  await page.getByRole("link", { name: "Next" }).click();
+  await expect(page).toHaveURL(/\?page=2$/);
+  await expect(page.locator("tbody tr")).toHaveCount(5);
+  await expect(page.getByText("purged-batch.jsonl (deleted)")).toBeVisible();
+  await expect(page.getByText("acme/chat-pairs")).toBeVisible();
+  await expect(page.getByText("Hub dataset")).toHaveCount(0);
+  // PostgREST answers 416 PGRST103 past the last row: an empty page with a way back, not the error screen
+  const r = await page.goto("/console/jobs?page=3");
+  expect(r?.status()).toBe(200);
+  await expect(page.getByText("Page 3 is past the end")).toBeVisible();
+  await page.getByRole("link", { name: "Go to the last page" }).click();
+  await expect(page).toHaveURL(/\?page=2$/);
+  await expect(page.locator("tbody tr")).toHaveCount(5);
+  const jobCalls = (await calls()).filter((c) => c.path === "/rest/v1/jobs");
+  expect(jobCalls.some((c) => c.method === "HEAD"), "the total is recounted after a 416").toBe(true);
+  expect(jobCalls.every((c) => c.query.org_id === "eq.10000000-0000-4000-8000-000000000001")).toBe(true);
+});
+
+test("an org member's keys, datasets and job detail come from the database", async ({ context, baseURL, page }) => {
+  await signIn(context, baseURL!, "member");
+  await page.goto("/console/keys");
+  await expect(page.getByText("ci-pipeline")).toBeVisible();
+  await expect(page.locator("tr").filter({ hasText: "old-laptop" })).toContainText(/Revoked/i);
+
+  await page.goto("/console/datasets");
+  await expect(page.locator("tr").filter({ hasText: "support-answers.jsonl" }).getByText("Ready")).toBeVisible();
+  const expired = page.locator("tr").filter({ hasText: "old-batch.csv" });
+  await expect(expired.getByText("Expired")).toBeVisible();
+  await expect(expired.getByRole("link", { name: /Gate it/ })).toHaveCount(0);
+
+  await page.goto("/console/jobs/new?dataset=30000000-0000-4000-8000-000000000003", { waitUntil: "networkidle" });
+  await expect(page.locator("#ds option", { hasText: "old-batch.csv" })).toBeDisabled();
+  await expect(page.locator("#ds")).toHaveValue("30000000-0000-4000-8000-000000000001");
+
+  await page.goto("/console/jobs/20000000-0000-4000-8000-000000000002");
+  await expect(page.getByRole("heading", { name: "Job 20000000" })).toBeVisible();
+  await expect(page.getByText("policy-qa.parquet").first()).toBeVisible();
+
+  await page.goto("/console");
+  await expect(page.getByText("Acme Research").first()).toBeVisible();
+});
+
+test("the reset form recovers from a network error instead of sticking on Saving", async ({ context, baseURL, page }) => {
+  await signIn(context, baseURL!, "member");
+  await page.goto("/reset-password", { waitUntil: "networkidle" });
+  await page.getByLabel("New password", { exact: true }).fill("drop-the-connection");
+  await page.getByLabel("Confirm new password").fill("drop-the-connection");
+  await page.getByRole("button", { name: "Save password" }).click();
+  await expect(page.locator("p[role=alert]")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save password" })).toBeEnabled();
+});
+
+test("a PKCE email link opened in another browser says what to do next", async ({ request, page }) => {
+  // no code verifier cookie in this context: exactly a link opened on another device
+  const signup = await request.get("/auth/callback?code=abc&next=%2Fconsole&flow=signup", { maxRedirects: 0 });
+  expect(signup.headers().location).toMatch(/\/signin\?error=email_confirmed$/);
+  const magic = await request.get("/auth/callback?code=abc&next=%2Fconsole&flow=magiclink", { maxRedirects: 0 });
+  expect(magic.headers().location).toMatch(/\/signin\?error=other_browser$/);
+  const reset = await request.get("/auth/callback?code=abc&next=%2Freset-password", { maxRedirects: 0 });
+  expect(reset.headers().location).toMatch(/\/signin\?error=other_browser$/);
+  await page.goto("/signin?error=email_confirmed");
+  await expect(page.locator("p[role=status]").first()).toHaveText("Your email is confirmed: sign in to continue.");
+  await expect(page.locator("p[role=alert]")).toHaveCount(0);
+  await page.goto("/signin?error=other_browser");
+  await expect(page.locator("p[role=alert]")).toContainText("This link was opened in a different browser.");
 });
