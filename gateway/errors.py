@@ -46,7 +46,8 @@ InternalError = _make("InternalError", 500, "internal_error")
 
 
 # Quota spent on a judgment that never reached the model (or that Serve refused) is given back.
-REFUNDED = frozenset({"rate_limited", "model_unavailable", "invalid_request", "unavailable"})
+# client_disconnected marks batch items never started because the caller had gone (audit 2, B11).
+REFUNDED = frozenset({"rate_limited", "model_unavailable", "invalid_request", "unavailable", "client_disconnected"})
 
 
 def refundable(err: LordeError) -> bool:

@@ -69,7 +69,10 @@ class Settings:
     access_log: bool = field(default_factory=lambda: _env("LORDE_ACCESS_LOG", "1") == "1")
     allowed_origins: list[str] = field(default_factory=lambda: _csv("ALLOWED_ORIGINS"))
     default_threshold: float = field(default_factory=lambda: float(_env("LORDE_DEFAULT_THRESHOLD", "0.7")))
-    max_batch: int = field(default_factory=lambda: int(_env("LORDE_MAX_BATCH", "256")))
+    # Synchronous batches (REST and MCP) run their items one after another on the org's slot: at 15-30 s per
+    # judgment on CPU, 8 items take 2-4 minutes, about what clients wait for (SDK 60 s per attempt with retries,
+    # Console relay 120 s). Larger sets belong in a job. (Audit 2, B11: it was 256, i.e. 1-2 hours.)
+    max_batch: int = field(default_factory=lambda: int(_env("LORDE_MAX_BATCH", "8")))
     max_body_bytes: int = 5 * 1024 * 1024
     max_field_chars: int = 32_000
     max_source_chars: int = 24_000
@@ -80,7 +83,7 @@ class Settings:
     breaker_failures: int = 20
     breaker_window_s: float = 30.0
     max_temperature: float = 0.3
-    mcp_batch_limit: int = 64
+    mcp_batch_limit: int = 8              # MCP batches: at most this and max_batch
     key_cache_size: int = 10_000           # bounded LRU of key lookups (positive and negative, each)
     usage_queue_max: int = 10_000          # usage events held in memory while the database is unreachable
     database_url: str | None = field(default_factory=lambda: _env("DATABASE_URL"))

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pydantic import ValidationError
@@ -103,11 +104,13 @@ class JudgeService:
                         "completion_tokens": usage.get("completion_tokens", 0)}
 
     async def batch(self, kind: str, items: list[dict], threshold: float | None, request_id: str,
-                    org_id: str | None = None) -> tuple[BatchResult, dict[str, int]]:
+                    org_id: str | None = None,
+                    disconnected: Callable[[], Awaitable[bool]] | None = None) -> tuple[BatchResult, dict[str, int]]:
         """Judge every item; an item's failure is reported in its slot. Items run at most
         min(API slots, org slots) at a time, so a batch never queues against its own org's slots. Once an item
         is refused as busy, the items not yet started are refused too (no point queueing them); when nothing was
-        judged at all, the whole batch is 429 rate_limited."""
+        judged at all, the whole batch is 429 rate_limited. ``disconnected`` is checked before each item: once the
+        client has gone, the remaining items are not started (error ``client_disconnected``, refunded)."""
         if len(items) > self.s.max_batch:
             from .errors import PayloadTooLarge
 
@@ -125,10 +128,15 @@ class JudgeService:
         sem = asyncio.Semaphore(max(1, width))
         tokens = {"prompt_tokens": 0, "completion_tokens": 0}
         busy: list[Busy] = []
+        gone: list[bool] = []
 
         async def one(i: int, it: Any) -> BatchItemResult:
             fields = it.model_dump(exclude={"id"})
             async with sem:
+                if gone or (disconnected is not None and await disconnected()):
+                    gone.append(True)
+                    return BatchItemResult(index=i, id=it.id, error={
+                        "code": "client_disconnected", "message": "not judged: the client disconnected"})
                 try:
                     if busy:
                         raise busy[0]

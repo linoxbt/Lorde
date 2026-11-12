@@ -546,11 +546,13 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
     async def judge_batch(request: Request, req: BatchRequest, key: ApiKey = Depends(need("judge"))):
         t0 = time.perf_counter()
         if len(req.items) > s.max_batch:
-            raise PayloadTooLarge(f"batch of {len(req.items)} exceeds {s.max_batch} items")
+            raise PayloadTooLarge(f"batch of {len(req.items)} exceeds {s.max_batch} items; send several batches "
+                                  "or start a gating job (POST /v1/jobs)")
         await gw.rate_limit(key, len(req.items))
         await gw.spend(key, len(req.items))
         try:
-            res, usage = await gw.service.batch(req.kind, req.items, req.threshold, rid(request), key.org_id)
+            res, usage = await gw.service.batch(req.kind, req.items, req.threshold, rid(request), key.org_id,
+                                                disconnected=request.is_disconnected)
         except LordeError as e:
             if refundable(e):
                 await gw.refund(key, len(req.items))

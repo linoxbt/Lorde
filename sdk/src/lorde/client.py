@@ -77,6 +77,29 @@ def _items(kind: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [dict(i) for i in items]
 
 
+BATCH_CHUNK = 8  # the Gateway's default LORDE_MAX_BATCH: larger batches are sent as several requests
+
+
+def _chunks(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    return [items[i:i + BATCH_CHUNK] for i in range(0, len(items), BATCH_CHUNK)] or [[]]
+
+
+def _merge(parts: list[dict[str, Any]]) -> BatchResult:
+    """One BatchResult from consecutive chunk responses (indices continue across chunks, summaries add up)."""
+    results: list[dict[str, Any]] = []
+    summary: dict[str, int] = {}
+    offset = 0
+    for p in parts:
+        for r in p["results"]:
+            results.append({**r, "index": r["index"] + offset})
+        offset += len(p["results"])
+        for k, v in p["summary"].items():
+            summary[k] = summary.get(k, 0) + v
+    last = parts[-1]
+    return BatchResult.model_validate({**last, "results": results, "summary": summary,
+                                       "request_id": ",".join(p["request_id"] for p in parts)})
+
+
 class _Judge:
     def __init__(self, c: Lorde) -> None:
         self._c = c
@@ -92,8 +115,8 @@ class _Judge:
 
     def batch(self, kind: Literal["reward", "grounding"], items: list[dict[str, Any]],
               threshold: float | None = None) -> BatchResult:
-        body = {"kind": kind, "items": _items(kind, items), "threshold": threshold}
-        return BatchResult.model_validate(self._c._post("/v1/judge/batch", body))
+        return _merge([self._c._post("/v1/judge/batch", {"kind": kind, "items": chunk, "threshold": threshold})
+                       for chunk in _chunks(_items(kind, items))])
 
 
 class Lorde:
@@ -176,8 +199,8 @@ class _AsyncJudge:
 
     async def batch(self, kind: Literal["reward", "grounding"], items: list[dict[str, Any]],
                     threshold: float | None = None) -> BatchResult:
-        return BatchResult.model_validate(await self._c._post(
-            "/v1/judge/batch", {"kind": kind, "items": _items(kind, items), "threshold": threshold}))
+        return _merge([await self._c._post("/v1/judge/batch", {"kind": kind, "items": chunk, "threshold": threshold})
+                       for chunk in _chunks(_items(kind, items))])
 
 
 class AsyncLorde:

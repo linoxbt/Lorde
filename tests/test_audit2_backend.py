@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 
+import httpx
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
@@ -359,3 +360,72 @@ def test_mcp_single_item_tools_enforce_the_rest_field_limits(tmp_path):
 def test_default_job_row_cap_fits_the_time_limit_on_one_cpu_slot():
     s = Settings()
     assert s.job_max_rows * 2 * 30 <= s.job_max_seconds  # 2 gates x 30 s per judgment, worst case on CPU
+
+
+# ------------------------------------------------------------------ B11: synchronous batches
+
+def test_batches_are_capped_and_stop_when_the_client_disconnects(tmp_path):
+    """B11: at most 8 items per synchronous batch; once the client has gone, items not yet started are not sent
+    to the model and their quota is refunded."""
+    from test_gateway_fairness import REWARD, held_upstream, hold, make, until
+
+    assert Settings().max_batch == 8
+
+    async def go():
+        release, entered = asyncio.Event(), []
+        app, h = make(tmp_path, orgs=("orgD",), transport=held_upstream(release, entered), org_daily_judgments=100)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+            r = await c.post("/v1/judge/batch", headers=h["orgD"], json={"kind": "reward", "items": [REWARD] * 9})
+            assert r.status_code == 413 and r.json()["error"]["code"] == "payload_too_large"
+
+        body = json.dumps({"kind": "reward", "items": [hold(), REWARD, REWARD, REWARD]}).encode()
+        gone, sent = asyncio.Event(), []
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await gone.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg):
+            sent.append(msg)
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+                 "scheme": "http", "path": "/v1/judge/batch", "raw_path": b"/v1/judge/batch", "query_string": b"",
+                 "root_path": "", "client": ("127.0.0.1", 1), "server": ("t", 80),
+                 "headers": [(b"host", b"t"), (b"content-type", b"application/json"),
+                             (b"content-length", str(len(body)).encode()),
+                             (b"authorization", h["orgD"]["Authorization"].encode())]}
+        call = asyncio.create_task(app(scope, receive, send))
+        await until(lambda: len(entered) == 1)  # the first item is with the model
+        gone.set()                              # the client hangs up
+        await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.wait_for(call, 10)
+        assert len(entered) == 1  # the three items after the disconnect never reached the model
+        assert app.gw.quota.used_sync("orgD") == 1  # 4 spent up front, 3 refunded
+        res = json.loads(b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body"))
+        assert [x["error"]["code"] for x in res["results"][1:]] == ["client_disconnected"] * 3
+        assert res["summary"]["errors"] == 3
+
+    asyncio.run(go())
+
+
+def test_sdk_splits_large_batches_into_server_sized_requests(tmp_path):
+    from test_gateway import PEPPER, stub_vllm
+
+    from gateway.keys import KeyStore
+    from lorde import Lorde
+
+    s = Settings(key_pepper=PEPPER, keys_file=str(tmp_path / "keys.json"), usage_file=str(tmp_path / "u.jsonl"),
+                 model_revision="v1.0.0", vllm_base_url="http://vllm/v1", redis_url=None)
+    key, _ = KeyStore(s.keys_file, PEPPER).create("t", "org1", ["judge"], 6000)
+    with TestClient(create_app(s, transport=stub_vllm())) as c:
+        out = Lorde(api_key=key, base_url="http://testserver", http_client=c).judge.batch(
+            "reward", [{"instruction": f"Explain {i}", "response": "X is a thing that is long enough to pass."}
+                       for i in range(19)])
+    assert [r.index for r in out.results] == list(range(19)) and out.summary["total"] == 19
+    assert len(out.request_id.split(",")) == 3

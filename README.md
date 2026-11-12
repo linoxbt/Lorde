@@ -124,7 +124,7 @@ uvicorn gateway.app:app --port 8080                          # or: docker build 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/v1/judge/reward`, `/v1/judge/grounding` | judge one item → score, details, `decision`, model, template |
-| POST | `/v1/judge/batch` | up to 256 items of one kind |
+| POST | `/v1/judge/batch` | up to 8 items of one kind (`LORDE_MAX_BATCH`; the SDK splits larger lists) |
 | POST | `/v1/chat/completions` | OpenAI-compatible proxy for CuratorKIT/LiteLLM (temperature ≤ 0.3) |
 | GET | `/v1/models`, `/healthz`, `/readyz`, `/metrics` | model list, liveness, readiness, Prometheus |
 | * | `/mcp` | MCP Streamable HTTP: `lorde_judge_reward`, `lorde_judge_grounding`, `lorde_judge_batch`, `lorde_model_info` |

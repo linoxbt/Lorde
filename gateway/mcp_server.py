@@ -1,6 +1,6 @@
 """Lorde MCP server (spec Section 5.2), mounted at /mcp; every tool call is authenticated and metered.
 
-Tools: lorde_judge_reward, lorde_judge_grounding, lorde_judge_batch (<= 64 items), lorde_model_info
+Tools: lorde_judge_reward, lorde_judge_grounding, lorde_judge_batch (<= 8 items), lorde_model_info
 (scope judge), lorde_create_gating_job (jobs:write) and lorde_job_status (jobs:read). Errors come back as
 tool errors whose text carries the API error code, e.g. "not_found: no such job in this organization".
 """
@@ -117,13 +117,15 @@ def build(gw: Gateway) -> MCPServer:
         return await _call(ctx, "reward", {"instruction": instruction, "response": response}, threshold)
 
     @mcp.tool(name="lorde_judge_batch", annotations=READ_ONLY,
-              description="Judge up to 64 items of one kind. reward items: {instruction, response}; grounding "
+              description="Judge up to 8 items of one kind (larger sets: a gating job). reward items: "
+                          "{instruction, response}; grounding "
                           "items: {source_text, question, answer}. Returns per-item results and summary counts.")
     @_api_errors
     async def judge_batch(kind: Literal["reward", "grounding"], items: list[dict[str, Any]], ctx: Context,
                           threshold: float | None = None) -> dict[str, Any]:
-        if len(items) > gw.s.mcp_batch_limit:
-            raise PayloadTooLarge(f"MCP batches are limited to {gw.s.mcp_batch_limit} items; use the REST API")
+        limit = min(gw.s.mcp_batch_limit, gw.s.max_batch)
+        if len(items) > limit:
+            raise PayloadTooLarge(f"MCP batches are limited to {limit} items; start a gating job for more")
         if not items:
             raise InvalidRequest("items must not be empty")
         return await _call(ctx, "batch", {"kind": kind, "items": items}, threshold, cost=len(items))
@@ -132,7 +134,8 @@ def build(gw: Gateway) -> MCPServer:
               annotations=ToolAnnotations.model_validate({"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False,
                                           "openWorldHint": False}),
               description="Start a CuratorKIT gating job on an uploaded dataset (upload_id from POST /v1/uploads) "
-                          "or one file of a Hub dataset (dataset_url hf://datasets/<owner>/<name>/<file>.jsonl|.csv|.parquet). Gates are thresholds (0-1) "
+                          "or one file of a Hub dataset (dataset_url "
+                          "hf://datasets/<owner>/<name>/<file>.jsonl|.csv|.parquet). Gates are thresholds (0-1) "
                           "or null to disable. Confirm with the user before starting: jobs consume quota.")
     @_api_errors
     async def create_job(ctx: Context, upload_id: str | None = None, dataset_url: str | None = None,
