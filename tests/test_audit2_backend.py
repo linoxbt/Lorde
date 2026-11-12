@@ -833,3 +833,48 @@ def test_members_join_only_by_accepting_an_invitation(sqldb):
         cfg = dict(c.execute("select proname, array_to_string(proconfig, ',') from pg_proc where proname in "
                              "('create_invite', 'my_invites', 'accept_invite')").fetchall())
         assert all("search_path=public" in v for v in cfg.values()) and len(cfg) == 3
+
+
+# ------------------------------------------------------------------ S9: the job child cannot read its parent
+
+PARENT = r'''
+import importlib.util, subprocess, sys
+spec = importlib.util.spec_from_file_location("procsec", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+if sys.argv[2] == "1":
+    assert m.make_undumpable()
+child = "import os\ntry:\n    print('READ' if b'pepper-123' in open(f'/proc/{os.getppid()}/environ', 'rb').read() else 'NO')\n" \
+        "except PermissionError:\n    print('DENIED')"
+print(subprocess.run([sys.executable, "-I", "-c", child], capture_output=True, text=True, env={}).stdout.strip())
+'''
+
+
+@pytest.mark.skipif(not (hasattr(os, "geteuid") and os.geteuid() == 0 and os.path.exists("/proc/self/environ")),
+                    reason="needs Linux and root (to run the check as an unprivileged uid)")
+def test_job_child_cannot_read_an_undumpable_parents_environment():
+    """S9: the worker and Gateway mark themselves non-dumpable, so a process of the same uid (the job child)
+    cannot read their /proc/<pid>/environ. Checked as uid 65534 with the system Python (no venv access needed)."""
+    import shutil
+    import subprocess
+
+    py = shutil.which("python3", path="/usr/local/bin:/usr/bin:/bin")
+    procsec = Path(__file__).resolve().parent.parent / "gateway" / "procsec.py"
+
+    def run(flag):
+        return subprocess.run([py, "-I", "-c", PARENT, str(procsec), flag], capture_output=True, text=True,
+                              user=65534, group=65534, cwd="/", env={"SECRET_X": "pepper-123"}, timeout=30)
+
+    control, hardened = run("0"), run("1")
+    assert control.stdout.strip() == "READ", control.stderr  # same uid, dumpable: the secret leaks
+    assert hardened.stdout.strip() == "DENIED", hardened.stderr
+
+
+def test_entrypoints_mark_themselves_undumpable():
+    import inspect
+
+    import gateway.app
+    import worker.main
+
+    assert "make_undumpable()" in inspect.getsource(worker.main.main)
+    assert "make_undumpable()" in inspect.getsource(gateway.app.__getattr__)

@@ -691,5 +691,8 @@ def create_app(s: Settings | None = None, transport: httpx.AsyncBaseTransport | 
 
 def __getattr__(name: str):  # lazy module-level app for `uvicorn gateway.app:app`
     if name == "app":
+        from .procsec import make_undumpable
+
+        make_undumpable()  # the job child runs as the same uid: keep this process's secrets out of its /proc
         return create_app()
     raise AttributeError(name)

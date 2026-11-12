@@ -31,7 +31,9 @@ Isolation between tenants (audit S4/S10): one job may run for at most LORDE_JOB_
 at most LORDE_JOB_MAX_ROWS rows; inputs over LORDE_JOB_MAX_INPUT_BYTES are refused; the child calls Serve
 with LORDE_WORKER_JUDGE_CONCURRENCY (default 1: the worker shares Serve with the Gateway, which leaves that
 many of LORDE_UPSTREAM_CONCURRENCY to it; see gateway/settings.py) and gets a minimal environment with no
-database URL, pepper, service key or HF token. Every status write is guarded by locked_by, so a
+database URL, pepper, service key or HF token; the worker and the Gateway mark themselves non-dumpable
+(gateway/procsec.py, audit 2 S9) so the child, which runs as the same uid, cannot read their environments
+from /proc either. Every status write is guarded by locked_by, so a
 worker that lost its lease cannot overwrite the job. SIGTERM stops claiming, ends the running job's child
 and puts the job back in the queue without counting the attempt.
 
@@ -670,8 +672,10 @@ def hf_file_info(repo: str, path: str) -> tuple[str, int | None]:
 
 def main() -> None:
     from gateway.logs import setup
+    from gateway.procsec import make_undumpable
 
     setup()
+    make_undumpable()  # the job child (same uid) cannot read this process's environment (audit 2, S9)
     w = Worker()
 
     async def go():
