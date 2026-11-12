@@ -142,3 +142,25 @@ instead, which the Console verifies server-side (`verifyOtp`), so they work anyw
 templates are applied, the old PKCE links still work in the browser that requested them; opened elsewhere, the sign-in
 page says "Your email is confirmed: sign in to continue" (sign-up) or that the link was opened in a different browser
 and to request a new one (sign-in link, password reset), instead of "We could not start your session".
+
+## Supabase Auth: CAPTCHA (Cloudflare Turnstile)
+
+Optional bot protection on sign-up, password sign-in, email-link sign-in, "resend confirmation" and password-reset
+requests (audit S1/S12: open sign-up is otherwise free to script). The Console shows the Turnstile widget and passes
+its single-use token to supabase-js (`options.captchaToken`) only when `NEXT_PUBLIC_TURNSTILE_SITE_KEY` is set;
+without it nothing is loaded and nothing changes. Email links (`/auth/confirm`) and GitHub sign-in need no token.
+
+1. Cloudflare dashboard → Turnstile → Add widget: hostnames `lorde-console.vercel.app` (add `localhost` for local
+   testing), widget mode **Managed**. Copy the site key and the secret key.
+2. Vercel → `lorde-console` → Settings → Environment Variables: `NEXT_PUBLIC_TURNSTILE_SITE_KEY` = the site key
+   (Production and Preview), then redeploy: it is inlined at build time. Deploy this **before** step 3, or sign-ins
+   fail for lack of a token.
+3. Supabase Dashboard → project `lorde` → Authentication → Attack Protection (older dashboards: Authentication →
+   Settings → Bot and Abuse Protection) → Enable CAPTCHA protection → provider **Turnstile by Cloudflare** → paste
+   the secret key → Save.
+4. Check: sign in on the live site (the widget appears above the button); with the widget blocked, a sign-in attempt
+   must say "Complete the security check above the button first."
+
+To turn it off, disable CAPTCHA in Supabase first, then remove the variable and redeploy. The CSP
+(`console/lib/csp.ts`) adds `https://challenges.cloudflare.com` to `script-src`, `frame-src` and `connect-src` only
+while the site key is set. `pnpm test:e2e:live` builds with Cloudflare's test site key and a stand-in Turnstile script.

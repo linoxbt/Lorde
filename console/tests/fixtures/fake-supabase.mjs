@@ -158,7 +158,7 @@ const server = createServer(async (req, res) => {
     const u = userFromAuth(req);
     return u ? send(200, userJson(u)) : send(401, { code: 401, error_code: "bad_jwt", msg: "invalid JWT" });
   }
-  if (path === "/auth/v1/resend") return send(200, {});
+  if (path === "/auth/v1/resend" || path === "/auth/v1/recover" || path === "/auth/v1/otp") return send(200, {});
   if (path === "/auth/v1/logout") return send(204);
   if (path === "/auth/v1/signup") {
     return send(200, { id: "new-user", email: json?.email, aud: "authenticated", role: "", identities: [{ id: "i1" }],

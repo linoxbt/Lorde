@@ -2,12 +2,17 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { captchaFields } from "@/lib/captcha";
+
+export { CaptchaMissing } from "@/lib/captcha";
+
 /**
  * Optional Cloudflare Turnstile CAPTCHA for the auth forms. Enabled only when NEXT_PUBLIC_TURNSTILE_SITE_KEY is set
- * (and then Supabase Auth → Bot and Abuse Protection must be on with the matching secret key, see
+ * (and then Supabase Auth → Attack Protection → CAPTCHA must be on with the matching secret key, see
  * docs/DEPLOYMENT.md); otherwise nothing is rendered or loaded and `captchaOptions()` adds nothing.
  *
- * The script is added from JavaScript, so the nonce-based CSP's 'strict-dynamic' allows it (see proxy.ts).
+ * The script is added from JavaScript, so the nonce-based CSP's 'strict-dynamic' allows it (lib/csp.ts adds the
+ * Turnstile frame and connect origins when the site key is set).
  * Tokens are single-use: call `reset()` after every auth request, successful or not.
  */
 export const TURNSTILE_SITE_KEY = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || "";
@@ -35,8 +40,6 @@ function loadScript(): Promise<void> {
   });
   return loading;
 }
-
-export class CaptchaMissing extends Error {}
 
 export function useCaptcha(siteKey = TURNSTILE_SITE_KEY) {
   const enabled = Boolean(siteKey);
@@ -72,14 +75,10 @@ export function useCaptcha(siteKey = TURNSTILE_SITE_KEY) {
   }, []);
 
   /** `{ captchaToken }` for supabase-js auth calls; `{}` when CAPTCHA is off. Throws CaptchaMissing if not solved. */
-  const captchaOptions = useCallback((): { captchaToken?: string } => {
-    if (!enabled) return {};
-    if (!token) throw new CaptchaMissing("captcha");
-    return { captchaToken: token };
-  }, [enabled, token]);
+  const captchaOptions = useCallback(() => captchaFields(siteKey, token), [siteKey, token]);
 
   const widget = enabled ? (
-    <div>
+    <div role="group" aria-label="Security check">
       <div ref={el} className="min-h-[65px]" />
       {failed && <p role="alert" className="mt-1 text-[13px] text-reject">The security check did not load. Reload the page and try again.</p>}
     </div>

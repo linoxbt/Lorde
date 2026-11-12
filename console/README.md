@@ -34,6 +34,9 @@ pnpm test:e2e:live       # Playwright, live mode: production build (.next-live) 
   `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=<type>&next={{ .RedirectTo }}`, verified server-side
   (`verifyOtp`). `/auth/callback` keeps handling GitHub and PKCE `code` links; a PKCE email link opened in another
   browser gets "your email is confirmed, sign in" (sign-up) or "request a new link" (sign-in link, reset).
+- **CAPTCHA** (optional): with `NEXT_PUBLIC_TURNSTILE_SITE_KEY` set, sign-up, sign-in (password and email link),
+  resend and reset requests show Cloudflare Turnstile and pass its token to Supabase (`options.captchaToken`); unset,
+  nothing is loaded. Supabase Auth must have CAPTCHA enabled with the matching secret (`../docs/DEPLOYMENT.md`).
 
 ## Security headers
 

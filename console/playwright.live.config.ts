@@ -31,6 +31,8 @@ export default defineConfig({
         LORDE_GATEWAY_URL: "http://127.0.0.1:54397",  // nothing listens here, so the relay must answer 502
         LORDE_KEY_PEPPER: "live-e2e-pepper-live-e2e-pepper-0123456789",
         LORDE_API_KEY: "lorde_sk_operator_key_that_must_never_be_used",
+        // Cloudflare's documented always-pass test site key; the tests serve a fake Turnstile script (no network).
+        NEXT_PUBLIC_TURNSTILE_SITE_KEY: "1x00000000000000000000AA",
       },
     },
   ],

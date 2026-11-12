@@ -13,7 +13,19 @@ async function signIn(context: BrowserContext, baseURL: string, user: "noorg" | 
   await context.addCookies([{ name: c.name, value: c.value, url: baseURL }]);
 }
 
-test.beforeEach(async () => { await reset(); });
+/**
+ * A stand-in for Cloudflare's Turnstile script (the build has a test site key): renders nothing and "solves" at
+ * once with a fresh token, again after each reset, as Turnstile's managed mode does for a real visitor.
+ */
+const FAKE_TURNSTILE = `window.turnstile = (() => { let n = 0; const w = {};
+  const solve = (id) => setTimeout(() => w[id] && w[id].callback("captcha-token-" + (++n)), 10);
+  return { render(el, o) { const id = "w" + Object.keys(w).length; w[id] = o; el.setAttribute("data-fake-turnstile", o.sitekey); solve(id); return id; },
+    reset(id) { solve(id); }, remove(id) { delete w[id]; } }; })();`;
+
+test.beforeEach(async ({ page }) => {
+  await reset();
+  await page.route("https://challenges.cloudflare.com/**", (r) => r.fulfill({ contentType: "text/javascript", body: FAKE_TURNSTILE }));
+});
 
 test("signed out: /console redirects to /signin and keeps the path and query in next", async ({ request }) => {
   const r = await request.get("/console/jobs/new?dataset=abc-123", { maxRedirects: 0 });
@@ -223,4 +235,36 @@ test("every page carries a nonce-based CSP that its own scripts satisfy", async 
   await page.getByRole("button", { name: "Open menu" }).click();
   await expect(page.getByRole("dialog", { name: "Menu" })).toBeVisible();
   expect(violations).toEqual([]);
+});
+
+test("with a Turnstile site key, every auth request carries a fresh CAPTCHA token", async ({ page }) => {
+  await page.goto("/signin", { waitUntil: "networkidle" });
+  await expect(page.locator("[data-fake-turnstile='1x00000000000000000000AA']")).toBeAttached();
+  await page.getByLabel("Email").fill("someone@example.com");
+  await page.getByLabel("Password").fill("wrong-password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page.locator("p[role=alert]")).toHaveText("Wrong email or password.");
+  await page.getByRole("button", { name: "Forgot password?" }).click();
+  await expect(page.getByText("If that email has an account, a reset link is on its way.")).toBeVisible();
+  await page.getByRole("button", { name: "Email link" }).click();
+  await page.getByRole("button", { name: "Email me a sign-in link" }).click();
+  await expect(page.getByText("Check your email for a sign-in link.")).toBeVisible();
+  const tokens = (await calls()).filter((c) => ["/auth/v1/token", "/auth/v1/recover", "/auth/v1/otp"].includes(c.path))
+    .map((c) => (c.body?.gotrue_meta_security as { captcha_token?: string } | undefined)?.captcha_token);
+  expect(tokens).toHaveLength(3);
+  expect(tokens.every((t) => /^captcha-token-\d+$/.test(t ?? ""))).toBe(true);
+  expect(new Set(tokens).size, "tokens are single-use: a new one per request").toBe(3);
+});
+
+test("if the security check never loads, the form says so and sends nothing", async ({ page }) => {
+  await page.unroute("https://challenges.cloudflare.com/**");
+  await page.route("https://challenges.cloudflare.com/**", (r) => r.abort());
+  await page.goto("/signup", { waitUntil: "networkidle" });
+  await expect(page.getByText("The security check did not load. Reload the page and try again.")).toBeVisible();
+  await page.getByLabel("Email").fill("new@example.com");
+  await page.getByLabel("Password", { exact: true }).fill("long-enough-pw");
+  await page.getByLabel("Confirm password").fill("long-enough-pw");
+  await page.getByRole("button", { name: "Create account" }).click();
+  await expect(page.locator("p[role=alert]").last()).toHaveText("Complete the security check above the button first.");
+  expect((await calls()).filter((c) => c.path === "/auth/v1/signup")).toHaveLength(0);
 });
