@@ -281,7 +281,8 @@ def main() -> None:
         for name in rows:
             report["calibration_32b"][name] = metrics.compare([rows[name][i] for i in ci], cref)
 
-    # API reference cost: Aya Expanse 32B at Cohere list price, with measured token counts.
+    # API reference cost: an estimate, Aya Expanse 32B at Cohere list price x mean token counts (of the 32B
+    # calibration replies when they exist, else of the 8B teacher's replies). No API bill is measured.
     tok_src = list(cal.values()) or jsonl.read(config.DATA / "labels.jsonl")
     tok_src = [r for r in tok_src if r.get("prompt_tokens")]
     if tok_src:

@@ -1,13 +1,15 @@
 # forge-train: step 5 (judge SFT) and step 8 (downstream SFT, generation, scoring).
 # Keep this environment separate from forge-serve: AlignTune pins trl==1.7.1 and torch<2.14,
 # while vLLM brings its own torch build.
+# Versions pinned to the environment the CPU end-to-end runs of steps 5 and 8 used (pip freeze, listed deps only);
+# the driver installs torch with uv --torch-backend=auto, which picks the CUDA build of the same version.
 aligntune==0.1.32            # MIT; pins trl==1.7.1 and torch>=2.4,<2.14
-transformers>=5.15,<6
+transformers==5.22.2
 trl==1.7.1
-peft>=0.18
-accelerate>=1.6
-datasets>=3.0
-torch>=2.4,<2.14
-huggingface_hub>=1.0
+peft==0.21.2
+accelerate==1.15.0
+datasets==5.1.0
+torch==2.13.0
+huggingface_hub==2.4.0
 auditkit==1.1.6              # core only: f1_score / lexical_groundedness / paired bootstrap (LSAL v1.2)
-tqdm>=4.66
+tqdm==4.70.1

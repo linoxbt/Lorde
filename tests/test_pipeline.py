@@ -83,6 +83,7 @@ def test_forge_pipeline(world):
     assert not {r["uid"].split(":")[0] for r in train} & {r["uid"].split(":")[0] for r in test}
     nd = json.loads((root / "data" / "splits_summary.json").read_text())["near_duplicates"]
     assert nd["test_prompts_near_train"] == 0 and nd["grouping_threshold"] == 0.9  # near copies share a split
+    assert "dropped_from_test" in json.loads((root / "data" / "splits_summary.json").read_text())  # step 6 reads it
     human = jsonl.read(root / "data" / "human_sample.jsonl")
     assert human and "teacher_score" not in human[0]
     # blind: opaque ids, no variant/group; the private key maps them back (audit B1)

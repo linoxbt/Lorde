@@ -1,12 +1,13 @@
 # forge-data: steps 1-4, 6, 7, 9, bench/ and tests. No GPU libraries.
+# Versions pinned to the environment the test suite runs in (pip freeze, listed deps only).
 curatorkit[generation]==0.1.23   # LSAL v1.1 (non-commercial); judge prompts, parser, QA stage, gating runs
 auditkit==1.1.6                  # LSAL v1.2; per-sample scoring and significance tests
-litellm>=1.60
-openai>=1.40
-pydantic>=2.7
-datasets>=3.0
-scipy>=1.11
-jsonschema>=4
-tqdm>=4.66
-huggingface_hub>=1.0
-gradio>=5                        # step 4 label tool only
+litellm==1.108.3
+openai==3.48.0
+pydantic==2.14.3
+datasets==5.1.0
+scipy==1.17.1
+jsonschema==4.26.0
+tqdm==4.70.1
+huggingface_hub==1.33.0
+gradio==6.31.0                   # step 4 label tool only (the same version as infra/Dockerfile.label)

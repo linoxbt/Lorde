@@ -27,7 +27,7 @@ from lorde_forge.config import JUDGE_MAX_TOKENS, JUDGE_TEMPERATURE, STUDENT_MODE
 from lorde_forge.schemas import response_format  # noqa: E402
 
 DEFAULT_REVISION = "v1.0.0"  # the published release tag (forge/09_publish.py --tag)
-MODEL = os.environ.get("LORDE_MODEL", "lorde/lorde-tiny-aya")
+MODEL = os.environ.get("LORDE_MODEL", "Oxlino/lorde-tiny-aya")  # the published model; override per Space
 REVISION = os.environ.get("LORDE_REVISION") or DEFAULT_REVISION
 if REVISION == "main":  # a moving branch: the demo could silently serve weights nobody evaluated
     print(f"[space] LORDE_REVISION=main is not allowed; serving {DEFAULT_REVISION}", flush=True)
