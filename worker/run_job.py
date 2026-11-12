@@ -5,6 +5,11 @@
 Reads <job_dir>/job.json and <job_dir>/input.<ext>; writes <job_dir>/out/{passed.jsonl, rejected.jsonl,
 report.md, judgments.jsonl, summary.json} plus CuratorKIT's manifest and lexsi_provenance.json.
 Runs in its own process so the worker can stop it when a job is cancelled.
+
+judgments.jsonl is written as the judgments happen (audit 2, B3): every reward or grounding score is appended
+(and flushed) the moment CuratorKIT's gate returns it for a row, so when the worker stops this process (time
+limit, cancel, shutdown) or it crashes, the judgments already made are on disk; the worker stores them and
+charges them. The other files are written only when the run completes.
 """
 
 from __future__ import annotations
@@ -13,7 +18,9 @@ import csv
 import json
 import os
 import sys
+import threading
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -121,7 +128,23 @@ def stamp_ids(src: Path, fmt: str, dst_dir: Path, max_rows: int | None = None,
     return src, -1
 
 
+def count_rows(src: Path, fmt: str) -> int:
+    """Rows in a dataset file, streamed (Parquet: from the footer), counted the way stamp_ids counts them."""
+    if fmt == "jsonl":
+        with src.open("rb") as f:
+            return sum(1 for line in f if line.strip())
+    if fmt == "csv":
+        with src.open(encoding="utf-8", newline="") as f:
+            return sum(1 for _ in csv.DictReader(f))
+    if fmt == "parquet":
+        import pyarrow.parquet as pq
+
+        return int(pq.ParquetFile(src).metadata.num_rows)
+    raise ValueError(f"unsupported format {fmt!r}")
+
+
 TEXT_CLIP = 4000
+GATES = (("RewardGate", "reward", "reward_score"), ("HallucinationGate", "grounding", "grounding_score"))
 
 
 def _clip(v) -> str | None:
@@ -134,6 +157,76 @@ def gate_notes(sample) -> dict[str, dict]:
         if p.step_name in ("RewardGate", "HallucinationGate"):
             out[p.step_name] = p.notes or {}
     return out
+
+
+def row_index(sample) -> int | None:
+    sid = str(sample.id)
+    return int(sid[4:]) if sid.startswith("row-") and sid[4:].isdigit() else None
+
+
+def judgment_record(sample, step: str, gate: str, key: str, passed: bool, langs: dict[int, str]) -> dict | None:
+    """One judgments.jsonl line for ``sample``'s ``step`` result, or None (skipped, judge error, no row id)."""
+    n = gate_notes(sample).get(step)
+    idx = row_index(sample)
+    if not n or key not in n or idx is None:
+        return None
+    return {"row_idx": idx, "gate": gate, "score": n[key], "lang": langs.get(idx),
+            "decision": bool(n.get("passed", passed)), "verdict": n.get("verdict"),
+            # row text; the worker stores it in judgments.parsed only when the org enabled store_content
+            # (debug retention), never otherwise
+            "text": {"instruction": _clip(sample.instruction), "input": _clip(sample.input),
+                     "output": _clip(sample.output)}}
+
+
+class LiveJudgments:
+    """Appends each judgment to judgments.jsonl as soon as a gate returns it (flushed line by line)."""
+
+    def __init__(self, path: Path, langs: dict[int, str]) -> None:
+        self.f = path.open("a", encoding="utf-8")
+        self.langs = langs
+        self.lock = threading.Lock()
+        self.n = 0
+
+    def emit(self, step: str, result: tuple) -> None:
+        p, r = result
+        gate, key = next((g, k) for s, g, k in GATES if s == step)
+        rec = judgment_record(p if p is not None else r, step, gate, key, p is not None, self.langs)
+        if rec is not None:
+            with self.lock:
+                self.f.write(json.dumps(rec) + "\n")
+                self.f.flush()
+                self.n += 1
+
+    def install(self) -> Callable[[], None]:
+        """Wrap CuratorKIT's per-sample gate calls (sync and async; curatorkit is pinned, see
+        requirements/runtime.txt) so every result is recorded the moment it exists. Returns an undo."""
+        from curatorkit.gates.hallucination import HallucinationGate
+        from curatorkit.gates.reward import RewardGate
+
+        saved = []
+        gates: list[tuple[Any, str]] = [(RewardGate, "RewardGate"), (HallucinationGate, "HallucinationGate")]
+        for cls, step in gates:
+            sync, asyn = cls._run_one, cls._run_one_async
+            saved.append((cls, sync, asyn))
+
+            def wrap_sync(self_, *a, _orig=sync, _step=step, **kw):
+                out = _orig(self_, *a, **kw)
+                live.emit(_step, out)
+                return out
+
+            async def wrap_async(self_, *a, _orig=asyn, _step=step, **kw):
+                out = await _orig(self_, *a, **kw)
+                live.emit(_step, out)
+                return out
+
+            cls._run_one, cls._run_one_async = wrap_sync, wrap_async
+        live = self
+
+        def undo() -> None:
+            for cls, sync, asyn in saved:
+                cls._run_one, cls._run_one_async = sync, asyn
+            self.f.close()
+        return undo
 
 
 def main() -> None:
@@ -182,7 +275,12 @@ def main() -> None:
         clean=False,
         export_formats=["alpaca"],
     )
-    res = Curator(cfg).run()
+    live = LiveJudgments(out_dir / "judgments.jsonl", langs)
+    undo = live.install()
+    try:
+        res = Curator(cfg).run()
+    finally:
+        undo()
 
     unstamped: dict[int, int] = {}  # Hub datasets carry no row-N id: number their samples in output order
 
@@ -202,20 +300,6 @@ def main() -> None:
             r["verdict"] = notes["HallucinationGate"].get("verdict")
         return r
 
-    judgments = []
-    for s, passed in [(s, True) for s in res.passed] + [(s, False) for s in res.rejected]:
-        for step, gate, key in (("RewardGate", "reward", "reward_score"), ("HallucinationGate", "grounding",
-                                                                             "grounding_score")):
-            n = gate_notes(s).get(step)
-            if n and key in n:
-                idx = row_idx(s)
-                judgments.append({"row_idx": idx, "gate": gate, "score": n[key], "lang": langs.get(idx),
-                                  "decision": bool(n.get("passed", passed)), "verdict": n.get("verdict"),
-                                  # row text; the worker stores it in judgments.parsed only when the org enabled
-                                  # store_content (debug retention), never otherwise
-                                  "text": {"instruction": _clip(s.instruction), "input": _clip(s.input),
-                                           "output": _clip(s.output)}})
-
     with (out_dir / "passed.jsonl").open("w", encoding="utf-8") as f:
         for s in res.passed:
             f.write(json.dumps(record(s, {}), ensure_ascii=False) + "\n")
@@ -223,10 +307,6 @@ def main() -> None:
         for s in res.rejected:
             f.write(json.dumps(record(s, {"rejection_reason": s.rejection_reason,
                                           "rejecting_step": s.rejecting_step}), ensure_ascii=False) + "\n")
-    with (out_dir / "judgments.jsonl").open("w", encoding="utf-8") as f:
-        for j in judgments:
-            f.write(json.dumps(j) + "\n")
-
     reasons = Counter((r.rejection_reason or "?").split(":")[0] if not (r.rejection_reason or "").startswith(
         "judge_error") else r.rejection_reason for r in res.rejected)
     total = len(res.passed) + len(res.rejected)
@@ -234,6 +314,7 @@ def main() -> None:
                "pass_rate": round(len(res.passed) / total, 4) if total else None,
                "rejection_reasons": dict(reasons),
                "judge_errors": sum(v for k, v in reasons.items() if k.startswith("judge_error")),
+               "judgments": live.n,
                "wall_s": round(res.wall_clock_seconds, 1), "gates": gates, "options": opts}
     if quota_rows is not None and (n_rows > quota_rows or (n_rows < 0 and total >= quota_rows)):
         skipped = n_rows - quota_rows if n_rows >= 0 else None

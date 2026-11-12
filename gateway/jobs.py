@@ -4,7 +4,8 @@ POST /v1/uploads            signed upload URL for a dataset (JSONL, CSV or Parqu
 POST /v1/jobs               create a gating job (<= 3 queued or running per org; 429 quota_exceeded once the
                             org's daily judgments are used up; the worker caps a job's rows to what is left)
 GET  /v1/jobs/{id}          status, progress, counts
-GET  /v1/jobs/{id}/results  signed URLs: passed.jsonl, rejected.jsonl, report.md, manifest, provenance
+GET  /v1/jobs/{id}/results  signed URLs: passed.jsonl, rejected.jsonl, report.md, manifest, provenance; for a job
+                            that failed, timed out or was cancelled after judging some rows: partial.jsonl
 POST /v1/jobs/{id}/cancel   cancel a queued or running job
 GET  /v1/usage              usage by day, key and endpoint
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
@@ -72,6 +74,17 @@ class JobRequest(BaseModel):
         if self.dataset_url and not HF_DATASET.match(self.dataset_url):
             raise ValueError("dataset_url must look like hf://datasets/<owner>/<name>[/<file>]")
         return self
+
+
+def results_available(job: dict) -> bool:
+    """Succeeded jobs have result files; failed or cancelled ones may have partial.jsonl (audit 2, B3): the scores
+    judged before they stopped. Files expired by a data deletion are not offered."""
+    if not job.get("results"):
+        return False
+    if job["status"] == "succeeded":
+        return True
+    exp = job.get("results_expire_at")
+    return job["status"] in ("failed", "cancelled") and (exp is None or exp > datetime.now(UTC))
 
 
 def safe_name(filename: str) -> str:
@@ -168,8 +181,9 @@ def build_router(gw: Gateway, auth) -> APIRouter:
     @r.get("/v1/jobs/{job_id}/results")
     async def get_results(job_id: str, key: ApiKey = Depends(auth("jobs:read"))):
         _, job = await load(key, job_id)
-        if job["status"] != "succeeded":
-            raise Conflict(f"job is {job['status']}; results exist once it has succeeded")
+        if not results_available(job):
+            raise Conflict(f"job is {job['status']}; results exist once it has succeeded (a job stopped by the time "
+                           "limit, a cancel or a failure has partial results when it judged anything)")
         _, storage = need()
         urls = {name: await storage.signed_download("results", path) for name, path in (job["results"] or {}).items()}
         return {"id": job_id, "status": job["status"], "counts": job["counts"], "files": urls,

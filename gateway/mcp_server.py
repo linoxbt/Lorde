@@ -148,7 +148,9 @@ def build(gw: Gateway) -> MCPServer:
         if not job:
             raise NotFound("no such job in this organization")
         v = job_view(job)
-        if job["status"] == "succeeded" and gw.storage is not None:
+        from .jobs import results_available
+
+        if results_available(job) and gw.storage is not None:
             v["files"] = {n: await gw.storage.signed_download("results", p) for n, p in (job["results"] or {}).items()}
         return v
 

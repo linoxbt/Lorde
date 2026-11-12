@@ -52,8 +52,8 @@ class LocalQuota:
             self._used[(org, day)] = used + n
             return True, used + n
 
-    def add_sync(self, org: str, n: int) -> int:
-        day = utc_day()
+    def add_sync(self, org: str, n: int, day: str | None = None) -> int:
+        day = day or utc_day()
         with self._lock:
             v = max(0, self._used.get((org, day), 0) + n)
             self._used[(org, day)] = v
@@ -77,8 +77,10 @@ class LocalQuota:
     async def take(self, org: str, n: int, limit: int) -> tuple[bool, int]:
         return self.take_sync(org, n, limit)
 
-    async def add(self, org: str, n: int) -> int:
-        return self.add_sync(org, n)
+    async def add(self, org: str, n: int, day: str | None = None) -> int:
+        """Add ``n`` (negative: refund) to the counter of ``day`` (default today, UTC). A settlement or refund
+        passes the day of its reservation, so one that lands after midnight corrects the right day."""
+        return self.add_sync(org, n, day)
 
     async def used(self, org: str) -> int:
         return self.used_sync(org)
@@ -123,8 +125,8 @@ class RedisQuota:
         self.degraded = False  # the last call fell back to the in-process counter
 
     @staticmethod
-    def key(org: str) -> str:
-        return f"lorde:quota:{org}:{utc_day()}"
+    def key(org: str, day: str | None = None) -> str:
+        return f"lorde:quota:{org}:{day or utc_day()}"
 
     def _fail(self) -> None:
         self.degraded = True
@@ -142,12 +144,12 @@ class RedisQuota:
         self.degraded = False
         return bool(int(ok)), int(used)
 
-    async def add(self, org: str, n: int) -> int:
+    async def add(self, org: str, n: int, day: str | None = None) -> int:
         try:
-            v = int(await self._add(keys=[self.key(org)], args=[n]))
+            v = int(await self._add(keys=[self.key(org, day)], args=[n]))
         except Exception:  # noqa: BLE001
             self._fail()
-            return self.fallback.add_sync(org, n)
+            return self.fallback.add_sync(org, n, day)
         self.degraded = False
         return v
 

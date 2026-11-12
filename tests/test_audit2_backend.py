@@ -4,19 +4,25 @@
 The Postgres tests need LORDE_TEST_PG_URL (see test_supabase_sql.py).
 """
 
+import asyncio
+import json
 import os
 import threading
+import time
 import uuid
 
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
 from fastapi.testclient import TestClient  # noqa: E402
-from test_jobs import ROWS, clear_jobs, env, upload  # noqa: E402,F401
+from test_jobs import ROWS, clear_jobs, env, run_one, upload  # noqa: E402,F401
 
 from gateway.app import create_app  # noqa: E402
+from gateway.settings import Settings  # noqa: E402
+from worker.main import Worker  # noqa: E402
 
 URL = os.environ.get("LORDE_TEST_PG_URL")
+REDIS = os.environ.get("LORDE_TEST_REDIS_URL")
 pg = pytest.mark.skipif(not URL, reason="set LORDE_TEST_PG_URL to run Postgres tests")
 
 
@@ -64,3 +70,162 @@ def test_concurrent_job_posts_respect_the_org_cap_and_idempotency(env):
         assert sorted(code for code, _ in codes) == [200] * 9 + [201]
         assert len({b["id"] for _, b in codes}) == 1
     clear_jobs(env)
+
+
+# ------------------------------------------------------------------ B3/S2/B9: partial work is kept and charged
+
+def submit(env, rows, s=None):
+    with TestClient(create_app(s or env["s"])) as c:
+        up = upload(c, env["keys"]["all"], rows)
+        r = c.post("/v1/jobs", headers=env["keys"]["all"], json={"upload_id": up})
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+
+def quota_used(org) -> int:
+    from gateway.quota import RedisQuota
+
+    async def go():
+        q = RedisQuota(REDIS)
+        try:
+            return await q.used(str(org))
+        finally:
+            await q.close()
+    return asyncio.run(go())
+
+
+def job_state(env, jid):
+    with db(env) as c:
+        status, error, counts, results = c.execute("select status, error, counts, results from jobs where id=%s",
+                                                   (jid,)).fetchone()
+        n = c.execute("select count(*) from judgments where job_id=%s", (jid,)).fetchone()[0]
+        metered = c.execute("select coalesce(sum(judgments), 0) from usage_events where source='job' and "
+                            "created_at > now() - interval '5 minutes' and org_id=%s", (env["org"],)).fetchone()[0]
+    return status, error, counts, results, n, metered
+
+
+def slow_settings(env, **kw):
+    return Settings(**{**env["s"].__dict__, "vllm_base_url": env["slow_url"], "redis_url": REDIS,
+                       "org_daily_judgments": 100_000, **kw})
+
+
+def run_in_thread(w):
+    t = threading.Thread(target=run_one, args=(w,))
+    t.start()
+    return t
+
+
+def wait_for(cond, timeout=30.0):
+    t0 = time.monotonic()
+    while not cond():
+        assert time.monotonic() - t0 < timeout, "condition not reached"
+        time.sleep(0.05)
+
+
+@pg
+@pytest.mark.skipif(not REDIS, reason="set LORDE_TEST_REDIS_URL")
+def test_time_limit_keeps_meters_and_charges_the_judgments_made(env):
+    """B3/S2: a job stopped by the time limit used to discard everything, refund its reservation and meter
+    nothing. Now its judgments are stored, metered, charged, and offered as partial.jsonl. B9: while it runs the
+    job reserves rows x gates of its own dataset (12 x 2), not the org's whole remaining quota."""
+    clear_jobs(env)
+    with db(env) as c:
+        c.execute("delete from usage_events where org_id=%s and source='job'", (env["org"],))
+    s = slow_settings(env, job_max_seconds=4)
+    jid = submit(env, ROWS * 4, s)  # 12 rows, every judge call takes 1 s
+    before = quota_used(env["org"])
+    w = Worker(s, worker_id="partial", work_dir=str(env["tmp"] / "partial"), heartbeat_s=0.3)
+    t = run_in_thread(w)
+    wait_for(lambda: job_state(env, jid)[0] == "running")
+    wait_for(lambda: quota_used(env["org"]) > before)
+    assert quota_used(env["org"]) - before == 12 * 2  # the reservation: this dataset's rows x gates
+    wait_for(lambda: job_state(env, jid)[4] >= 1, 20)  # judgments are stored while the job runs
+    t.join(60)
+    assert not t.is_alive()
+    status, error, counts, results, n, metered = job_state(env, jid)
+    assert status == "failed" and "time limit" in error and "kept" in error
+    assert 1 <= n < 24 and metered == n and counts["judgments"] == counts["judgments_charged"] == n
+    assert quota_used(env["org"]) - before == n  # reservation settled to the judgments made
+    assert set(results) == {"partial"}
+    with TestClient(create_app(env["s"])) as c:
+        r = c.get(f"/v1/jobs/{jid}/results", headers=env["keys"]["all"])
+        assert r.status_code == 200 and set(r.json()["files"]) == {"partial"}
+        lines = [json.loads(x) for x in c.get(r.json()["files"]["partial"]).text.splitlines()]
+    assert len(lines) == n and all(set(x) == {"row_idx", "gate", "score", "decision", "verdict", "lang"}
+                                   for x in lines)
+
+
+@pg
+@pytest.mark.skipif(not REDIS, reason="set LORDE_TEST_REDIS_URL")
+def test_cancel_keeps_and_charges_partial_work_and_shutdown_charges_nothing(env):
+    clear_jobs(env)
+    s = slow_settings(env)
+    jid = submit(env, ROWS * 4, s)
+    before = quota_used(env["org"])
+    w = Worker(s, worker_id="cancel", work_dir=str(env["tmp"] / "cancel"), heartbeat_s=0.3)
+    t = run_in_thread(w)
+    wait_for(lambda: job_state(env, jid)[4] >= 2, 30)
+    with TestClient(create_app(env["s"])) as c:
+        assert c.post(f"/v1/jobs/{jid}/cancel", headers=env["keys"]["all"]).json()["cancel_requested"] is True
+    t.join(60)
+    status, _, counts, results, n, _ = job_state(env, jid)
+    assert status == "cancelled" and n >= 2 and counts["judgments_charged"] == n and "partial" in results
+    assert quota_used(env["org"]) - before == n
+
+    # a deploy (SIGTERM) re-queues the job: its next attempt judges every row again, so this one is not charged
+    clear_jobs(env)
+    jid = submit(env, ROWS * 4, s)
+    before = quota_used(env["org"])
+    with db(env) as c:
+        metered_before = c.execute("select count(*) from usage_events where source='job'").fetchone()[0]
+    w = Worker(s, worker_id="deploy2", work_dir=str(env["tmp"] / "deploy2"), heartbeat_s=0.3)
+    t = run_in_thread(w)
+    wait_for(lambda: job_state(env, jid)[4] >= 1, 30)
+    w._stop_loop.call_soon_threadsafe(w.stop)
+    t.join(60)
+    status, _, counts, _, n, _ = job_state(env, jid)
+    assert status == "queued" and counts["progress"] == "requeued" and n >= 1  # stored judgments are kept
+    assert quota_used(env["org"]) == before
+    with db(env) as c:
+        assert c.execute("select count(*) from usage_events where source='job'").fetchone()[0] == metered_before
+    clear_jobs(env)
+
+
+@pg
+def test_rows_over_the_job_cap_fail_before_judging(env):
+    clear_jobs(env)
+    s = Settings(**{**env["s"].__dict__, "job_max_rows": 2})
+    jid = submit(env, ROWS, s)
+    assert run_one(Worker(s, worker_id="cap2", work_dir=str(env["tmp"] / "cap2"), poll_s=0.1)) is True
+    status, error, _, _, n, _ = job_state(env, jid)
+    assert status == "failed" and "more than 2 rows" in error and n == 0
+
+
+@pg
+def test_0008_applies_on_the_production_order_and_is_rerunnable():
+    """Production applied 0006 before 0005, then 0007; 0008 must apply on that, twice, and match a fresh install."""
+    from test_supabase_sql import SUPA
+
+    mig = {f.name[:4]: f for f in (SUPA / "migrations").glob("*.sql")}
+    name = f"lorde_prod8_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(URL, autocommit=True) as c:
+        c.execute(f"create database {name}")
+    url = URL.rsplit("/", 1)[0] + "/" + name
+    try:
+        with psycopg.connect(url, autocommit=True) as c:
+            for f in [SUPA / "tests" / "supabase_shim.sql"] + [mig[n] for n in ("0001", "0002", "0003", "0004",
+                                                                                "0006", "0005", "0007", "0008")]:
+                with c.transaction():
+                    c.execute(f.read_text())
+            with c.transaction():
+                c.execute(mig["0008"].read_text())  # re-runnable
+            assert c.execute("select count(*) from information_schema.columns where table_name='jobs' "
+                             "and column_name='delete_requested'").fetchone()[0] == 1
+    finally:
+        with psycopg.connect(URL, autocommit=True) as c:
+            c.execute(f"drop database {name} with (force)")
+
+
+def test_default_job_row_cap_fits_the_time_limit_on_one_cpu_slot():
+    s = Settings()
+    assert s.job_max_rows * 2 * 30 <= s.job_max_seconds  # 2 gates x 30 s per judgment, worst case on CPU

@@ -89,7 +89,11 @@ class Settings:
     max_active_jobs: int = 3
     # worker limits (spec Section 11.4; audit S4)
     job_max_seconds: int = field(default_factory=lambda: int(_env("LORDE_JOB_MAX_SECONDS", "3600")))
-    job_max_rows: int = field(default_factory=lambda: int(_env("LORDE_JOB_MAX_ROWS", "50000")))
+    # 60 rows x 2 gates x 30 s (one CPU llama.cpp slot, worst case) = 3600 s = LORDE_JOB_MAX_SECONDS: a job of
+    # LORDE_JOB_MAX_ROWS rows finishes inside the time limit. Size it as JOB_MAX_SECONDS / (gates x seconds per
+    # judgment); on a GPU (~1.7 judgments/s) thousands of rows fit. Jobs that still hit the limit keep and are
+    # charged for the rows judged (partial.jsonl).
+    job_max_rows: int = field(default_factory=lambda: int(_env("LORDE_JOB_MAX_ROWS", "60")))
     job_max_input_bytes: int = field(
         default_factory=lambda: int(_env("LORDE_JOB_MAX_INPUT_BYTES", str(200 * 1024 * 1024))))
     # one job judgment at a time by default: jobs share Serve with API calls (see the module docstring)
