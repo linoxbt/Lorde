@@ -205,20 +205,37 @@ class JobStore:
                                           (org_id, key))).fetchone()
 
     async def create_job(self, org_id: str, dataset_id: str | None, api_key_id: str | None, config: dict,
-                         model_revision: str, actor: str, idempotency_key: str | None = None) -> dict:
-        """Insert a job; with an idempotency key, a concurrent duplicate returns the existing job."""
-        async with self.pool.connection() as c:
+                         model_revision: str, actor: str, idempotency_key: str | None = None,
+                         max_active: int | None = None) -> tuple[dict | None, bool]:
+        """Insert a job. Returns (job, created): (prior job, False) when ``idempotency_key`` was used before,
+        (None, False) when the org already has ``max_active`` queued or running jobs.
+
+        The idempotency lookup, the active-job count and the insert run in one transaction under a per-org
+        advisory lock (audit 2, B4/B17), so concurrent requests cannot all pass the count, and of several
+        concurrent requests with one key exactly one creates the job and the rest return it (created=False).
+        The lock key differs from claim_job's per-org try-lock, so job creation never makes a worker skip an org.
+        """
+        async with self.pool.connection() as c, c.transaction():
+            await c.execute("select pg_advisory_xact_lock(hashtextextended('lorde.jobs.create:' || %s, 0))",
+                            (str(org_id),))
+            if idempotency_key is not None:
+                prior = await (await c.execute("select * from jobs where org_id=%s and idempotency_key=%s",
+                                               (org_id, idempotency_key))).fetchone()
+                if prior:
+                    return prior, False
+            if max_active is not None:
+                n = (await (await c.execute(
+                    "select count(*) n from jobs where org_id=%s and status in ('queued','running')",
+                    (org_id,))).fetchone())["n"]
+                if n >= max_active:
+                    return None, False
             r = await (await c.execute(
                 "insert into jobs (org_id, dataset_id, api_key_id, config, model_revision, idempotency_key) "
-                "values (%s,%s,%s,%s,%s,%s) on conflict (org_id, idempotency_key) where idempotency_key is not null "
-                "do nothing returning *",
+                "values (%s,%s,%s,%s,%s,%s) returning *",
                 (org_id, dataset_id, api_key_id, Jsonb(config), model_revision, idempotency_key))).fetchone()
-            if r is None:
-                return await (await c.execute("select * from jobs where org_id=%s and idempotency_key=%s",
-                                              (org_id, idempotency_key))).fetchone()
             await c.execute("insert into audit_log (org_id, actor, action, target, detail) values "
                             "(%s, %s, 'job.create', %s, %s)", (org_id, actor, str(r["id"]), Jsonb(config)))
-        return r
+        return r, True
 
     async def get_job(self, org_id: str, job_id: str) -> dict | None:
         async with self.pool.connection() as c:

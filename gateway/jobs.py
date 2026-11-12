@@ -93,9 +93,12 @@ async def submit_job(gw: Gateway, key: ApiKey, req: JobRequest, idempotency_key:
         prior = await jobs.job_by_idempotency_key(key.org_id, idempotency_key)
         if prior:
             return prior, False
-    if await jobs.active_jobs(key.org_id) >= gw.s.max_active_jobs:
-        raise RateLimited(f"at most {gw.s.max_active_jobs} jobs may be queued or running per organization",
-                          headers={"Retry-After": "30"})
+    def busy_jobs() -> LordeError:
+        return RateLimited(f"at most {gw.s.max_active_jobs} jobs may be queued or running per organization",
+                           headers={"Retry-After": "30"})
+
+    if await jobs.active_jobs(key.org_id) >= gw.s.max_active_jobs:  # fast path; re-checked under the lock
+        raise busy_jobs()
     if (lim := gw.s.org_daily_judgments) > 0:  # a job cannot start on a used-up daily quota (audit N1b)
         used = max(await gw.quota.used(key.org_id), await jobs.judgments_today(key.org_id))
         if used >= lim:
@@ -108,9 +111,12 @@ async def submit_job(gw: Gateway, key: ApiKey, req: JobRequest, idempotency_key:
             raise NotFound("no such upload in this organization")
         dataset_id, source = str(ds["id"]), {"storage_path": ds["storage_path"], "format": ds["format"]}
     config = {"gates": req.gates.model_dump(), "options": req.options.model_dump(), "source": source}
-    job = await jobs.create_job(key.org_id, dataset_id, key.id, config, gw.s.model_label, actor=key.prefix,
-                                idempotency_key=idempotency_key)
-    return job, True
+    # count + insert are atomic per org (B4); a concurrent same-key duplicate gets created=False (B17)
+    job, created = await jobs.create_job(key.org_id, dataset_id, key.id, config, gw.s.model_label, actor=key.prefix,
+                                         idempotency_key=idempotency_key, max_active=gw.s.max_active_jobs)
+    if job is None:
+        raise busy_jobs()
+    return job, created
 
 
 def build_router(gw: Gateway, auth) -> APIRouter:
