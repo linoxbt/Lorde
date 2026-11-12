@@ -49,12 +49,13 @@ class Upstream:
     def __init__(self, s: Settings, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self.s = s
         self.client = httpx.AsyncClient(
-            base_url=s.vllm_base_url.rstrip("/") + "/", timeout=s.upstream_timeout_s, transport=transport,
+            base_url=s.vllm_base_url.rstrip("/") + "/", timeout=s.upstream_read_timeout_s, transport=transport,
             headers={"Authorization": f"Bearer {s.vllm_api_key}"},
             limits=httpx.Limits(max_connections=s.api_upstream_slots + 2))
         self.breaker = CircuitBreaker(s.breaker_failures, s.breaker_window_s)
         self.slots: UpstreamSlots = LocalSlots(s.api_upstream_slots, s.org_upstream_concurrency,
-                                               s.upstream_max_waiters, s.upstream_queue_timeout_s)
+                                               s.upstream_max_waiters, s.upstream_queue_timeout_s,
+                                               s.org_max_waiters)
 
     async def chat(self, body: dict[str, Any], org_id: str | None = None) -> dict[str, Any]:
         """POST /chat/completions for ``org_id``; returns the JSON body. Raises ModelUnavailable on failure and

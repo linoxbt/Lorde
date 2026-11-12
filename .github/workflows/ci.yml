@@ -40,8 +40,8 @@ jobs:
         run: ruff check .
       - name: Type check (gateway, worker, SDK)
         run: mypy --ignore-missing-imports --no-strict-optional --python-version 3.11 gateway worker sdk/src/lorde
-      - name: Dependency audit (runtime image requirements)
-        run: pip-audit -r requirements/runtime.txt --progress-spinner off
+      - name: Dependency audit (the runtime image's pinned, hashed lock file)
+        run: pip-audit -r requirements/runtime.lock --require-hashes --disable-pip --progress-spinner off
       - name: Shell syntax
         run: bash -n forge/00_serve.sh && sh -n infra/start-api.sh
       - name: Tests (contract, parser fuzzing, metrics, pipeline, gateway, SDK, Supabase SQL, worker)

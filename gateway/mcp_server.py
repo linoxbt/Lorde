@@ -1,6 +1,6 @@
 """Lorde MCP server (spec Section 5.2), mounted at /mcp; every tool call is authenticated and metered.
 
-Tools: lorde_judge_reward, lorde_judge_grounding, lorde_judge_batch (<= 64 items), lorde_model_info
+Tools: lorde_judge_reward, lorde_judge_grounding, lorde_judge_batch (<= 8 items), lorde_model_info
 (scope judge), lorde_create_gating_job (jobs:write) and lorde_job_status (jobs:read). Errors come back as
 tool errors whose text carries the API error code, e.g. "not_found: no such job in this organization".
 """
@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING, Any, Literal
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ValidationError
 
 from lorde_forge import contract
 
-from .errors import REFUNDED, InvalidRequest, LordeError, NotFound, PayloadTooLarge, refundable
+from .errors import InvalidRequest, LordeError, NotFound, PayloadTooLarge
+from .models import BatchRequest, GroundingRequest, RewardRequest
 
 if TYPE_CHECKING:
     from .app import Gateway
@@ -40,6 +42,18 @@ def _api_errors(fn):
     return wrapper
 
 
+def validated(model: type[BaseModel], data: dict[str, Any]) -> Any:
+    """Validate tool arguments with the REST request model (audit 2, B8): the same field limits and the same
+    errors (413 payload_too_large for an over-long field, 400 invalid_request otherwise)."""
+    try:
+        return model.model_validate(data)
+    except ValidationError as e:
+        errs = e.errors()
+        loc = ".".join(str(x) for x in errs[0]["loc"]) if errs else ""
+        cls = PayloadTooLarge if any(x.get("type") == "string_too_long" for x in errs) else InvalidRequest
+        raise cls(f"{loc}: {errs[0]['msg']}" if errs else "invalid arguments") from e
+
+
 def build(gw: Gateway) -> MCPServer:
     mcp = MCPServer(
         name="lorde",
@@ -52,25 +66,29 @@ def build(gw: Gateway) -> MCPServer:
 
     async def _call(ctx: Context, kind: str, fields: dict[str, Any], threshold: float | None, cost: int = 1):
         key = await gw.authenticate(ctx.headers or {}, scope="judge")
+        models: dict[str, type[BaseModel]] = {"reward": RewardRequest, "grounding": GroundingRequest,
+                                              "batch": BatchRequest}
+        model = models[kind]
+        req = validated(model, {**fields, "threshold": threshold})  # before any rate-limit token or quota is spent
+        threshold = req.threshold
+        if kind != "batch":
+            fields = req.model_dump(exclude={"threshold"})
         await gw.rate_limit(key, cost)
-        await gw.spend(key, cost)
+        day = await gw.spend(key, cost)
         rid = "req_" + secrets.token_hex(8)
         res: Any
         t0 = time.perf_counter()
         try:
             if kind == "batch":
                 res, usage = await gw.service.batch(fields["kind"], fields["items"], threshold, rid, key.org_id)
-                failed = sum(1 for x in res.results if x.error and x.error.get("code") in REFUNDED)
-                await gw.refund(key, failed)
-                n = len(fields["items"]) - failed
+                n = await gw.settle_batch(key, res, cost, day)
             else:
                 res, usage = await gw.service.judge(kind, fields, threshold, rid, key.org_id)
                 n = 1
         except LordeError as e:
-            if refundable(e):
-                await gw.refund(key, cost)
+            charged = await gw.refund_for(key, e, cost, day)
             gw.usage.record(org_id=key.org_id, api_key_id=key.id, key_prefix=key.prefix, route=f"mcp:{kind}",
-                            judgments=0, status=e.status, model_revision=gw.s.model_label, source="mcp",
+                            judgments=charged, status=e.status, model_revision=gw.s.model_label, source="mcp",
                             latency_ms=int((time.perf_counter() - t0) * 1000))
             raise
         gw.usage.record(org_id=key.org_id, api_key_id=key.id, key_prefix=key.prefix, route=f"mcp:{kind}",
@@ -96,13 +114,15 @@ def build(gw: Gateway) -> MCPServer:
         return await _call(ctx, "reward", {"instruction": instruction, "response": response}, threshold)
 
     @mcp.tool(name="lorde_judge_batch", annotations=READ_ONLY,
-              description="Judge up to 64 items of one kind. reward items: {instruction, response}; grounding "
+              description="Judge up to 8 items of one kind (larger sets: a gating job). reward items: "
+                          "{instruction, response}; grounding "
                           "items: {source_text, question, answer}. Returns per-item results and summary counts.")
     @_api_errors
     async def judge_batch(kind: Literal["reward", "grounding"], items: list[dict[str, Any]], ctx: Context,
                           threshold: float | None = None) -> dict[str, Any]:
-        if len(items) > gw.s.mcp_batch_limit:
-            raise PayloadTooLarge(f"MCP batches are limited to {gw.s.mcp_batch_limit} items; use the REST API")
+        limit = min(gw.s.mcp_batch_limit, gw.s.max_batch)
+        if len(items) > limit:
+            raise PayloadTooLarge(f"MCP batches are limited to {limit} items; start a gating job for more")
         if not items:
             raise InvalidRequest("items must not be empty")
         return await _call(ctx, "batch", {"kind": kind, "items": items}, threshold, cost=len(items))
@@ -111,7 +131,8 @@ def build(gw: Gateway) -> MCPServer:
               annotations=ToolAnnotations.model_validate({"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False,
                                           "openWorldHint": False}),
               description="Start a CuratorKIT gating job on an uploaded dataset (upload_id from POST /v1/uploads) "
-                          "or a Hub dataset (dataset_url hf://datasets/<owner>/<name>). Gates are thresholds (0-1) "
+                          "or one file of a Hub dataset (dataset_url "
+                          "hf://datasets/<owner>/<name>/<file>.jsonl|.csv|.parquet). Gates are thresholds (0-1) "
                           "or null to disable. Confirm with the user before starting: jobs consume quota.")
     @_api_errors
     async def create_job(ctx: Context, upload_id: str | None = None, dataset_url: str | None = None,
@@ -148,7 +169,9 @@ def build(gw: Gateway) -> MCPServer:
         if not job:
             raise NotFound("no such job in this organization")
         v = job_view(job)
-        if job["status"] == "succeeded" and gw.storage is not None:
+        from .jobs import results_available
+
+        if results_available(job) and gw.storage is not None:
             v["files"] = {n: await gw.storage.signed_download("results", p) for n, p in (job["results"] or {}).items()}
         return v
 

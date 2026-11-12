@@ -36,8 +36,16 @@ worker_pid=""
 ) &
 worker_pid=$!
 
+# Proxy headers (audit 2, S7): trust X-Forwarded-For only from the proxy hop (Railway's edge reaches the container
+# from a private/CGNAT address) and take the right-most hop that is not a proxy; never '*', which made uvicorn take
+# the left-most, client-written hop. Override with FORWARDED_ALLOW_IPS if the platform's proxy addresses differ.
+# --no-access-log (S10): uvicorn's own access log printed /v1/_storage/<signed token> URLs; the Gateway writes one
+# JSON access line per request with the token masked (LORDE_ACCESS_LOG=1).
+# --limit-concurrency / --timeout-keep-alive (S4): bound open connections (503 past the limit) and idle keep-alives.
+PROXY_HOPS="${FORWARDED_ALLOW_IPS:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,fc00::/7}"
 setpriv --reuid=10001 --regid=10001 --init-groups \
-  uvicorn gateway.app:app --host 0.0.0.0 --port "${PORT:-8080}" --proxy-headers --forwarded-allow-ips='*' \
+  uvicorn gateway.app:app --host 0.0.0.0 --port "${PORT:-8080}" --proxy-headers --forwarded-allow-ips="$PROXY_HOPS" \
+  --no-access-log --limit-concurrency "${LORDE_LIMIT_CONCURRENCY:-128}" --timeout-keep-alive 5 \
   --workers 1 --timeout-graceful-shutdown 20 &
 api_pid=$!
 

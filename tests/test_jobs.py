@@ -55,8 +55,9 @@ def env(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("jobs")
     vllm, vurl = serve("chatty")
     slow, surl = serve("slow")
+    # new_org_daily_judgments=0: these tests exercise the base quota; the new-org quota (audit 2, S1) has its own
     s = Settings(key_pepper=PEPPER, database_url=db, storage_dir=str(tmp / "storage"), vllm_base_url=vurl,
-                 model_revision="v1.0.0")
+                 model_revision="v1.0.0", new_org_daily_judgments=0)
     yield {"db": db, "org": org, "keys": keys, "s": s, "tmp": tmp, "slow_url": surl}
     vllm.shutdown()
     slow.shutdown()

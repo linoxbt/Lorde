@@ -14,18 +14,38 @@ Tenant fairness (audit N1; see gateway/slots.py and gateway/quota.py):
   deployment Serve sees at most one API call plus one job judgment at a time, and an API call waits for at most
   one job judgment inside Serve.
 - ``LORDE_ORG_UPSTREAM_CONCURRENCY`` (1): API calls in flight per organization.
+- ``LORDE_UPSTREAM_TIMEOUT`` (30): seconds one judgment may take in Serve. The HTTP timeout is that times the
+  calls that can be ahead of it inside Serve (``upstream_read_timeout_s``), so an API call queued in Serve behind a
+  job judgment is not timed out (and charged) for the job's time. Set ``LORDE_UPSTREAM_CONCURRENCY`` to Serve's
+  real parallelism (1 for one llama.cpp slot) so this and the slot pool match the hardware.
 - ``LORDE_UPSTREAM_QUEUE_TIMEOUT_S`` (30) and ``LORDE_UPSTREAM_MAX_WAITERS`` (32): how long, and how many
   requests may, wait for a slot; past either, 429 ``rate_limited`` "model busy, retry later".
 - ``LORDE_ORG_DAILY_JUDGMENTS`` (5000, 0 = unlimited): judgments per organization per UTC day, API and jobs
   together; past it, 429 ``quota_exceeded`` until 00:00 UTC.
 
+Sybil resistance (audit 2, S1): sign-up is open and the model has one CPU slot, so many cheap organizations could
+otherwise starve real ones.
+
+- ``LORDE_GLOBAL_DAILY_CAP`` (0 = off): judgments per UTC day for the whole service, API and jobs together, matched
+  to what Serve can do (one CPU llama.cpp slot at 15-30 s per judgment: about 3,000-5,000 a day). Past it, 429
+  ``capacity_exceeded`` until 00:00 UTC. Counted atomically in Redis (``lorde:quota:__global__:<day>``) with the
+  in-process fallback, and raised every minute to the day's metered usage_events.
+- ``LORDE_NEW_ORG_HOURS`` (24) and ``LORDE_NEW_ORG_DAILY_JUDGMENTS`` (50): an organization younger than that many
+  hours gets that lower daily quota (0 for either turns the restriction off).
+- ``LORDE_ORG_MAX_WAITERS`` (1): requests one organization may have waiting for its own slot; past it, 429 at once.
+  The global slot is handed over round-robin across organizations (gateway/slots.py).
+- ``LORDE_ORG_FREE_BUSY_PER_DAY`` (20): "model busy" refusals refunded per organization per day; past it, each
+  refusal costs one judgment of the daily quota, so hammering a saturated model is not free.
+
 Per-IP limit (audit N2): ``LORDE_IP_RPM`` (300, 0 = off) requests per minute per client IP on every keyed route,
 checked before the API key is looked up, so a flood of made-up keys from one address is refused without
-reaching the database. The client IP is the TCP peer as uvicorn reports it. Behind Railway's proxy run uvicorn
-with ``--proxy-headers --forwarded-allow-ips='*'`` (infra/start-api.sh does): uvicorn then reports the first
-X-Forwarded-For hop, the address Railway's edge saw. Without uvicorn's proxy headers, list the proxy addresses
-(IPs or CIDRs, or ``*``) in ``LORDE_TRUSTED_PROXIES`` and the Gateway reads X-Forwarded-For's first hop itself,
-only for requests that come from one of them. The Console relays its users' calls from Vercel's few egress
+reaching the database. The client IP is the TCP peer as uvicorn reports it. Behind Railway's proxy,
+infra/start-api.sh runs uvicorn with ``--proxy-headers --forwarded-allow-ips=<private and CGNAT ranges>``
+(``FORWARDED_ALLOW_IPS`` overrides): uvicorn then reports the right-most X-Forwarded-For hop that is not one of
+those proxies, i.e. the address Railway's edge saw; hops a client wrote itself are to its left and ignored
+(audit 2, S7: ``'*'`` used to make uvicorn take the left-most, client-supplied hop). Without uvicorn's proxy
+headers, list the proxy addresses (IPs or CIDRs) in ``LORDE_TRUSTED_PROXIES`` and the Gateway applies the same
+right-most-untrusted rule itself, only for requests that come from one of them. The Console relays its users' calls from Vercel's few egress
 addresses; with ``LORDE_RELAY_SECRET`` set (32+ characters, the same value in the Console), a request carrying
 ``x-lorde-relay-secret: <secret>`` is limited by its ``x-lorde-client-ip`` header instead. IPv6 clients are
 limited per /64.
@@ -65,7 +85,10 @@ class Settings:
     access_log: bool = field(default_factory=lambda: _env("LORDE_ACCESS_LOG", "1") == "1")
     allowed_origins: list[str] = field(default_factory=lambda: _csv("ALLOWED_ORIGINS"))
     default_threshold: float = field(default_factory=lambda: float(_env("LORDE_DEFAULT_THRESHOLD", "0.7")))
-    max_batch: int = field(default_factory=lambda: int(_env("LORDE_MAX_BATCH", "256")))
+    # Synchronous batches (REST and MCP) run their items one after another on the org's slot: at 15-30 s per
+    # judgment on CPU, 8 items take 2-4 minutes, about what clients wait for (SDK 60 s per attempt with retries,
+    # Console relay 120 s). Larger sets belong in a job. (Audit 2, B11: it was 256, i.e. 1-2 hours.)
+    max_batch: int = field(default_factory=lambda: int(_env("LORDE_MAX_BATCH", "8")))
     max_body_bytes: int = 5 * 1024 * 1024
     max_field_chars: int = 32_000
     max_source_chars: int = 24_000
@@ -76,7 +99,7 @@ class Settings:
     breaker_failures: int = 20
     breaker_window_s: float = 30.0
     max_temperature: float = 0.3
-    mcp_batch_limit: int = 64
+    mcp_batch_limit: int = 8              # MCP batches: at most this and max_batch
     key_cache_size: int = 10_000           # bounded LRU of key lookups (positive and negative, each)
     usage_queue_max: int = 10_000          # usage events held in memory while the database is unreachable
     database_url: str | None = field(default_factory=lambda: _env("DATABASE_URL"))
@@ -87,9 +110,18 @@ class Settings:
     public_url: str = field(default_factory=lambda: _env("LORDE_PUBLIC_URL", "") or "")
     max_upload_bytes: int = 200 * 1024 * 1024
     max_active_jobs: int = 3
+    # per-org dataset storage (audit 2, S3): datasets uploaded or still uploadable, and their bytes (a pending upload
+    # counts at max_upload_bytes until its signed URL has expired)
+    org_max_datasets: int = field(default_factory=lambda: int(_env("LORDE_ORG_MAX_DATASETS", "20")))
+    org_max_dataset_bytes: int = field(
+        default_factory=lambda: int(_env("LORDE_ORG_MAX_DATASET_BYTES", str(1024 * 1024 * 1024))))
     # worker limits (spec Section 11.4; audit S4)
     job_max_seconds: int = field(default_factory=lambda: int(_env("LORDE_JOB_MAX_SECONDS", "3600")))
-    job_max_rows: int = field(default_factory=lambda: int(_env("LORDE_JOB_MAX_ROWS", "50000")))
+    # 60 rows x 2 gates x 30 s (one CPU llama.cpp slot, worst case) = 3600 s = LORDE_JOB_MAX_SECONDS: a job of
+    # LORDE_JOB_MAX_ROWS rows finishes inside the time limit. Size it as JOB_MAX_SECONDS / (gates x seconds per
+    # judgment); on a GPU (~1.7 judgments/s) thousands of rows fit. Jobs that still hit the limit keep and are
+    # charged for the rows judged (partial.jsonl).
+    job_max_rows: int = field(default_factory=lambda: int(_env("LORDE_JOB_MAX_ROWS", "60")))
     job_max_input_bytes: int = field(
         default_factory=lambda: int(_env("LORDE_JOB_MAX_INPUT_BYTES", str(200 * 1024 * 1024))))
     # one job judgment at a time by default: jobs share Serve with API calls (see the module docstring)
@@ -102,6 +134,13 @@ class Settings:
         default_factory=lambda: float(_env("LORDE_UPSTREAM_QUEUE_TIMEOUT_S", "30")))
     upstream_max_waiters: int = field(default_factory=lambda: int(_env("LORDE_UPSTREAM_MAX_WAITERS", "32")))
     org_daily_judgments: int = field(default_factory=lambda: int(_env("LORDE_ORG_DAILY_JUDGMENTS", "5000")))
+    # Sybil resistance (audit 2, S1; see the module docstring)
+    global_daily_cap: int = field(default_factory=lambda: int(_env("LORDE_GLOBAL_DAILY_CAP", "0")))
+    new_org_hours: float = field(default_factory=lambda: float(_env("LORDE_NEW_ORG_HOURS", "24")))
+    new_org_daily_judgments: int = field(
+        default_factory=lambda: int(_env("LORDE_NEW_ORG_DAILY_JUDGMENTS", "50")))
+    org_max_waiters: int = field(default_factory=lambda: int(_env("LORDE_ORG_MAX_WAITERS", "1")))
+    org_free_busy_per_day: int = field(default_factory=lambda: int(_env("LORDE_ORG_FREE_BUSY_PER_DAY", "20")))
     # per-IP limit before key resolution (audit N2)
     ip_rpm: int = field(default_factory=lambda: int(_env("LORDE_IP_RPM", "300")))
     trusted_proxies: list[str] = field(default_factory=lambda: _csv("LORDE_TRUSTED_PROXIES"))
@@ -121,6 +160,17 @@ class Settings:
         if self.worker_shares_upstream:
             return max(1, self.upstream_concurrency - self.worker_judge_concurrency)
         return max(1, self.upstream_concurrency)
+
+    @property
+    def upstream_read_timeout_s(self) -> float:
+        """How long one call may wait for Serve's reply (audit 2, B9). ``LORDE_UPSTREAM_TIMEOUT`` is the budget for
+        one judgment; when the Gateway's API calls plus the worker's job judgments can exceed Serve's own slots
+        (``LORDE_UPSTREAM_CONCURRENCY``), a call can sit in Serve's queue behind them first, so the timeout covers
+        that many judgments. On the one-slot CPU deployment (LORDE_UPSTREAM_CONCURRENCY=1) an API call may wait for
+        one job judgment, then run its own: 2 x 30 s. Without this, such calls timed out and were charged."""
+        in_flight = self.api_upstream_slots + (self.worker_judge_concurrency if self.worker_shares_upstream else 0)
+        rounds = -(-in_flight // max(1, self.upstream_concurrency))  # ceil
+        return self.upstream_timeout_s * max(1, rounds)
 
     @property
     def model_label(self) -> str:

@@ -4,7 +4,8 @@ POST /v1/uploads            signed upload URL for a dataset (JSONL, CSV or Parqu
 POST /v1/jobs               create a gating job (<= 3 queued or running per org; 429 quota_exceeded once the
                             org's daily judgments are used up; the worker caps a job's rows to what is left)
 GET  /v1/jobs/{id}          status, progress, counts
-GET  /v1/jobs/{id}/results  signed URLs: passed.jsonl, rejected.jsonl, report.md, manifest, provenance
+GET  /v1/jobs/{id}/results  signed URLs: passed.jsonl, rejected.jsonl, report.md, manifest, provenance; for a job
+                            that failed, timed out or was cancelled after judging some rows: partial.jsonl
 POST /v1/jobs/{id}/cancel   cancel a queued or running job
 GET  /v1/usage              usage by day, key and endpoint
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
@@ -21,8 +23,18 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .db import job_view
-from .errors import Conflict, InvalidRequest, LordeError, NotFound, PayloadTooLarge, RateLimited
+from .errors import (
+    Conflict,
+    InvalidRequest,
+    LordeError,
+    NotFound,
+    PayloadTooLarge,
+    RateLimited,
+    StorageQuotaExceeded,
+    UnsupportedDataset,
+)
 from .keys import ApiKey
+from .quota import GLOBAL
 
 if TYPE_CHECKING:
     from .app import Gateway
@@ -30,7 +42,9 @@ if TYPE_CHECKING:
 NotConfigured = type("NotConfigured", (LordeError,), {"status": 503, "code": "not_configured"})
 FORMATS = {".jsonl": "jsonl", ".json": "jsonl", ".csv": "csv", ".parquet": "parquet"}
 HF_DATASET = re.compile(r"^hf://datasets/[\w.-]+/[\w.-]+(/[\w./-]+)?$")
+HF_FILE = re.compile(r"^hf://datasets/[\w.-]+/[\w.-]+/[\w./-]*[\w-]\.(jsonl|json|csv|parquet)$")
 IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
+UPLOAD_URL_TTL_S = 2 * 3600  # the longest a signed upload URL lives (Supabase: two hours; local: 15 minutes)
 
 
 class UploadRequest(BaseModel):
@@ -60,7 +74,7 @@ class Options(BaseModel):
 class JobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     upload_id: uuid.UUID | None = None
-    dataset_url: str | None = Field(None, description="hf://datasets/<owner>/<name>[/<file>]")
+    dataset_url: str | None = Field(None, description="hf://datasets/<owner>/<name>/<file>.(jsonl|json|csv|parquet)")
     # defaults come from Field(); mypy runs without the pydantic plugin, hence the ignore
     gates: Gates = Gates()  # type: ignore[call-arg]
     options: Options = Options()
@@ -72,6 +86,17 @@ class JobRequest(BaseModel):
         if self.dataset_url and not HF_DATASET.match(self.dataset_url):
             raise ValueError("dataset_url must look like hf://datasets/<owner>/<name>[/<file>]")
         return self
+
+
+def results_available(job: dict) -> bool:
+    """Succeeded jobs have result files; failed or cancelled ones may have partial.jsonl (audit 2, B3): the scores
+    judged before they stopped. Files expired by a data deletion are not offered."""
+    if not job.get("results"):
+        return False
+    if job["status"] == "succeeded":
+        return True
+    exp = job.get("results_expire_at")
+    return job["status"] in ("failed", "cancelled") and (exp is None or exp > datetime.now(UTC))
 
 
 def safe_name(filename: str) -> str:
@@ -93,13 +118,26 @@ async def submit_job(gw: Gateway, key: ApiKey, req: JobRequest, idempotency_key:
         prior = await jobs.job_by_idempotency_key(key.org_id, idempotency_key)
         if prior:
             return prior, False
-    if await jobs.active_jobs(key.org_id) >= gw.s.max_active_jobs:
-        raise RateLimited(f"at most {gw.s.max_active_jobs} jobs may be queued or running per organization",
-                          headers={"Retry-After": "30"})
-    if (lim := gw.s.org_daily_judgments) > 0:  # a job cannot start on a used-up daily quota (audit N1b)
+    def busy_jobs() -> LordeError:
+        return RateLimited(f"at most {gw.s.max_active_jobs} jobs may be queued or running per organization",
+                           headers={"Retry-After": "30"})
+
+    if await jobs.active_jobs(key.org_id) >= gw.s.max_active_jobs:  # fast path; re-checked under the lock
+        raise busy_jobs()
+    if req.dataset_url and not HF_FILE.match(req.dataset_url):
+        # Audit 2 (B10): a whole Hub repo needs CuratorKIT's HuggingFaceReader and the `datasets` library, which the
+        # production image does not install (and whose download size the worker cannot bound before it starts).
+        raise UnsupportedDataset("dataset_url must name one file in the Hub dataset repo: "
+                                 "hf://datasets/<owner>/<name>/<path>.jsonl (or .json, .csv, .parquet); "
+                                 "whole repos (hf://datasets/<owner>/<name>) are not supported")
+    if (lim := gw.daily_limit(key)) > 0:  # a job cannot start on a used-up daily quota (audit N1b)
         used = max(await gw.quota.used(key.org_id), await jobs.judgments_today(key.org_id))
         if used >= lim:
-            raise gw.quota_error(used)
+            raise gw.quota_error(used, lim)
+    if (cap := gw.s.global_daily_cap) > 0:  # nor on the service's used-up daily capacity (audit 2, S1)
+        used = max(await gw.quota.used(GLOBAL), await jobs.judgments_today_all())
+        if used >= cap:
+            raise gw.capacity_error(used)
     source: dict = {"dataset_url": req.dataset_url}
     dataset_id = None
     if req.upload_id:
@@ -108,9 +146,12 @@ async def submit_job(gw: Gateway, key: ApiKey, req: JobRequest, idempotency_key:
             raise NotFound("no such upload in this organization")
         dataset_id, source = str(ds["id"]), {"storage_path": ds["storage_path"], "format": ds["format"]}
     config = {"gates": req.gates.model_dump(), "options": req.options.model_dump(), "source": source}
-    job = await jobs.create_job(key.org_id, dataset_id, key.id, config, gw.s.model_label, actor=key.prefix,
-                                idempotency_key=idempotency_key)
-    return job, True
+    # count + insert are atomic per org (B4); a concurrent same-key duplicate gets created=False (B17)
+    job, created = await jobs.create_job(key.org_id, dataset_id, key.id, config, gw.s.model_label, actor=key.prefix,
+                                         idempotency_key=idempotency_key, max_active=gw.s.max_active_jobs)
+    if job is None:
+        raise busy_jobs()
+    return job, created
 
 
 def build_router(gw: Gateway, auth) -> APIRouter:
@@ -131,6 +172,16 @@ def build_router(gw: Gateway, auth) -> APIRouter:
             raise InvalidRequest("upload JSONL, CSV or Parquet (.jsonl, .json, .csv, .parquet)")
         if req.bytes and req.bytes > gw.s.max_upload_bytes:
             raise PayloadTooLarge(f"uploads are limited to {gw.s.max_upload_bytes // (1024 * 1024)} MB")
+        # per-org storage caps (audit 2, S3); a new upload counts at the upload limit until it is done
+        n, used = await jobs.dataset_usage(key.org_id, gw.s.max_upload_bytes, UPLOAD_URL_TTL_S)
+        if n >= gw.s.org_max_datasets or used + gw.s.max_upload_bytes > gw.s.org_max_dataset_bytes:
+            mb = 1024 * 1024
+            raise StorageQuotaExceeded(
+                f"this organization holds {n} datasets ({used // mb} MB, pending uploads counted at "
+                f"{gw.s.max_upload_bytes // mb} MB); the limits are {gw.s.org_max_datasets} datasets and "
+                f"{gw.s.org_max_dataset_bytes // mb} MB. Delete datasets or wait for them to expire",
+                extra={"datasets": n, "bytes": used, "max_datasets": gw.s.org_max_datasets,
+                       "max_bytes": gw.s.org_max_dataset_bytes})
         ds = await jobs.create_dataset(key.org_id, name, fmt, req.bytes, None, actor=key.prefix)
         signed = await storage.signed_upload("datasets", ds["storage_path"])
         return {"upload_id": str(ds["id"]), "upload_url": signed["url"], "method": signed["method"],
@@ -162,8 +213,9 @@ def build_router(gw: Gateway, auth) -> APIRouter:
     @r.get("/v1/jobs/{job_id}/results")
     async def get_results(job_id: str, key: ApiKey = Depends(auth("jobs:read"))):
         _, job = await load(key, job_id)
-        if job["status"] != "succeeded":
-            raise Conflict(f"job is {job['status']}; results exist once it has succeeded")
+        if not results_available(job):
+            raise Conflict(f"job is {job['status']}; results exist once it has succeeded (a job stopped by the time "
+                           "limit, a cancel or a failure has partial results when it judged anything)")
         _, storage = need()
         urls = {name: await storage.signed_download("results", path) for name, path in (job["results"] or {}).items()}
         return {"id": job_id, "status": job["status"], "counts": job["counts"], "files": urls,
@@ -211,7 +263,7 @@ def build_router(gw: Gateway, auth) -> APIRouter:
             raise PayloadTooLarge(f"upload over {limit // (1024 * 1024)} MB") from e
         if gw.jobs:
             async with gw.jobs.pool.connection() as c:
-                await c.execute("update datasets set bytes=%s where storage_path=%s", (n, path))
+                await c.execute("update datasets set bytes=%s, uploaded_at=now() where storage_path=%s", (n, path))
         return {"ok": True, "bytes": n}
 
     @r.get("/v1/_storage/{token}")

@@ -288,8 +288,10 @@ def test_client_ip_trusts_forwarded_headers_only_from_trusted_proxies(tmp_path):
     assert gw.client_ip({"client": ("54.1.2.3", 1)}, {**relay, "x-lorde-relay-secret": "nope"}) == "54.1.2.3"
     assert gw.client_ip({"client": ("2001:db8:1:2:3:4:5:6", 1)}, {}) == "2001:db8:1:2::/64"
     assert gw.client_ip({"client": ("::ffff:198.51.100.9", 1)}, {}) == "198.51.100.9"
+    # audit 2 (S7): '*' trusts the peer as one proxy hop and takes the hop it appended (the right-most), not the
+    # left-most hop, which the client can write itself
     app, _ = make(tmp_path / "all", orgs=(), trusted_proxies=["*"])
-    assert app.gw.client_ip({"client": ("100.64.0.2", 1)}, xff) == "203.0.113.5"
+    assert app.gw.client_ip({"client": ("100.64.0.2", 1)}, {"x-forwarded-for": "6.6.6.6, 203.0.113.5"}) == "203.0.113.5"
     app, _ = make(tmp_path / "none", orgs=())  # default: the peer as uvicorn reports it
     assert app.gw.client_ip({"client": ("100.64.0.2", 1)}, xff) == "100.64.0.2"
 

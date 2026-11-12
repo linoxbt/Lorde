@@ -160,6 +160,15 @@ class LocalStorage:
             tmp.unlink(missing_ok=True)
         return n
 
+    def older_than(self, bucket: str, age_s: float) -> list[str]:
+        """Paths of the bucket's files last written more than ``age_s`` ago (finished uploads only)."""
+        root, cutoff, out = (self.root / bucket), time.time() - age_s, []
+        if root.is_dir():
+            for f in root.rglob("*"):
+                if f.is_file() and not f.name.startswith(".") and f.stat().st_mtime < cutoff:
+                    out.append(f.relative_to(root).as_posix())
+        return out
+
     def write_bytes(self, bucket: str, path: str, data: bytes) -> None:
         dst = self._file(bucket, path)
         dst.parent.mkdir(parents=True, exist_ok=True)

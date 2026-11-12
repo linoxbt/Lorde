@@ -12,6 +12,11 @@ Waiting is bounded twice. The time spent waiting for both slots is at most ``LOR
 ``rate_limited`` "model busy, retry later" and a Retry-After. A refused or timed-out wait never reached Serve,
 so it is not an upstream failure and the circuit breaker does not count it.
 
+Fairness under many small tenants (audit 2, S1): an organization may have at most ``LORDE_ORG_MAX_WAITERS``
+(default 1) requests waiting for its own slot (past it, 429 at once), and the global slot is handed over
+round-robin across organizations, not first come first served: when it frees, the org that has waited since
+it was last served gets it, so one tenant's (or one Sybil's) queue cannot run ahead of everyone else's.
+
 ``LocalSlots`` is in-process, which is exact for the single Gateway replica this deployment runs. Several
 replicas would need a shared implementation with the same ``acquire(org_id)`` interface, e.g. Redis sorted
 sets of leases (ZADD with an expiry score, ZREMRANGEBYSCORE to drop dead holders, ZCARD against the limit).
@@ -22,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
 from typing import Protocol
 
@@ -84,14 +89,79 @@ class _Slot:
         self.used -= 1
 
 
+class _FairSlot:
+    """A counting semaphore whose waiters are served round-robin by group (organization), FIFO within a group."""
+
+    def __init__(self, n: int) -> None:
+        self.n = max(1, n)
+        self.used = 0
+        self.queues: OrderedDict[str | None, deque[asyncio.Future[None]]] = OrderedDict()
+
+    @property
+    def waiters(self) -> list[asyncio.Future[None]]:
+        return [f for q in self.queues.values() for f in q if not f.done()]
+
+    @property
+    def waiting(self) -> int:
+        return len(self.waiters)
+
+    @property
+    def free(self) -> bool:
+        return self.used < self.n and not self.waiters
+
+    def _drop(self, group: str | None, fut: asyncio.Future[None]) -> None:
+        q = self.queues.get(group)
+        if q is not None:
+            with contextlib.suppress(ValueError):
+                q.remove(fut)
+            if not q:
+                self.queues.pop(group, None)
+
+    async def acquire(self, timeout_s: float, group: str | None = None) -> None:
+        if self.free:
+            self.used += 1
+            return
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.queues.setdefault(group, deque()).append(fut)
+        try:
+            async with asyncio.timeout(max(timeout_s, 0.0)):
+                await fut
+        except BaseException:
+            if fut.done() and not fut.cancelled():
+                self.release()  # the slot was handed over just as we gave up: pass it on
+            else:
+                fut.cancel()
+                self._drop(group, fut)
+            raise
+
+    def release(self) -> None:
+        """Hand the slot to the head of the next group in rotation (that group then goes to the back)."""
+        while self.queues:
+            group, q = next(iter(self.queues.items()))
+            while q and q[0].done():
+                q.popleft()
+            if not q:
+                self.queues.pop(group, None)
+                continue
+            fut = q.popleft()
+            self.queues.pop(group)
+            if q:
+                self.queues[group] = q  # served: to the back of the rotation
+            fut.set_result(None)
+            return
+        self.used -= 1
+
+
 class UpstreamSlots(Protocol):
     def acquire(self, org_id: str | None) -> contextlib.AbstractAsyncContextManager[None]: ...
 
 
 class LocalSlots:
-    def __init__(self, global_slots: int, org_slots: int, max_waiters: int, timeout_s: float) -> None:
-        self.global_slot = _Slot(global_slots)
+    def __init__(self, global_slots: int, org_slots: int, max_waiters: int, timeout_s: float,
+                 org_max_waiters: int | None = None) -> None:
+        self.global_slot = _FairSlot(global_slots)
         self.org_n, self.max_waiters, self.timeout_s = max(1, org_slots), max(0, max_waiters), timeout_s
+        self.org_max_waiters = self.max_waiters if org_max_waiters is None else max(0, org_max_waiters)
         self.orgs: dict[str, _Slot] = {}
         self.retry_after = str(max(1, int(timeout_s // 2)))
 
@@ -110,7 +180,7 @@ class LocalSlots:
             org = self.orgs.get(org_id)
             if org is None:
                 org = self.orgs[org_id] = _Slot(self.org_n)
-            if not org.free and org.waiting >= self.max_waiters:
+            if not org.free and org.waiting >= self.org_max_waiters:
                 raise self.busy("too many requests from this organization are waiting")
             try:
                 await org.acquire(deadline - time.monotonic())
@@ -124,7 +194,7 @@ class LocalSlots:
             if not self.global_slot.free and self.global_slot.waiting >= self.max_waiters:
                 raise self.busy("the queue is full")
             try:
-                await self.global_slot.acquire(deadline - time.monotonic())
+                await self.global_slot.acquire(deadline - time.monotonic(), org_id)
             except TimeoutError:
                 raise self.busy("timed out in the queue") from None
             try:

@@ -84,7 +84,7 @@ worker/          Lorde Job Worker: runs CuratorKIT gating jobs from the Postgres
 supabase/        migrations: schema, RLS and column grants, job queue, requeue, retention (+ a test shim)
 sdk/             `pip install lorde`: typed sync/async client, CuratorKIT preset, CLI, stdio MCP server
 skills/          lorde-gating: a Claude skill that teaches agents when and how to gate data with Lorde
-infra/           Dockerfiles for the Gateway and the Worker
+infra/           Dockerfile.api (Gateway + Worker in one container), start-api.sh, Dockerfile.label
 console/         Lorde Console and website: Next.js 16, every page its own route, demo mode until Supabase is set
 docs/            HF Article template and builder, submission checklist
 requirements/    forge-train, forge-serve, forge-data (three separate environments) and dev
@@ -148,13 +148,13 @@ pip install -r requirements/runtime.txt
 export LORDE_KEY_PEPPER=$(python -c "import secrets; print(secrets.token_hex(32))")
 export VLLM_BASE_URL=http://localhost:8002/v1 LORDE_MODEL_REVISION=v1.0.0
 python -m gateway.keys create --name me --org demo          # prints lorde_sk_... once
-uvicorn gateway.app:app --port 8080                          # or: docker build -f infra/Dockerfile.gateway .
+uvicorn gateway.app:app --port 8080                          # or: docker build -f infra/Dockerfile.api . (Gateway + worker)
 ```
 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/v1/judge/reward`, `/v1/judge/grounding` | judge one item → score, details, `decision`, model, template |
-| POST | `/v1/judge/batch` | up to 256 items of one kind |
+| POST | `/v1/judge/batch` | up to 8 items of one kind (`LORDE_MAX_BATCH`; the SDK splits larger lists) |
 | POST | `/v1/chat/completions` | OpenAI-compatible proxy for CuratorKIT/LiteLLM (temperature ≤ 0.3) |
 | GET | `/v1/models`, `/healthz`, `/readyz`, `/metrics` | model list, liveness, readiness, Prometheus |
 | * | `/mcp` | MCP Streamable HTTP: `lorde_judge_reward`, `lorde_judge_grounding`, `lorde_judge_batch`, `lorde_model_info` |
@@ -183,7 +183,7 @@ With `DATABASE_URL` (Supabase Postgres) and storage (`SUPABASE_URL` + `SUPABASE_
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/v1/uploads` | signed upload URL for a JSONL/CSV/Parquet dataset (≤ 200 MB) · scope `jobs:write` |
-| POST | `/v1/jobs` | `{upload_id \| dataset_url: "hf://datasets/..", gates, options}` · ≤ 3 queued or running per org |
+| POST | `/v1/jobs` | `{upload_id \| dataset_url: "hf://datasets/<owner>/<name>/<file>.jsonl", gates, options}` · ≤ 3 queued or running per org |
 | GET | `/v1/jobs/{id}`, `/v1/jobs/{id}/results` | status and counts; signed URLs for passed, rejected, report, manifest, provenance |
 | POST | `/v1/jobs/{id}/cancel` | queued jobs stop at once; running jobs are stopped by the worker within one heartbeat |
 | GET | `/v1/usage` | usage by day, key and endpoint · scope `usage:read` |

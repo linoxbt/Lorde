@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import json
 import logging
 import time
 import uuid
@@ -49,7 +48,8 @@ class PgKeyStore(KeyStore):
     def _rec(r: dict) -> ApiKey:
         return ApiKey(prefix=r["prefix"], key_hash=r["key_hash"], name=r["name"], org_id=str(r["org_id"]),
                       scopes=list(r["scopes"]), rpm=r["rpm"], created_at=str(r["created_at"]),
-                      revoked_at=str(r["revoked_at"]) if r["revoked_at"] else None, id=str(r["id"]))
+                      revoked_at=str(r["revoked_at"]) if r["revoked_at"] else None, id=str(r["id"]),
+                      org_created_at=r.get("org_created_at"))
 
     async def alookup(self, key: str) -> ApiKey | None:
         prefix = prefix_of(key)  # malformed keys never reach the database
@@ -58,7 +58,9 @@ class PgKeyStore(KeyStore):
         found, rec = self._cache.get(prefix)
         if not found:
             async with self.pool.connection() as c:
-                r = await (await c.execute("select * from api_keys where prefix = %s", (prefix,))).fetchone()
+                r = await (await c.execute("select k.*, o.created_at as org_created_at from api_keys k "
+                                           "join orgs o on o.id = k.org_id where k.prefix = %s",
+                                           (prefix,))).fetchone()
             rec = self._rec(r) if r else None
             self._cache.put(prefix, rec)
         if rec is None or not hmac.compare_digest(rec.key_hash, hash_key(key, self.pepper)):
@@ -69,10 +71,6 @@ class PgKeyStore(KeyStore):
             async with self.pool.connection() as c:
                 await c.execute("update api_keys set last_used_at = now() where prefix = %s", (prefix,))
         return rec
-
-    async def averify(self, key: str) -> ApiKey | None:
-        rec = await self.alookup(key)
-        return None if rec is None or rec.revoked_at else rec
 
     async def acreate(self, name: str, org_id: str, scopes: list[str] | None = None, rpm: int = 600,
                       actor: str = "cli") -> tuple[str, ApiKey]:
@@ -166,9 +164,6 @@ class PgUsageSink:
         except Exception:  # noqa: BLE001
             logging.getLogger("lorde.usage").warning("final usage flush failed; %s events lost", len(self.queue))
 
-    def flush(self) -> None:  # parity with UsageSink
-        pass
-
 
 class JobStore:
     def __init__(self, pool: Pool) -> None:
@@ -187,6 +182,32 @@ class JobStore:
                 "values (%s, %s, %s, %s, %s, %s, now() + make_interval(days => %s)) returning *",
                 (did, org_id, name, dataset_path(org_id, str(did), name), fmt, size, ret))).fetchone()
         return r
+
+    async def dataset_usage(self, org_id: str, pending_bytes: int, signed_ttl_s: int) -> tuple[int, int]:
+        """(datasets, bytes) the org holds in storage: uploads at their real size (the storage object's, or the
+        size the Gateway's local route wrote), and uploads whose signed URL may still be used at ``pending_bytes``.
+        Expired datasets and never-used upload URLs do not count (audit 2, S3)."""
+        from psycopg import errors
+
+        sql = ("with d as (select case when o.size is not null then o.size "
+               "  when ds.uploaded_at is not null then coalesce(ds.bytes, 0) "
+               "  when ds.created_at > now() - make_interval(secs => %s) then %s::bigint end as size "
+               "  from datasets ds left join lateral (select (x.metadata->>'size')::bigint as size "
+               "   from storage.objects x where x.bucket_id = 'datasets' and x.name = ds.storage_path limit 1) o on true "
+               "  where ds.org_id = %s and (ds.expires_at is null or ds.expires_at > now())) "
+               "select count(size) as n, coalesce(sum(size), 0)::bigint as bytes from d")
+        # without read access to storage.objects: completed uploads count at their declared size
+        fallback = ("with d as (select case when ds.uploaded_at is not null then coalesce(ds.bytes, 0) "
+                    "  when ds.created_at > now() - make_interval(secs => %s) then %s::bigint "
+                    "  else ds.bytes end as size from datasets ds "
+                    "  where ds.org_id = %s and (ds.expires_at is null or ds.expires_at > now())) "
+                    "select count(size) as n, coalesce(sum(size), 0)::bigint as bytes from d")
+        async with self.pool.connection() as c:
+            try:
+                r = await (await c.execute(sql, (signed_ttl_s, pending_bytes, org_id))).fetchone()
+            except (errors.InsufficientPrivilege, errors.UndefinedTable, errors.UndefinedColumn):
+                r = await (await c.execute(fallback, (signed_ttl_s, pending_bytes, org_id))).fetchone()
+        return int(r["n"]), int(r["bytes"])
 
     async def get_dataset(self, org_id: str, dataset_id: str) -> dict | None:
         async with self.pool.connection() as c:
@@ -207,26 +228,51 @@ class JobStore:
                 "created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'", (org_id,))).fetchone()
         return int(r["n"])
 
+    async def judgments_today_all(self) -> int:
+        """Judgments metered for the whole service since 00:00 UTC (LORDE_GLOBAL_DAILY_CAP's durable view)."""
+        async with self.pool.connection() as c:
+            r = await (await c.execute(
+                "select coalesce(sum(judgments), 0)::bigint as n from usage_events where "
+                "created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'")).fetchone()
+        return int(r["n"])
+
     async def job_by_idempotency_key(self, org_id: str, key: str) -> dict | None:
         async with self.pool.connection() as c:
             return await (await c.execute("select * from jobs where org_id=%s and idempotency_key=%s",
                                           (org_id, key))).fetchone()
 
     async def create_job(self, org_id: str, dataset_id: str | None, api_key_id: str | None, config: dict,
-                         model_revision: str, actor: str, idempotency_key: str | None = None) -> dict:
-        """Insert a job; with an idempotency key, a concurrent duplicate returns the existing job."""
-        async with self.pool.connection() as c:
+                         model_revision: str, actor: str, idempotency_key: str | None = None,
+                         max_active: int | None = None) -> tuple[dict | None, bool]:
+        """Insert a job. Returns (job, created): (prior job, False) when ``idempotency_key`` was used before,
+        (None, False) when the org already has ``max_active`` queued or running jobs.
+
+        The idempotency lookup, the active-job count and the insert run in one transaction under a per-org
+        advisory lock (audit 2, B4/B17), so concurrent requests cannot all pass the count, and of several
+        concurrent requests with one key exactly one creates the job and the rest return it (created=False).
+        The lock key differs from claim_job's per-org try-lock, so job creation never makes a worker skip an org.
+        """
+        async with self.pool.connection() as c, c.transaction():
+            await c.execute("select pg_advisory_xact_lock(hashtextextended('lorde.jobs.create:' || %s, 0))",
+                            (str(org_id),))
+            if idempotency_key is not None:
+                prior = await (await c.execute("select * from jobs where org_id=%s and idempotency_key=%s",
+                                               (org_id, idempotency_key))).fetchone()
+                if prior:
+                    return prior, False
+            if max_active is not None:
+                n = (await (await c.execute(
+                    "select count(*) n from jobs where org_id=%s and status in ('queued','running')",
+                    (org_id,))).fetchone())["n"]
+                if n >= max_active:
+                    return None, False
             r = await (await c.execute(
                 "insert into jobs (org_id, dataset_id, api_key_id, config, model_revision, idempotency_key) "
-                "values (%s,%s,%s,%s,%s,%s) on conflict (org_id, idempotency_key) where idempotency_key is not null "
-                "do nothing returning *",
+                "values (%s,%s,%s,%s,%s,%s) returning *",
                 (org_id, dataset_id, api_key_id, Jsonb(config), model_revision, idempotency_key))).fetchone()
-            if r is None:
-                return await (await c.execute("select * from jobs where org_id=%s and idempotency_key=%s",
-                                              (org_id, idempotency_key))).fetchone()
             await c.execute("insert into audit_log (org_id, actor, action, target, detail) values "
                             "(%s, %s, 'job.create', %s, %s)", (org_id, actor, str(r["id"]), Jsonb(config)))
-        return r
+        return r, True
 
     async def get_job(self, org_id: str, job_id: str) -> dict | None:
         async with self.pool.connection() as c:
@@ -257,4 +303,4 @@ def job_view(j: dict) -> dict[str, Any]:
             "finished_at": j["finished_at"].isoformat() if j.get("finished_at") else None}
 
 
-__all__ = ["JobStore", "PgKeyStore", "PgUsageSink", "job_view", "json", "make_pool"]
+__all__ = ["JobStore", "PgKeyStore", "PgUsageSink", "job_view", "make_pool"]

@@ -36,19 +36,21 @@ def build(api_key: str | None = None, base_url: str | None = None):
         return (await client.judge.reward(instruction, response, threshold)).model_dump()
 
     @mcp.tool(name="lorde_judge_batch", annotations=ro,
-              description="Judge up to 64 items of one kind. reward items: {instruction, response}; grounding "
+              description="Judge up to 8 items of one kind (larger sets: a gating job). reward items: "
+                          "{instruction, response}; grounding "
                           "items: {source_text, question, answer}. Returns per-item results and summary counts.")
     async def batch(kind: Literal["reward", "grounding"], items: list[dict[str, Any]],
                     threshold: float | None = None) -> dict[str, Any]:
-        if len(items) > 64:
-            raise ValueError("MCP batches are limited to 64 items")
+        if len(items) > 8:
+            raise ValueError("MCP batches are limited to 8 items; start a gating job for more")
         return (await client.judge.batch(kind, items, threshold)).model_dump()
 
     @mcp.tool(name="lorde_create_gating_job",
               annotations=ToolAnnotations.model_validate({"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False,
                                           "openWorldHint": True}),
               description="Start a CuratorKIT gating job on an uploaded dataset (upload_id from POST /v1/uploads) "
-                          "or a Hub dataset (dataset_url hf://datasets/<owner>/<name>). Gates are thresholds (0-1) "
+                          "or one file of a Hub dataset (dataset_url "
+                          "hf://datasets/<owner>/<name>/<file>.jsonl|.csv|.parquet). Gates are thresholds (0-1) "
                           "or null to disable. Confirm with the user before starting: jobs consume quota.")
     async def create_job(upload_id: str | None = None, dataset_url: str | None = None,
                          grounding: float | None = 0.7, reward: float | None = 0.7) -> dict[str, Any]:

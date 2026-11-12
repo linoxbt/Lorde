@@ -234,11 +234,14 @@ def test_idempotency_key_and_mcp_not_found(env):
 
 
 def test_model_registry_promotion(env):
-    from gateway.models_cli import promote
+    from gateway.models_cli import installed_fingerprints, promote
 
     h = env["keys"]["all"]
-    promote(env["db"], "Oxlino/lorde-tiny-aya", "v1.0.0-rc1")
-    out = promote(env["db"], "Oxlino/lorde-tiny-aya", "v1.0.1", name="Lorde 1.0.1")
+    # audit 2 (M5): promotion needs a promotable Lorde Bench result and the model's stored template fingerprints
+    ok = {"promotable": True, "acceptance": [{"criterion": "κ", "value": 0.8, "met": True, "blocking": True}]}
+    fps = installed_fingerprints()
+    promote(env["db"], "Oxlino/lorde-tiny-aya", "v1.0.0-rc1", bench=ok, fingerprints=fps)
+    out = promote(env["db"], "Oxlino/lorde-tiny-aya", "v1.0.1", name="Lorde 1.0.1", bench=ok, fingerprints=fps)
     assert out["retired"] == ["Oxlino/lorde-tiny-aya@v1.0.0-rc1"]
     with db(env) as c:
         states = dict(c.execute("select revision, state from model_versions").fetchall())
@@ -289,19 +292,30 @@ def test_store_content_keeps_row_text_only_when_enabled(env):
 
 
 # ------------------------------------------------------------------ audit N5: no resurrection at finish
+# Audit 2 (B3) changed what a cancel keeps: judgments are stored while the job runs and a cancelled job keeps
+# (and is charged for) what it judged. Only a data deletion still leaves no judgments and expires the files.
 
-def test_cancel_during_upload_ends_cancelled_without_judgments_and_expires_results(env, monkeypatch):
+def request_deletion(env):
+    """request_org_data_deletion() as the org's owner (what the Console's "Delete data" calls)."""
+    with db(env) as c:
+        owner = c.execute("select user_id from org_members where org_id=%s and role='owner' limit 1",
+                          (env["org"],)).fetchone()[0]
+        c.execute("set role authenticated")
+        c.execute("select set_config('request.jwt.claims', %s, false)", (json.dumps({"sub": str(owner)}),))
+        c.execute("select request_org_data_deletion(%s)", (env["org"],))
+
+
+def test_data_deletion_during_upload_ends_cancelled_without_judgments_and_expires_results(env, monkeypatch):
     clear_jobs(env)
     jid = submit(env, ROWS)
     w = work(env)
     real_upload = w.storage.upload
 
-    async def upload_then_cancel(bucket, path, local, ctype):
+    async def upload_then_delete(bucket, path, local, ctype):
         await real_upload(bucket, path, local, ctype)
-        with db(env) as c:  # what POST /cancel or request_org_data_deletion() does while results upload
-            c.execute("update jobs set cancel_requested = true where id=%s", (jid,))
+        request_deletion(env)  # the owner deletes the org's data while the results upload
 
-    monkeypatch.setattr(w.storage, "upload", upload_then_cancel)
+    monkeypatch.setattr(w.storage, "upload", upload_then_delete)
     assert run_one(w) is True
     with db(env) as c:
         status, results, expire, locked = c.execute(
@@ -312,11 +326,40 @@ def test_cancel_during_upload_ends_cancelled_without_judgments_and_expires_resul
         assert expired == set(results.values())  # the purge deletes the uploaded files
         actions = [r[0] for r in c.execute("select action from audit_log where target=%s order by id", (str(jid),))]
         assert actions[-1] == "job.cancelled"
+        charged = c.execute("select judgments from usage_events where source='job' order by id desc limit 1"
+                            ).fetchone()[0]
+        assert charged >= 3  # the model did the work: metered even though the data is deleted
     with TestClient(create_app(env["s"])) as c:
         assert c.get(f"/v1/jobs/{jid}/results", headers=env["keys"]["all"]).status_code == 409
 
 
-def test_finish_inserts_judgments_and_status_in_one_transaction(env, monkeypatch):
+def test_cancel_during_upload_ends_cancelled_and_keeps_its_work(env, monkeypatch):
+    clear_jobs(env)
+    jid = submit(env, ROWS)
+    w = work(env)
+    real_upload = w.storage.upload
+
+    async def upload_then_cancel(bucket, path, local, ctype):
+        await real_upload(bucket, path, local, ctype)
+        with db(env) as c:  # what POST /v1/jobs/{id}/cancel does while the results upload
+            c.execute("update jobs set cancel_requested = true where id=%s", (jid,))
+
+    monkeypatch.setattr(w.storage, "upload", upload_then_cancel)
+    assert run_one(w) is True
+    with db(env) as c:
+        status, results, expire, counts = c.execute(
+            "select status, results, results_expire_at, counts from jobs where id=%s", (jid,)).fetchone()
+        assert status == "cancelled" and results and expire is None
+        n = c.execute("select count(*) from judgments where job_id=%s", (jid,)).fetchone()[0]
+        assert n >= 3 and counts["judgments"] == counts["judgments_charged"] == n
+    with TestClient(create_app(env["s"])) as c:
+        r = c.get(f"/v1/jobs/{jid}/results", headers=env["keys"]["all"])
+        assert r.status_code == 200 and "passed" in r.json()["files"]
+
+
+def test_finish_failure_keeps_the_stored_judgments_and_charges_them(env, monkeypatch):
+    """The finishing transaction fails: the job is failed, not succeeded; the judgments stored while it ran
+    stay, and exactly those are metered (they used to be dropped, and nothing was charged)."""
     clear_jobs(env)
     jid = submit(env, ROWS)
     w = work(env)
@@ -328,10 +371,13 @@ def test_finish_inserts_judgments_and_status_in_one_transaction(env, monkeypatch
         return await real_q(sql, args)
 
     monkeypatch.setattr(w, "q", failing_audit)
-    assert run_one(w) is True  # the job fails; neither 'succeeded' nor its judgments were committed
+    assert run_one(w) is True
     with db(env) as c:
         assert c.execute("select status from jobs where id=%s", (jid,)).fetchone()[0] == "failed"
-        assert c.execute("select count(*) from judgments where job_id=%s", (jid,)).fetchone()[0] == 0
+        n = c.execute("select count(*) from judgments where job_id=%s", (jid,)).fetchone()[0]
+        metered = c.execute("select judgments from usage_events where source='job' order by id desc limit 1"
+                            ).fetchone()[0]
+        assert n >= 3 and metered == n
 
 
 # ------------------------------------------------------------------ audit N1b: the daily quota and jobs

@@ -114,6 +114,8 @@ class ApiKey:
     revoked_at: str | None = None
     last_used_at: str | None = None
     id: str | None = None
+    # when the key's organization was created (Postgres only): new orgs get a lower daily quota (audit 2, S1)
+    org_created_at: datetime | None = field(default=None, compare=False, repr=False)
 
 
 class KeyStore:
@@ -163,9 +165,6 @@ class KeyStore:
     def list(self) -> list[ApiKey]:
         return list(self._load().values())
 
-    async def averify(self, key: str) -> ApiKey | None:
-        return self.verify(key)
-
     async def alookup(self, key: str) -> ApiKey | None:
         return self.lookup(key)
 
@@ -181,11 +180,6 @@ class KeyStore:
         if rec is None or not hmac.compare_digest(rec.key_hash, hash_key(key, self.pepper)):
             return None
         return rec
-
-    def verify(self, key: str) -> ApiKey | None:
-        """The key record if ``key`` is valid and not revoked, else None."""
-        rec = self.lookup(key)
-        return None if rec is None or rec.revoked_at else rec
 
 
 def _print(k: ApiKey) -> None:

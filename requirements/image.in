@@ -1,0 +1,7 @@
+# Everything infra/Dockerfile.api installs (Gateway + job worker). Pinned with hashes in runtime.lock:
+#   uv pip compile requirements/image.in --generate-hashes --no-annotate --python-version 3.11 \
+#     --python-platform x86_64-manylinux_2_28 -c <freeze of the tested env> -o requirements/runtime.lock
+# Re-run after changing runtime.txt; Dependabot (.github/dependabot.yml) proposes updates; CI audits the lock.
+-r runtime.txt
+curatorkit[generation]==0.1.23   # the job worker runs CuratorKIT's Curator (generation extra: its LLM client)
+pyarrow                          # Parquet datasets in the worker
