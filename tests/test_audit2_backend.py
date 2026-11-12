@@ -318,6 +318,44 @@ def test_upstream_timeout_covers_queueing_behind_job_judgments_in_serve(tmp_path
     assert not refundable(timeout)
 
 
+# ------------------------------------------------------------------ B8: MCP uses the REST request models
+
+def gateway_app(tmp_path, **kw):
+    from test_gateway import PEPPER, stub_vllm
+
+    from gateway.keys import KeyStore
+
+    s = Settings(key_pepper=PEPPER, keys_file=str(tmp_path / "keys.json"), usage_file=str(tmp_path / "usage.jsonl"),
+                 model_revision="v1.0.0", vllm_base_url="http://vllm/v1", redis_url=None, **kw)
+    key, _ = KeyStore(s.keys_file, PEPPER).create("t", "org1", ["judge"], 6000)
+    seen: list = []
+    return create_app(s, transport=stub_vllm("plain", seen)), {"Authorization": f"Bearer {key}"}, seen
+
+
+def test_mcp_single_item_tools_enforce_the_rest_field_limits(tmp_path):
+    from test_gateway import SRC, mcp_call
+
+    app, h, seen = gateway_app(tmp_path, org_daily_judgments=10)
+    big = "x" * (3 * 1024 * 1024)  # 3 MB: under the 5 MB body limit, far over the 32,000-character field limit
+    with TestClient(app) as c:
+        for name, args in [("lorde_judge_reward", {"instruction": big, "response": "r"}),
+                           ("lorde_judge_grounding", {"source_text": big, "question": "q", "answer": "a"}),
+                           ("lorde_judge_grounding", {"source_text": SRC, "question": "q", "answer": big})]:
+            r = mcp_call(c, h, "tools/call", {"name": name, "arguments": args}).json()
+            assert r["result"]["isError"] and "payload_too_large: " in r["result"]["content"][0]["text"]
+        r = mcp_call(c, h, "tools/call", {"name": "lorde_judge_reward",
+                                          "arguments": {"instruction": "", "response": "r"}}).json()
+        assert "invalid_request: " in r["result"]["content"][0]["text"]
+        r = mcp_call(c, h, "tools/call", {"name": "lorde_judge_reward",
+                                          "arguments": {"instruction": "i", "response": "r", "threshold": 7}}).json()
+        assert "invalid_request: " in r["result"]["content"][0]["text"]
+        assert seen == []  # nothing reached the model server
+        assert app.gw.quota.used_sync("org1") == 0  # and no quota was spent
+        r = mcp_call(c, h, "tools/call", {"name": "lorde_judge_reward",
+                                          "arguments": {"instruction": "Explain X", "response": "X is a thing."}}).json()
+        assert not r["result"].get("isError") and len(seen) == 1
+
+
 def test_default_job_row_cap_fits_the_time_limit_on_one_cpu_slot():
     s = Settings()
     assert s.job_max_rows * 2 * 30 <= s.job_max_seconds  # 2 gates x 30 s per judgment, worst case on CPU

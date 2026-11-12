@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING, Any, Literal
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ValidationError
 
 from lorde_forge import contract
 
 from .errors import REFUNDED, InvalidRequest, LordeError, NotFound, PayloadTooLarge, refundable
+from .models import BatchRequest, GroundingRequest, RewardRequest
 
 if TYPE_CHECKING:
     from .app import Gateway
@@ -40,6 +42,18 @@ def _api_errors(fn):
     return wrapper
 
 
+def validated(model: type[BaseModel], data: dict[str, Any]) -> Any:
+    """Validate tool arguments with the REST request model (audit 2, B8): the same field limits and the same
+    errors (413 payload_too_large for an over-long field, 400 invalid_request otherwise)."""
+    try:
+        return model.model_validate(data)
+    except ValidationError as e:
+        errs = e.errors()
+        loc = ".".join(str(x) for x in errs[0]["loc"]) if errs else ""
+        cls = PayloadTooLarge if any(x.get("type") == "string_too_long" for x in errs) else InvalidRequest
+        raise cls(f"{loc}: {errs[0]['msg']}" if errs else "invalid arguments") from e
+
+
 def build(gw: Gateway) -> MCPServer:
     mcp = MCPServer(
         name="lorde",
@@ -52,6 +66,13 @@ def build(gw: Gateway) -> MCPServer:
 
     async def _call(ctx: Context, kind: str, fields: dict[str, Any], threshold: float | None, cost: int = 1):
         key = await gw.authenticate(ctx.headers or {}, scope="judge")
+        models: dict[str, type[BaseModel]] = {"reward": RewardRequest, "grounding": GroundingRequest,
+                                              "batch": BatchRequest}
+        model = models[kind]
+        req = validated(model, {**fields, "threshold": threshold})  # before any rate-limit token or quota is spent
+        threshold = req.threshold
+        if kind != "batch":
+            fields = req.model_dump(exclude={"threshold"})
         await gw.rate_limit(key, cost)
         await gw.spend(key, cost)
         rid = "req_" + secrets.token_hex(8)
