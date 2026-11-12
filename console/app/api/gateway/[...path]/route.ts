@@ -2,7 +2,7 @@ import { type NextRequest, NextResponse } from "next/server";
 
 import { apiError, sessionUserId, unauthenticated } from "@/lib/api";
 import { env, supabaseEnabled } from "@/lib/env";
-import { ALLOWED, timeoutFor } from "@/lib/relay";
+import { ALLOWED, IDEMPOTENCY_KEY, timeoutFor } from "@/lib/relay";
 
 export const dynamic = "force-dynamic";
 /** Seconds: longer than the relay's slowest timeout (RELAY_MAX_DURATION_S in lib/relay.ts; a unit test checks both). */
@@ -53,6 +53,8 @@ export { forward as GET, forward as POST };
 /** The caller's key, plus (with a relay secret) the end user's IP so the Gateway's per-IP limit applies per user. */
 function relayHeaders(req: NextRequest, key: string): Record<string, string> {
   const h: Record<string, string> = { authorization: `Bearer ${key}`, "content-type": "application/json" };
+  const idem = req.headers.get("idempotency-key");
+  if (idem && IDEMPOTENCY_KEY.test(idem)) h["idempotency-key"] = idem;  // job creation: a retried request returns the same job
   if (env.relaySecret) {
     const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0]!.trim() || req.headers.get("x-real-ip") || "";
     if (ip) {

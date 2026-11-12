@@ -13,9 +13,13 @@ export type DatasetState = "ready" | "uploading" | "incomplete" | "expired";
 /** How long a started upload may still be in flight (the Gateway's signed upload URLs last at most two hours). */
 export const UPLOAD_WINDOW_MS = 2 * 3600 * 1000;
 
-export function datasetState(d: Pick<Dataset, "expires_at">, now: number, startedAt?: number): DatasetState {
+/**
+ * `pending` is this browser's record for the dataset (see readPending): the time its upload started, or minus the
+ * time it failed. No record: nothing is known against it.
+ */
+export function datasetState(d: Pick<Dataset, "expires_at">, now: number, pending?: number): DatasetState {
   if (d.expires_at && Date.parse(d.expires_at) <= now) return "expired";
-  if (startedAt !== undefined) return now - startedAt < UPLOAD_WINDOW_MS ? "uploading" : "incomplete";
+  if (pending !== undefined) return pending > 0 && now - pending < UPLOAD_WINDOW_MS ? "uploading" : "incomplete";
   return "ready";
 }
 
@@ -32,7 +36,10 @@ export function jobDatasetLabel(j: Pick<Job, "dataset_name" | "config">): string
   return "Deleted dataset";
 }
 
-/** Uploads this browser started and has not seen finish: { dataset id: started at (ms) }. */
+/**
+ * Uploads this browser started and has not seen finish: { dataset id: started at (ms) }, or minus the time the file
+ * transfer failed. Finished uploads are removed.
+ */
 const PENDING_KEY = "lorde.pendingUploads";
 export function readPending(store: Pick<Storage, "getItem"> | undefined): Record<string, number> {
   try {
@@ -45,6 +52,6 @@ export function readPending(store: Pick<Storage, "getItem"> | undefined): Record
 }
 export function writePending(store: Pick<Storage, "setItem"> | undefined, pending: Record<string, number>, now = Date.now()) {
   // forget entries older than a week: the dataset row is purged by then anyway
-  const kept = Object.fromEntries(Object.entries(pending).filter(([, t]) => now - t < 7 * 24 * 3600 * 1000));
+  const kept = Object.fromEntries(Object.entries(pending).filter(([, t]) => now - Math.abs(t) < 7 * 24 * 3600 * 1000));
   try { store?.setItem(PENDING_KEY, JSON.stringify(kept)); } catch { /* storage full or blocked: labels only */ }
 }

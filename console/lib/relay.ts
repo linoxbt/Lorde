@@ -14,5 +14,8 @@ export const RELAY_MAX_DURATION_S = 130;
 
 export const ALLOWED = /^v1\/(judge\/(reward|grounding|batch)|uploads|jobs(\/[0-9a-f-]{36}(\/(results|cancel))?)?|models|usage)$/;
 
+/** What the Gateway accepts as an Idempotency-Key (gateway/jobs.py); anything else is not forwarded. */
+export const IDEMPOTENCY_KEY = /^[A-Za-z0-9_.:-]{8,128}$/;
+
 export const timeoutFor = (p: string) =>
   (p.startsWith("v1/judge") || p.startsWith("v1/jobs") || p === "v1/uploads" ? RELAY_SLOW_MS : RELAY_FAST_MS);

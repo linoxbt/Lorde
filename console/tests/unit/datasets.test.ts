@@ -11,6 +11,7 @@ test("expired and unfinished uploads are not ready", () => {
   assert.equal(datasetState({ expires_at: "2026-11-12T11:59:59Z" }, NOW), "expired");
   assert.equal(datasetState({ expires_at: null }, NOW, NOW - 60_000), "uploading");
   assert.equal(datasetState({ expires_at: null }, NOW, NOW - UPLOAD_WINDOW_MS), "incomplete");
+  assert.equal(datasetState({ expires_at: null }, NOW, -(NOW - 1000)), "incomplete", "the transfer failed");
   assert.equal(datasetState({ expires_at: "2026-11-01T00:00:00Z" }, NOW, NOW), "expired");
 });
 
@@ -26,8 +27,8 @@ test("pending uploads survive junk in localStorage", () => {
   const m = new Map<string, string>();
   const store = { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v) };
   assert.deepEqual(readPending(store), {});
-  writePending(store, { a: NOW, old: NOW - 8 * 24 * 3600 * 1000 }, NOW);
-  assert.deepEqual(readPending(store), { a: NOW });
+  writePending(store, { a: NOW, failed: -NOW, old: NOW - 8 * 24 * 3600 * 1000, oldFailed: -(NOW - 8 * 24 * 3600 * 1000) }, NOW);
+  assert.deepEqual(readPending(store), { a: NOW, failed: -NOW });
   m.set("lorde.pendingUploads", "not json");
   assert.deepEqual(readPending(store), {});
   m.set("lorde.pendingUploads", JSON.stringify({ a: "x", b: 5 }));

@@ -63,3 +63,17 @@ test("a page past the end is an empty page with a way back, not the error screen
   await page.getByRole("link", { name: "Go to the last page" }).click();
   await expect(page.locator("tbody td:nth-child(5)").first()).toBeVisible();
 });
+
+test("datasets show a status; only ready ones can start a job", async ({ page }) => {
+  await page.goto("/console/datasets");
+  await expect(page.locator("tbody tr").first().getByText("Ready")).toBeVisible();
+  // an upload this browser started whose file never arrived
+  await page.evaluate(() => localStorage.setItem("lorde.pendingUploads", JSON.stringify({ d2: -Date.now() })));
+  await page.goto("/console/datasets", { waitUntil: "networkidle" });
+  const row = page.locator("tbody tr").filter({ hasText: "policy-qa-multilingual.parquet" });
+  await expect(row.getByText("Upload incomplete")).toBeVisible();
+  await expect(row.getByRole("link", { name: /Gate it/ })).toHaveCount(0);
+  await page.goto("/console/jobs/new?dataset=d2", { waitUntil: "networkidle" });
+  await expect(page.locator("#ds option[value=d2]")).toBeDisabled();
+  await expect(page.locator("#ds")).not.toHaveValue("d2");
+});
