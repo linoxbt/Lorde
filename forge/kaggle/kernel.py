@@ -10,7 +10,7 @@ import sys
 
 SESSION = "a"
 REPO = os.environ.get("LORDE_REPO", "https://github.com/linoxbt/Lorde.git")
-BRANCH = os.environ.get("LORDE_BRANCH", "ccr-e4bea25f-7bzaqy")
+BRANCH = os.environ.get("LORDE_BRANCH", "main")
 
 for name in ("hf_token", "cohere_api_key"):
     hits = glob.glob(f"/kaggle/input/**/{name}", recursive=True)

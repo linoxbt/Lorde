@@ -1,3 +1,4 @@
 # forge-serve: step 0 (vLLM servers for teacher, student and Lorde). vLLM pins its own torch.
-vllm>=0.30                   # AuditKIT's vLLM extra floor; OpenAI server + structured outputs
+vllm>=0.30                   # AuditKIT's vLLM extra floor; OpenAI server + structured outputs. Not pinned:
+                             # no local environment has it (GPU only); pin to the Kaggle run's version when known
 huggingface_hub>=1.0

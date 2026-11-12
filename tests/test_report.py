@@ -92,6 +92,9 @@ def test_report_only_on_legacy_session_c_artefacts(tmp_path):
     assert all("reason" in c for c in rep["acceptance"]) and rep["promotable"] is False
     md = (tmp_path / "results" / "judge_eval.md").read_text()
     assert "Promotable: no" in md and "Tesla T4" in md and "not measured" in md
+    # audit 2, B7: the md says the predictions are a trusted legacy cache and how to recompute them
+    assert "## Prediction caches" in md and "nothing proves the earlier session" in md
+    assert "without `--trust-legacy-cache`" in md and lorde["cache"]["legacy_trusted"] is True
 
     run("docs/build_article.py", env=env)
     art = (tmp_path / "docs" / "HF_ARTICLE.md").read_text()

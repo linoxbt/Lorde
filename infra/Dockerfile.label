@@ -2,6 +2,14 @@
 # Env: HF_TOKEN (fine-grained, write access to the work repo only), LABEL_HUB_REPO, LABEL_PASSWORD and
 # LABEL_NAME (= the login username, recorded as the labeller) or LABEL_USERS=name:password,...; PORT.
 # The tool refuses to start without a password, and refuses a sample that is not blind (forge/04b_blind_sample.py).
+#
+# Storage: labels are written to LORDE_LABEL_DATA_DIR (default /app/data) and pushed to the hub after every save
+# (compare-and-swap commits, retried until they land). Mount a persistent volume there so saves that have not
+# reached the hub yet survive a redeploy or restart: on Railway, add a volume to the service with mount path
+# /app/data (or mount it elsewhere and set LORDE_LABEL_DATA_DIR to that path). Railway mounts volumes as root, and
+# this image runs as uid 10001: set RAILWAY_RUN_UID=0 on the service (Railway's documented fix for non-root
+# images); the tool exits with a clear message at start if the directory is not writable.
+# The sample key (human_sample_key.jsonl) is never needed here: keep it out of LABEL_HUB_REPO (LORDE_LABEL_KEY_REPO).
 FROM python:3.11-slim
 RUN useradd --create-home --uid 10001 label
 WORKDIR /app
@@ -10,5 +18,5 @@ COPY lorde_forge lorde_forge
 COPY forge/04_label_tool.py forge/04_label_tool.py
 RUN mkdir -p /app/data && chown -R label:label /app/data
 USER label
-ENV PYTHONUNBUFFERED=1 HF_HOME=/home/label/.cache/huggingface
+ENV PYTHONUNBUFFERED=1 HF_HOME=/home/label/.cache/huggingface LORDE_LABEL_DATA_DIR=/app/data
 CMD ["sh", "-c", "python forge/04_label_tool.py --host 0.0.0.0"]

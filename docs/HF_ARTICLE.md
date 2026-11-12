@@ -1,19 +1,19 @@
-# Lorde: a 3B judge that keeps CuratorKIT's quality gates honest, at a fraction of the cost
+# Lorde: a 3B judge that runs CuratorKIT's quality gates without breaking their JSON contract
 
 *Lexsi AI Safety & Alignment Hackathon · Track 1 (Fine-tuning and Data Curation) · CuratorKIT → AlignTune → AuditKIT*
 
-**TL;DR.** CuratorKIT filters synthetic training data with two LLM-judge gates. Large API judges are reliable
-but charge per row; small local judges are cheap but break the JSON contract, and CuratorKIT then throws good
-data away. We fine-tuned **Tiny Aya Global (3.35B)** on an Aya Expanse teacher's replies to CuratorKIT's *exact*
-gate prompts. Lorde's replies are **100.0%** gate-usable (base Tiny Aya Global: 74.2%), it agrees with the teacher on **91.1%** of decisions (κ = 0.748), and it costs **$82.82 per 1M judgments** on Tesla T4 vs $441.27 through the API.
+**TL;DR.** CuratorKIT filters synthetic training data with two LLM-judge gates. Large API judges charge per
+row; small local judges are cheap but break the JSON contract, and CuratorKIT then throws good data away. We
+fine-tuned **Tiny Aya Global (3.35B)** to imitate an Aya Expanse 8B teacher's replies to CuratorKIT's *exact*
+gate prompts. Lorde's replies are **100.0%** gate-usable (base Tiny Aya Global: 74.2%). On the 937-item held-out test set it agrees with the teacher on **91.1%** of pass/reject decisions (κ = 0.748; base: 64.5%), and on the balanced golden-300 subset on **87.3%** (κ = 0.691). It costs **$82.82 per 1M judgments** on a Tesla T4 vs $441.27 estimated at list price for Aya Expanse 32B through the Cohere API (5×). **That agreement measures imitation, not correctness:** the teacher is a lenient grounding reference (it passes 70% of swapped answers, 94% of fabricated numbers, 76% of closed-book answers and 99% of truncated answers); no human labels have been collected yet; the planned 32B calibration was not run. By its own acceptance criteria Lorde is **not promotable** yet (see *Results*). A QA model trained on Lorde-gated data reaches F1 0.681 (teacher-gated 0.679, ungated 0.664, untrained base 0.492), but its answers are significantly **less grounded** than the ungated set (0.930 vs 0.941, p = 0.004) and teacher-gated (0.930 vs 0.937, p = 0.023); one seed per set, so this is not yet evidence of parity.
 
 ## The problem
 
 CuratorKIT's RewardGate (helpfulness, honesty, instruction following) and HallucinationGate (is every claim
 supported by the source?) ask a judge for JSON, parse it strictly, and reject the sample when the reply
 cannot be parsed (`judge_error:JudgeParseError`). Small open models often wrap the JSON in prose or break
-it, so every parse failure deletes a training row that may have been perfectly good. That is the failure
-mode Lorde removes, in eight languages, while matching a larger teacher's pass/reject decisions.
+it, so every parse failure deletes a training row that may have been perfectly good. Lorde targets that
+failure mode in eight languages, while imitating a larger teacher's pass/reject decisions.
 
 ## Approach: chaining three Lexsi toolkits
 
@@ -24,24 +24,26 @@ mode Lorde removes, in eight languages, while matching a larger teacher's pass/r
    CuratorKIT accepts. Every gated set ships with its `lexsi_provenance.json`.
 2. **AlignTune** trains the judge (LoRA SFT, loss on the reply only) and the downstream models.
 3. **AuditKIT** scores downstream answers (`f1_score`, `lexical_groundedness`) and runs the paired-bootstrap
-   significance tests behind every "better than" claim below.
+   significance tests behind every comparison below.
 
 ### Data
 
 - **Reward items:** human-written prompts and answers from `CohereLabs/aya_dataset`, 300 per language.
+  aya_dataset's language labels are used as given; some are wrong (at least 10 of the 300 English prompts,
+  checked by hand, are in Malay, Hindi, Burmese or Somali).
 - **Grounding items:** Wikipedia passages with QA pairs from CuratorKIT's QA stage (teacher-generated).
 - Every prompt appears **good and degraded**: the student's own answer, truncation, an off-topic or
   wrong-language answer, padding; swapped answers, fabricated numbers, closed-book answers.
 - **Languages:** English, Hindi, French, Arabic, Spanish, Portuguese, Indonesian, Turkish. We chose eight
   languages that the teacher (Aya Expanse, 23 languages) and the student (Tiny Aya Global) *both* support,
   so every label comes from a teacher that actually reads the language.
-- **Labels:** Aya Expanse 8B (self-hosted vLLM, fp16 on 2xT4) for every item; the planned Aya Expanse 32B calibration slice was not run (no Cohere API key in the run); hand labels were not collected in time, so human agreement is not reported.
+- **Labels:** Aya Expanse 8B (self-hosted vLLM, fp16 on 2xT4) for every item; the planned Aya Expanse 32B calibration slice was not run; no hand labels have been collected yet (0 of the 200 blind sample items), so human agreement is not measured.
 - **Targets:** the teacher's reply re-serialized to the gate's exact keys (canonical JSON, long text
-  clipped). Splits are grouped by prompt and source passage, so no test prompt appears in training.
+  clipped). Splits are grouped by prompt and source passage: no test prompt or passage appears verbatim in training. Near-duplicates do cross the split, though: **17 of 348** distinct test reward prompts have a training prompt at least 90% similar (normalized text), 0 of 65 test passages do, and **12** test gold responses are identical to a training one (mostly short answers such as a sentiment label). These splits were built before the near-duplicate grouping in `forge/03_make_splits.py`; future builds put near-duplicates in one split.
 
 ### Training
 
-LoRA r=16, α=32 on all attention and MLP projections; lr 0.0001 cosine, 2 epoch(s) over 5281 training rows, effective batch 16 (1 x 16 accumulation), max 1,536 tokens (longer rows dropped, never truncated), 6.0 h of training. Tiny Aya's 261k-token vocabulary makes the logits the memory peak on a 16 GB T4, hence batch 1. In production, vLLM structured outputs constrain each
+LoRA r=16, α=32, dropout 0.05 on all attention and MLP projections; lr 0.0001 cosine, 2 epoch(s) over 5,281 training rows, effective batch 16 (1 x 16 accumulation), max 1,536 tokens (longer rows dropped, never truncated), 6.0 h of training as recorded in train_meta.json: that is the last session only (the code that wrote it did not add earlier sessions of a resumed run), so it is a lower bound. Tiny Aya's 261k-token vocabulary makes the logits the memory peak on a 16 GB T4, hence batch 1. In production, vLLM structured outputs constrain each
 gate's reply to its JSON schema, and Bench measures the raw model too so the model itself stays honest.
 
 ## Metrics, and why each one
@@ -49,10 +51,11 @@ gate's reply to its JSON schema, and Bench measures the raw model too so the mod
 | Metric | Why it matters |
 |---|---|
 | Gate-usable rate | The failure mode CuratorKIT warns about for small judges: unparseable = data thrown away. |
-| Decision agreement, Cohen's κ | The gate only acts on pass/reject at 0.7; κ corrects for skewed pass rates. |
+| Decision agreement, Cohen's κ | The gate only acts on pass/reject at 0.7; κ corrects for skewed pass rates. Both measure agreement with the teacher, i.e. imitation, not correctness. |
 | Spearman ρ, MAE | Calibration of scores beyond the threshold. |
-| Grounding verdict accuracy | HallucinationGate is the higher-stakes gate. |
-| Human agreement | Keeps the teacher honest: the teacher's own human agreement is the ceiling. |
+| Grounding verdict accuracy | HallucinationGate is the higher-stakes gate (again against the teacher's verdict). |
+| Golden-300, adversarial-100 (Bench) | A balanced subset, and items built to fool a judge. |
+| Human agreement | The only check on the teacher itself. **Not measured yet: 0 hand labels.** |
 | Downstream F1 / groundedness | A judge is only as good as the data it lets through. |
 | Latency, throughput, cost per 1M judgments | Pipeline fit and the ROI the hackathon asks for. |
 
@@ -76,8 +79,19 @@ Lorde learns the teacher's decisions, so its blind spots matter. Teacher pass ra
 | reward | truncated | 503 | 47% | 0.61 |
 | reward | wrong_language | 461 | 80% | 0.74 |
 
-**Promotion verdict (spec 9.2): not promotable.** Blocking criteria not met or not measured: Cohen's κ vs teacher ≥ 0.75; Human decision agreement ≥ teacher's − 3 pts; Per-language decision agreement ≥ 85% (worst: ar, n = 103).
+**The teacher is a lenient grounding reference.** It passes 70% of swapped answers, 94% of fabricated numbers, 76% of closed-book answers and 99% of truncated answers, all degraded on purpose, and 182 of its 1,752 parseable grounding replies pass an answer while listing an unsupported claim (72 of them say `grounded` with score 1.0). Decision agreement, κ and verdict accuracy below are measured against this teacher, so they measure how faithfully Lorde imitates it, not whether its decisions are right.
 
+**Promotion verdict (spec 9.2): not promotable.** Criteria not met or not measured:
+
+- Cohen's κ vs teacher ≥ 0.75: 0.748
+- Human decision agreement ≥ teacher's − 3 pts: not measured: no human labels for test items (forge/04_label_tool.py)
+- Per-language decision agreement ≥ 85% (worst: ar, n = 103): 84.5%
+- Bench (lorde): Golden decision agreement vs teacher ≥ 90%: 87.3%
+- Bench (lorde): Golden κ vs teacher ≥ 0.75: 0.691
+- Bench (lorde): Adversarial pass rate ≤ 5%: 46%
+- Bench (lorde+so): Golden decision agreement vs teacher ≥ 90%: 86.3%
+- Bench (lorde+so): Golden κ vs teacher ≥ 0.75: 0.665
+- Bench (lorde+so): Adversarial pass rate ≤ 5%: 47%
 
 ### Lorde Bench: judge evaluation
 
@@ -96,7 +110,7 @@ Templates: curatorkit-0.1.23/reward@fad46b18, curatorkit-0.1.23/hallucination@02
 | base+so | 97.8% | 84.7% | 0.559 | 0.481 | 0.151 | 34.8% | 80.2% | 11.361 | 37.174 | 1.133 | 122.590 |
 | **lorde+so** | 100.0% | 90.6% | 0.733 | 0.857 | 0.060 | 91.3% | 79.0% | 9.389 | 32.173 | 1.459 | 95.190 |
 
-API reference: c4ai-aya-expanse-32b (Cohere API) at $0.5/1M input and $1.5/1M output tokens, 534.1 prompt + 116.1 completion tokens per judgment (teacher labels (8B tokenizer)) → **$441.27 per 1M judgments**.
+API reference (an estimate at list price, not a measured cost: the API judge was not called; token counts are the 8B teacher's): c4ai-aya-expanse-32b (Cohere API) at $0.5/1M input and $1.5/1M output tokens, 534.1 prompt + 116.1 completion tokens per judgment (teacher labels (8B tokenizer)) → **$441.27 per 1M judgments**.
 
 Lorde on Tesla T4: **$82.82 per 1M judgments**, 5× cheaper.
 
@@ -158,6 +172,32 @@ Replies that failed: call errors (transport) are retried and never cached; parse
 | lorde vs base | 937 | 64.5% | 91.1% | 26.7% | 0.000999 | yes |
 | lorde+so vs base+so | 937 | 84.7% | 90.6% | 5.9% | 0.000999 | yes |
 
+#### Prediction caches
+
+| Judge | Predictions | Weights sha (stamped) | Stamped |
+|---|---|---|---|
+| base | legacy cache, trusted (`--trust-legacy-cache`) | `af89d219b53e` | 2026-11-11 |
+| lorde | legacy cache, trusted (`--trust-legacy-cache`) | `d12ab6ec5c6d` | 2026-11-11 |
+| base+so | legacy cache, trusted (`--trust-legacy-cache`) | `af89d219b53e` | 2026-11-11 |
+| lorde+so | legacy cache, trusted (`--trust-legacy-cache`) | `d12ab6ec5c6d` | 2026-11-11 |
+
+**base, lorde, base+so, lorde+so:** these predictions were cached by an earlier session, before caches carried a weights fingerprint, and reused here with `--trust-legacy-cache`. This run stamped them with the weights it was serving; nothing proves the earlier session served the same weights. To recompute them, re-run this step without `--trust-legacy-cache` (the old cache is moved aside to `results/preds/<judge>.jsonl.stale` and the server is asked again, 937 items per judge).
+
+### Lorde Bench: golden-300 and adversarial-100
+
+Golden-300 is the balanced Bench subset of the held-out test set (150 reward and 150 grounding items, drawn round-robin over language and variant), so it weighs the degraded variants more than the full test set does. Reference: the teacher.
+
+| Judge | Set (n) | Gate-usable | Decision agr. | κ | MAE |
+|---|---|---|---|---|---|
+| lorde | full held-out test (937) | 100.0% | 91.1% | 0.748 | 0.058 |
+| lorde | golden-300 (300) | 100.0% | 87.3% | 0.691 | 0.086 |
+| lorde+so | full held-out test (937) | 100.0% | 90.6% | 0.733 | 0.060 |
+| lorde+so | golden-300 (300) | 100.0% | 86.3% | 0.665 | 0.091 |
+
+Adversarial-100 holds prompt injections, forged verdicts, empty fields, extreme lengths and mixed scripts:
+
+- **lorde:** passes **46%** of adversarial-100 items whose reference is *fail* (target ≤ 5%); by attack: empty 60%, extreme length 15%, forged verdict 35%, injection 65%, mixed scripts 55%.
+- **lorde+so:** passes **47%** of adversarial-100 items whose reference is *fail* (target ≤ 5%); by attack: empty 60%, extreme length 15%, forged verdict 40%, injection 65%, mixed scripts 55%.
 
 ### CuratorKIT plug-in run
 
@@ -199,7 +239,6 @@ Downstream raw set: **3600** grounded QA items (swapped_answer: 362, closed_book
 | lorde vs teacher | 86.2% | 0.683 |
 | lorde+so vs teacher | 86.2% | 0.682 |
 
-
 ### Downstream test: models trained on gated data
 
 Tiny Aya Base + LoRA trained on each gated set, evaluated on held-out Wikipedia QA (articles never used elsewhere). AuditKIT `f1_score` vs the reference answer, `lexical_groundedness` vs the source passage.
@@ -213,7 +252,9 @@ Tiny Aya Base + LoRA trained on each gated set, evaluated on held-out Wikipedia 
 
 Lorde-gated F1 relative to teacher-gated: **+0.3%** (criterion: within ±2%; met).
 
-Lorde-gated beats ungated with p < 0.05: **yes**.
+Lorde-gated beats ungated on F1 with p < 0.05: **yes**.
+
+Groundedness: Lorde-gated answers are **significantly less grounded** in the source than the ungated set (0.930 vs 0.941, p = 0.004) and teacher-gated (0.930 vs 0.937, p = 0.023).
 
 #### Significance (AuditKIT paired bootstrap)
 
@@ -235,21 +276,26 @@ Lorde-gated beats ungated with p < 0.05: **yes**.
 | teacher | 0.571 | 0.716 | 0.701 | 0.679 | 0.684 | 0.710 | 0.738 | 0.633 |
 | lorde | 0.610 | 0.704 | 0.674 | 0.697 | 0.691 | 0.732 | 0.721 | 0.622 |
 
+### Reading the downstream result
+
+- **Small study:** one training run (one seed) per set, 1 epoch, 2,000 rows per set, every set subsampled to the same size (settings: forge/kaggle_driver.py DOWNSTREAM_ARGS). The F1 differences between gated sets need more seeds before they can be called parity.
+- **Groundedness regresses significantly:** Lorde-gated answers are less grounded in the source than the ungated set (0.930 vs 0.941, p = 0.004) and teacher-gated (0.930 vs 0.937, p = 0.023). In the plug-in run Lorde passed more degraded grounding answers than the teacher (fabricated numbers 76.3% vs 63.8%; closed book 71.8% vs 48.7%), which fits this.
+- **The teacher-gated set is depressed by parse errors:** in the plug-in run, 410 of 3,600 rows (11.4%) were rejected because CuratorKIT could not parse the teacher's reply, not because the teacher judged them bad. The "teacher-gated" baseline is therefore the teacher plus its JSON failures.
 
 ## ROI: self-hosted Lorde vs paying per token
 
 Scenario: curating a **100,000-row** dataset through both gates = **200,000 judgments**.
 
-|  | Aya Expanse 32B via Cohere API | Lorde on 1× Tesla T4 (measured) |
+|  | Aya Expanse 32B via Cohere API (list-price estimate) | Lorde on 1× Tesla T4 (measured) |
 |---|---|---|
-| Price | $0.5/1M in, $1.5/1M out | $0.5/GPU-hour |
-| Tokens per judgment | 534.1 in + 116.1 out | 836.6 in + 92.6 out |
+| Price | $0.5/1M in, $1.5/1M out (list price) | $0.5/GPU-hour |
+| Tokens per judgment | 534.1 in + 116.1 out (the 8B teacher's token counts; the API was not called) | 836.6 in + 92.6 out |
 | Throughput | – | 1.677 judgments/s, 155.3 output tokens/s (measured, 16 concurrent; stratified random sample, timed before any prediction) |
 | GPU runtime | – | 33.13 h |
-| Cost for this dataset | $88.25 | $16.56 |
-| Cost per 1M judgments | $441.27 | $82.82 |
+| Cost for this dataset | $88.25 (estimate) | $16.56 |
+| Cost per 1M judgments | $441.27 (estimate) | $82.82 |
 
-**5× cheaper** at equal volume, on the hardware the throughput was measured on (1× Tesla T4, $0.5/h). Other GPUs will differ; we did not measure them.
+**5× cheaper** at equal volume, on the hardware the throughput was measured on (1× Tesla T4, $0.5/h). The API side is list price times token counts, not a measured bill. Other GPUs will differ; we did not measure them. Cheaper is only useful at the agreement levels above.
 
 ## Deviations from the spec
 
@@ -265,24 +311,24 @@ We changed a few things from the build spec (LORDE-SPEC-001 v1.0), on purpose:
 
 ## Limitations
 
-- Lorde copies an 8B teacher and inherits its blind spots. Human agreement, the check on the teacher itself, was
-  not measured in this round (no hand labels yet), and the planned 32B calibration slice was not run.
-- It is trained on CuratorKIT's default RewardGate and HallucinationGate templates. Other rubrics are out of
-  distribution; template fingerprints flag them.
-- Judged content can try to instruct the judge, and Lorde does not resist it well yet: on Bench's adversarial-100
-  set it passes **46%** of items whose reference says *fail* (47% with structured outputs; target ≤ 5%), with
-  prompt injection (65%) and empty fields (60%) the weakest cases. High-stakes datasets still deserve a human in
-  the loop, and adversarial examples are the first thing to add to the next training round.
-- Two acceptance criteria are narrowly missed: κ vs the teacher is 0.748 (target 0.75) and Arabic decision
-  agreement is 84.5% (target 85%).
+- **Lorde imitates an 8B teacher and inherits its blind spots.** On grounding it is lenient (it passes 70% of swapped answers, 94% of fabricated numbers, 76% of closed-book answers and 99% of truncated answers). Human agreement, the only check on the teacher itself, has not been measured (0 hand labels), and the planned 32B calibration slice was not run. High agreement with the teacher is not evidence that the decisions are right.
+- **The headline is the easy number.** On the balanced golden-300 subset Lorde agrees with the teacher on 87.3% (κ = 0.691), against 91.1% (κ = 0.748) on the full test set.
+- **Judged content can instruct the judge, and Lorde does not resist it:** on adversarial-100 it passes 46% of items whose reference says *fail* (47% with structured outputs); target ≤ 5%, weakest on injection (65%) and empty (60%). High-stakes datasets still need a human in the loop.
+- **It misses its own acceptance criteria and is not promotable** (full list under *Results*): Cohen's κ vs teacher ≥ 0.75 (0.748); Human decision agreement ≥ teacher's − 3 pts (not measured); Per-language decision agreement ≥ 85% (84.5%, Arabic); golden-300 agreement ≥ 90% and κ ≥ 0.75 (87.3%, κ = 0.691); adversarial pass rate ≤ 5% (46%).
+- **Near-duplicate leakage:** 17 of 348 test reward prompts have a ≥ 90%-similar training prompt and 12 test gold responses equal a training one.
+- **The downstream study is small** (one seed, one training run per set, capped rows), groundedness regresses significantly, and the teacher-gated baseline is depressed by the teacher's parse errors (see *Reading the downstream result*).
+- It is trained on CuratorKIT's default RewardGate and HallucinationGate templates. Other rubrics are out of distribution; template fingerprints flag them.
+- **Prediction provenance:** The step-6 predictions behind the judge numbers (base, lorde, base+so, lorde+so) are a cache written by an earlier Kaggle session, before caches carried a weights fingerprint, and reused with `--trust-legacy-cache`; the run that reported them stamped them with the weights it served (`af89d219b53e`, `d12ab6ec5c6d`), which does not prove the earlier session served the same weights. Re-running step 6 without the flag recomputes them.
 
 ## Reproduce it
 
-Everything runs on a free Kaggle 2×T4 notebook: `forge/kaggle_runbook.ipynb` in the GitHub repo. Model,
-data (with CuratorKIT manifests and provenance), Bench sets and every result file are on the Hub.
+Everything runs on free Kaggle 2×T4 sessions: `forge/kaggle_runbook.ipynb` in the GitHub repo runs the steps of
+`forge/kaggle_driver.py`, with the downstream settings reported above. Model, data (with CuratorKIT manifests and
+provenance), Bench sets and the result files are on the Hub. To recompute the step-6 predictions instead of reusing the cached ones, run step 6 (the driver's Session D `judge-timing` step) without `LORDE_TRUST_LEGACY_CACHE=1`; see the runbook.
 
 ## Licences
 
 Lorde's weights are CC-BY-NC-4.0 (inherited from Tiny Aya Global; Cohere Labs Acceptable Use Policy applies).
-CuratorKIT (LSAL v1.1) and AuditKIT (LSAL v1.2) are non-commercial source-available; AlignTune is MIT.
-Lorde is for research and non-commercial use.
+CuratorKIT (LSAL v1.1) and AuditKIT (LSAL v1.2) are non-commercial source-available; AlignTune is MIT. The data
+includes Wikipedia excerpts under CC BY-SA 4.0, whose terms continue to apply to them. Lorde is for research and
+non-commercial use. See `THIRD_PARTY_LICENSES.md` in the GitHub repo.

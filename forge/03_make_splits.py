@@ -9,11 +9,20 @@ Outputs
   data/human_sample.jsonl                    200 test items to hand-label (step 4), blind: opaque ids,
                                              no variant/group, shuffled
   data/human_sample_key.jsonl                private key: opaque id -> uid, variant, group (never shown to
-                                             labellers; step 6 uses it to join the labels)
+                                             labellers; step 6 uses it to join the labels). Keep it where the
+                                             label service's token cannot read it (LORDE_LABEL_KEY_REPO)
 
 Splits are grouped by prompt (reward) or source chunk (grounding), so no test
 prompt or source passage appears in training. Only gate-usable teacher replies
 become targets; they are re-serialized to the gate's exact keys (canonical JSON).
+
+Near-duplicates: groups whose prompt (reward) or source passage (grounding) is at least
+``--near-dup-threshold`` similar (normalized difflib ratio, same kind and language) are merged into one group
+before splitting, so a re-punctuated or re-numbered copy of a test prompt cannot land in training. Groups
+without a near-duplicate keep their own bucket. The published v1 splits were built before this check
+(equivalent to ``--near-dup-threshold 0``): 17 of their 348 test reward prompts have a >= 0.9-similar training
+prompt and 12 test gold responses equal a training one (splits_summary.json "near_duplicates" reports this
+for every build).
 """
 
 from __future__ import annotations
@@ -40,6 +49,9 @@ def main() -> None:
     ap.add_argument("--human-n", type=int, default=200)
     ap.add_argument("--blind-salt", default=None,
                     help="salt for the opaque human-sample ids (default: random; ids already in the key are kept)")
+    ap.add_argument("--near-dup-threshold", type=float, default=splits.NEAR_DUP_THRESHOLD,
+                    help="merge groups whose prompt / source passage is at least this similar before splitting "
+                         "(0 disables it: the published v1 splits)")
     ap.add_argument("--max-prompt-chars", type=int, default=7000,
                     help="rough guard; step 5 drops rows over 1,536 tokens (config.MAX_SEQ_LEN) with the real "
                          "tokenizer")
@@ -70,7 +82,10 @@ def main() -> None:
                      "teacher_raw": lab["raw"], "teacher_verdict": target.get("verdict"),
                      "teacher_verdict_raw": j.verdict})
 
-    parts = splits.grouped_split(rows, val=args.val, test=args.test)
+    merged = splits.near_duplicate_groups(rows, args.near_dup_threshold)
+    for r in rows:
+        r["split_group"] = merged[str(r["group"])]
+    parts = splits.grouped_split(rows, val=args.val, test=args.test, key="split_group")
 
     def sft_row(r: dict) -> dict:
         user = {"role": "user", "content": r["prompt_text"]}
@@ -94,7 +109,9 @@ def main() -> None:
     n_test = jsonl.write(config.DATA / "test.jsonl", test)
 
     langs = [x.strip() for x in args.human_langs.split(",") if x.strip()]
-    human_pool = [t for t in test if t["lang"] in langs]
+    # Items whose text gives their variant away (the fabricated-figure suffix) would not be labelled blind:
+    # future samples leave them out (the published v1 sample has 14 of them; see lorde_forge.human.text_tells).
+    human_pool = [t for t in test if t["lang"] in langs and not human.text_tells(t)]
     sample = splits.stratified_sample(human_pool, args.human_n, keys=("kind", "lang", "variant"), salt="human")
     human.write_blind(sample, config.DATA / "human_sample.jsonl", config.DATA / "human_sample_key.jsonl",
                       salt=args.blind_salt)
@@ -105,6 +122,9 @@ def main() -> None:
         "test_by_kind_lang": Counter(f"{t['kind']}:{t['lang']}" for t in test),
         "test_teacher_pass_rate": round(sum(t["teacher_decision"] for t in test) / max(1, n_test), 4),
         "train_target_score_hist": Counter(round(r["teacher_score"], 1) for r in parts["train"]),
+        "near_duplicates": {"merged_groups": sum(g != m for g, m in merged.items()),
+                            **splits.leakage_report(parts["train"], parts["test"], splits.NEAR_DUP_THRESHOLD),
+                            "grouping_threshold": args.near_dup_threshold},
     }
     jsonl.write_json(config.DATA / "splits_summary.json", stats)
     print(f"[splits] train={n_train} val={n_val} test={n_test} human_sample={len(sample)} dropped={dict(dropped)}")

@@ -32,6 +32,13 @@ the test prompts. A cache that does not match is moved aside (<judge>.jsonl.stal
 from before fingerprints existed have no meta file; they are reused only with ``--trust-legacy-cache``:
 
     python forge/06_judge_eval.py --judge base=... --judge lorde=... --structured --report-only --trust-legacy-cache
+
+A trusted legacy cache is stamped with the weights the current run serves ("legacy_trusted": true in its
+meta.json), which does not prove the earlier session used those weights, so the report says so ("Prediction
+caches" in results/judge_eval.md, "cache" per judge in the JSON). To recompute such predictions, serve the
+judges and run this step without ``--trust-legacy-cache`` (and without ``--report-only``): the legacy cache is
+moved aside to results/preds/<judge>.jsonl.stale and every test item is asked again. On Kaggle, run the driver's
+Session D step ``judge-timing`` with LORDE_TRUST_LEGACY_CACHE unset (the default).
 """
 
 from __future__ import annotations
@@ -219,14 +226,12 @@ def main() -> None:
                 sys.exit(f"--report-only: cached predictions for {name} are not usable: {status} ({cache})")
             preds[name] = {r["uid"]: r for r in jsonl.read(cache)}  # the latest row per uid wins
             perf_stats[name] = old_judges.get(name, {}).get("perf", {})
-            cache_info[name] = {"status": status, "model": (fingerprint.read_meta(cache) or {}).get("model")}
+            cache_info[name] = cache_status(cache, status)
             continue
         print(f"[eval] judge {name} ({ep.model} @ {ep.base_url}, structured={structured})")
         preds[name] = predict(ep, test, structured, cache, args.concurrency, meta=meta,
                               trust_legacy=args.trust_legacy_cache)
-        legacy = (fingerprint.read_meta(cache) or {}).get("legacy_trusted")
-        cache_info[name] = {"status": "legacy, trusted by --trust-legacy-cache" if legacy else "fingerprinted",
-                            "model": models[ep.name]}
+        cache_info[name] = cache_status(cache, None, models[ep.name])
 
     rows = {name: [as_metric_row(preds[name].get(u)) for u in uids] for name in preds}
     report: dict = {"n_test": len(test), "templates": contract.fingerprints(), "hardware": hardware,
@@ -276,7 +281,8 @@ def main() -> None:
         for name in rows:
             report["calibration_32b"][name] = metrics.compare([rows[name][i] for i in ci], cref)
 
-    # API reference cost: Aya Expanse 32B at Cohere list price, with measured token counts.
+    # API reference cost: an estimate, Aya Expanse 32B at Cohere list price x mean token counts (of the 32B
+    # calibration replies when they exist, else of the 8B teacher's replies). No API bill is measured.
     tok_src = list(cal.values()) or jsonl.read(config.DATA / "labels.jsonl")
     tok_src = [r for r in tok_src if r.get("prompt_tokens")]
     if tok_src:
@@ -287,7 +293,8 @@ def main() -> None:
         report["api_reference"] = {"model": f"{config.CALIBRATION_MODEL} (Cohere API)",
                                    "mean_prompt_tokens": round(pt, 1), "mean_completion_tokens": round(ct, 1),
                                    "price_per_1M_tokens": price, "cost_per_1M_judgments": api,
-                                   "token_source": "calibration labels" if cal else "teacher labels (8B tokenizer)"}
+                                   "token_source": "calibration labels" if cal else "teacher labels (8B tokenizer)",
+                                   "estimate": "list price x mean tokens per judgment; no API bill was measured"}
 
     # AuditKIT significance: does the candidate agree with the teacher more often than the baseline?
     ref_dec = [t["teacher_score"] >= config.THRESHOLD for t in test]
@@ -383,6 +390,43 @@ def acceptance(r: dict, cand: str, min_lang_n: int = MIN_LANG_N) -> list[dict]:
     return out
 
 
+LEGACY_STATUS = "legacy, trusted by --trust-legacy-cache"
+
+
+def cache_status(cache: Path, status: str | None, model: dict | None = None) -> dict:
+    """Where a judge's predictions came from, for the report: freshly fingerprinted, or a legacy cache (written
+    before caches carried a weights fingerprint) that this run trusted and stamped with the weights it served."""
+    meta = fingerprint.read_meta(cache) or {}
+    legacy = bool(meta.get("legacy_trusted")) or (status or "").startswith("legacy")
+    return {"status": LEGACY_STATUS if legacy else "fingerprinted", "legacy_trusted": legacy,
+            "model": model if model is not None else meta.get("model"), "stamped": meta.get("written")}
+
+
+def cache_md(r: dict) -> str:
+    """Provenance of the predictions behind every number above (audit 2, B7)."""
+    js = r.get("judges", {})
+    if not any(j.get("cache") for j in js.values()):
+        return ""
+    rows, legacy = [], []
+    for name, j in js.items():
+        c = j.get("cache") or {}
+        is_legacy = bool(c.get("legacy_trusted")) or str(c.get("status", "")).startswith("legacy")
+        legacy += [name] if is_legacy else []
+        sha = str((c.get("model") or {}).get("sha") or "")[:12] or "–"
+        rows.append([name, ("legacy cache, trusted (`--trust-legacy-cache`)" if is_legacy else
+                            c.get("status") or "not recorded"), f"`{sha}`" if sha != "–" else sha,
+                     (c.get("stamped") or "–")[:10]])
+    out = ["## Prediction caches\n", table(["Judge", "Predictions", "Weights sha (stamped)", "Stamped"], rows), ""]
+    if legacy:
+        out += [f"**{', '.join(legacy)}:** these predictions were cached by an earlier session, before caches "
+                "carried a weights fingerprint, and reused here with `--trust-legacy-cache`. This run stamped them "
+                "with the weights it was serving; nothing proves the earlier session served the same weights. To "
+                "recompute them, re-run this step without `--trust-legacy-cache` (the old cache is moved aside to "
+                "`results/preds/<judge>.jsonl.stale` and the server is asked again, "
+                f"{r.get('n_test', '?')} items per judge).\n"]
+    return "\n".join(out)
+
+
 def promotable(criteria: list[dict]) -> bool:
     blocking = [c for c in criteria if c["blocking"]]
     return bool(blocking) and all(c["met"] is True for c in blocking)
@@ -431,7 +475,10 @@ def render_md(r: dict, cand: str) -> str:
     lines += ["## Before / after\n", table(head, body), ""]
     if "api_reference" in r:
         a = r["api_reference"]
-        lines += [f"API reference: {a['model']} at ${a['price_per_1M_tokens']['input']}/1M input and "
+        how = ("token counts of the 32B calibration replies" if a.get("token_source") == "calibration labels" else
+               "the API judge was not called; token counts are the 8B teacher's")
+        lines += [f"API reference (an estimate at list price, not a measured cost: {how}): "
+                  f"{a['model']} at ${a['price_per_1M_tokens']['input']}/1M input and "
                   f"${a['price_per_1M_tokens']['output']}/1M output tokens, {a['mean_prompt_tokens']} prompt + "
                   f"{a['mean_completion_tokens']} completion tokens per judgment ({a['token_source']}) → "
                   f"**${a['cost_per_1M_judgments']} per 1M judgments**.\n"]
@@ -481,6 +528,8 @@ def render_md(r: dict, cand: str) -> str:
                         [[k, s.get("n"), fmt(s.get("mean_baseline"), True), fmt(s.get("mean_candidate"), True),
                           fmt(s.get("delta"), True), s.get("p_value"), fmt(s.get("significant"))]
                          for k, s in r["significance_decision_agreement"].items()]), ""]
+    if cache_md(r):
+        lines += [cache_md(r)]
     return "\n".join(lines) + "\n"
 
 

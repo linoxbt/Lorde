@@ -81,6 +81,9 @@ def test_forge_pipeline(world):
     assert train and test
     assert train[0]["completion"][0]["role"] == "assistant"
     assert not {r["uid"].split(":")[0] for r in train} & {r["uid"].split(":")[0] for r in test}
+    nd = json.loads((root / "data" / "splits_summary.json").read_text())["near_duplicates"]
+    assert nd["test_prompts_near_train"] == 0 and nd["grouping_threshold"] == 0.9  # near copies share a split
+    assert "dropped_from_test" in json.loads((root / "data" / "splits_summary.json").read_text())  # step 6 reads it
     human = jsonl.read(root / "data" / "human_sample.jsonl")
     assert human and "teacher_score" not in human[0]
     # blind: opaque ids, no variant/group; the private key maps them back (audit B1)
@@ -121,6 +124,21 @@ def test_forge_pipeline(world):
     assert plug["judges"]["lorde"]["judge_error_rate"] == 0.0
     assert jsonl.read(root / "data" / "gated" / "lorde" / "passed.jsonl")
     assert list((root / "data" / "gated" / "lorde").glob("**/lexsi_provenance.json"))
+    # audit 2, B15: every entry and every gated set carries the raw-set fingerprint
+    sha = plug["raw_sha"]
+    assert {j["raw_sha"] for j in plug["judges"].values()} == {sha}
+    for name in ("lorde", "base", "base+so", "ungated"):
+        side = json.loads((root / "data" / "gated" / name / "passed.meta.json").read_text())
+        assert side["raw_sha"] == sha and side["n_passed"] == len(jsonl.read(root / "data" / "gated" / name /
+                                                                             "passed.jsonl"))
+    # an entry from another raw set (or one without a fingerprint) is not merged into a new run's report
+    plug["judges"]["base"]["raw_sha"] = "0" * 64
+    plug["judges"]["stale"] = {k: v for k, v in plug["judges"]["lorde"].items() if k != "raw_sha"}
+    jsonl.write_json(root / "results" / "plugin_eval.json", plug)
+    run("07_curatorkit_plugin.py", "--judge", f"lorde=openai/lorde@{world['lorde']}", "--concurrency", "4", env=env)
+    plug = json.loads((root / "results" / "plugin_eval.json").read_text())
+    assert set(plug["judges"]) == {"lorde", "base+so"} and all(" vs " not in k or "stale" not in k
+                                                                for k in plug["pairwise"])
 
     # Lorde Bench: frozen sets and the CI runner. The stub judge scores long answers high, so the
     # adversarial set (injections make answers longer) must trip the <= 5% gate and exit 1.
@@ -157,3 +175,37 @@ def test_forge_pipeline(world):
     run("docs/build_article.py", env=env)
     article = (root / "docs" / "HF_ARTICLE.md").read_text()
     assert "<!--" not in article and "cheaper" in article and "Pending" not in article
+
+
+def test_plugin_merge_and_gated_sidecar_units(tmp_path, monkeypatch):
+    """Audit 2, B15: the merge keeps only entries of this raw set and threshold; step 8 checks the sidecar."""
+    import importlib.util
+
+    def load(rel):
+        spec = importlib.util.spec_from_file_location(rel.replace("/", "_"), Path(__file__).resolve().parent.parent / rel)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    plug = load("forge/07_curatorkit_plugin.py")
+    raw = [{"instruction": "q", "input": "s", "output": "a"}, {"instruction": "q2", "input": "s", "output": "b"}]
+    sha = plug.raw_sha(raw)
+    assert sha == plug.raw_sha(raw[::-1]) and sha != plug.raw_sha(raw[:1])
+    old = {"judges": {"ok": {"raw_sha": sha, "threshold": 0.7}, "other": {"raw_sha": "x", "threshold": 0.7},
+                      "thr": {"raw_sha": sha, "threshold": 0.5}, "legacy": {"passed": 1}}}
+    assert set(plug.merge_report(old, sha, 0.7)["judges"]) == {"ok"}
+    kept = plug.merge_report(old, sha, 0.7, trust_legacy=True)["judges"]
+    assert set(kept) == {"ok", "legacy"} and kept["legacy"]["legacy_trusted"] is True
+
+    ds = load("forge/08_downstream.py")
+    monkeypatch.setattr(ds.config, "DATA", tmp_path)
+    jsonl.write(tmp_path / "downstream_raw.jsonl", raw)
+    jsonl.write(tmp_path / "gated" / "lorde" / "passed.jsonl", raw[:1])
+    assert ds.gated_set_ok("lorde", False)[0] is False and ds.gated_set_ok("lorde", True)[0] is True
+    from lorde_forge import fingerprint
+
+    fingerprint.write_meta(tmp_path / "gated" / "lorde" / "passed.jsonl", {"raw_sha": sha})
+    assert ds.gated_set_ok("lorde", False) == (True, "gated from the current raw set")
+    jsonl.write(tmp_path / "downstream_raw.jsonl", raw[:1])  # the raw set changed since step 7
+    ok, why = ds.gated_set_ok("lorde", True)
+    assert not ok and "re-run step 7" in why

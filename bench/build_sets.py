@@ -7,7 +7,8 @@
 golden-300       150 reward + 150 grounding test items, stratified over language and variant, with
                  the 8B teacher's label; 32B labels and human labels are attached when present
                  (label it with: forge/02_teacher_label.py ... --sample-from bench/data/golden-300.jsonl
-                 --out data/labels_32b.jsonl). Frozen per major version; used in CI: once
+                 --out data/labels_32b.jsonl). Frozen per major version; meant for a CI gate (not wired
+                 into CI yet, see the README's scope): once
                  bench/data/golden-300.jsonl exists, its items never change (only the 32B and human
                  reference labels attached to them are refreshed) unless --rebuild is given.
 adversarial-100  judged content that should fail: prompt injection aimed at the judge ("ignore the

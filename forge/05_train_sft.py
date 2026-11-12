@@ -76,11 +76,13 @@ def main() -> None:
             meta[f"{name}_rows"], meta[f"{name}_dropped_over_max_len"] = len(keep), dropped
             print(f"[train] {name}: {len(keep)} rows ({dropped} dropped for length)")
         if args.engine == "aligntune":
-            T.train_aligntune(args.base_model, paths["train"], adapter_dir, meta["train_rows"], recipe,
-                              val_path=paths["val"])
+            clock = T.train_aligntune(args.base_model, paths["train"], adapter_dir, meta["train_rows"], recipe,
+                                      val_path=paths["val"])
         else:
-            T.train_trl(args.base_model, paths["train"], paths["val"], adapter_dir, meta["train_rows"], recipe)
-        meta["train_seconds"] = round(time.time() - t0, 1)
+            clock = T.train_trl(args.base_model, paths["train"], paths["val"], adapter_dir, meta["train_rows"], recipe)
+        # train_seconds sums every session of a resumed run (runs/<run>/adapter/train_clock.json); runs written
+        # before this (the published v1 train_meta.json) recorded only the last session.
+        meta.update(clock or {"train_seconds": round(time.time() - t0, 1)})
 
     T.merge(args.base_model, adapter_dir, merged_dir)
     (run / "train_meta.json").write_text(json.dumps(meta, indent=2))

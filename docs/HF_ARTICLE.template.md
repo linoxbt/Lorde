@@ -1,10 +1,10 @@
-# Lorde: a 3B judge that keeps CuratorKIT's quality gates honest, at a fraction of the cost
+# Lorde: a 3B judge that runs CuratorKIT's quality gates without breaking their JSON contract
 
 *Lexsi AI Safety & Alignment Hackathon · Track 1 (Fine-tuning and Data Curation) · CuratorKIT → AlignTune → AuditKIT*
 
-**TL;DR.** CuratorKIT filters synthetic training data with two LLM-judge gates. Large API judges are reliable
-but charge per row; small local judges are cheap but break the JSON contract, and CuratorKIT then throws good
-data away. We fine-tuned **Tiny Aya Global (3.35B)** on an Aya Expanse teacher's replies to CuratorKIT's *exact*
+**TL;DR.** CuratorKIT filters synthetic training data with two LLM-judge gates. Large API judges charge per
+row; small local judges are cheap but break the JSON contract, and CuratorKIT then throws good data away. We
+fine-tuned **Tiny Aya Global (3.35B)** to imitate an Aya Expanse 8B teacher's replies to CuratorKIT's *exact*
 gate prompts. <!-- tldr -->
 
 ## The problem
@@ -12,8 +12,8 @@ gate prompts. <!-- tldr -->
 CuratorKIT's RewardGate (helpfulness, honesty, instruction following) and HallucinationGate (is every claim
 supported by the source?) ask a judge for JSON, parse it strictly, and reject the sample when the reply
 cannot be parsed (`judge_error:JudgeParseError`). Small open models often wrap the JSON in prose or break
-it, so every parse failure deletes a training row that may have been perfectly good. That is the failure
-mode Lorde removes, in eight languages, while matching a larger teacher's pass/reject decisions.
+it, so every parse failure deletes a training row that may have been perfectly good. Lorde targets that
+failure mode in eight languages, while imitating a larger teacher's pass/reject decisions.
 
 ## Approach: chaining three Lexsi toolkits
 
@@ -24,11 +24,13 @@ mode Lorde removes, in eight languages, while matching a larger teacher's pass/r
    CuratorKIT accepts. Every gated set ships with its `lexsi_provenance.json`.
 2. **AlignTune** trains the judge (LoRA SFT, loss on the reply only) and the downstream models.
 3. **AuditKIT** scores downstream answers (`f1_score`, `lexical_groundedness`) and runs the paired-bootstrap
-   significance tests behind every "better than" claim below.
+   significance tests behind every comparison below.
 
 ### Data
 
 - **Reward items:** human-written prompts and answers from `CohereLabs/aya_dataset`, 300 per language.
+  aya_dataset's language labels are used as given; some are wrong (at least 10 of the 300 English prompts,
+  checked by hand, are in Malay, Hindi, Burmese or Somali).
 - **Grounding items:** Wikipedia passages with QA pairs from CuratorKIT's QA stage (teacher-generated).
 - Every prompt appears **good and degraded**: the student's own answer, truncation, an off-topic or
   wrong-language answer, padding; swapped answers, fabricated numbers, closed-book answers.
@@ -37,7 +39,7 @@ mode Lorde removes, in eight languages, while matching a larger teacher's pass/r
   so every label comes from a teacher that actually reads the language.
 <!-- labels_note -->
 - **Targets:** the teacher's reply re-serialized to the gate's exact keys (canonical JSON, long text
-  clipped). Splits are grouped by prompt and source passage, so no test prompt appears in training.
+  clipped). <!-- leakage -->
 
 ### Training
 
@@ -49,10 +51,11 @@ gate's reply to its JSON schema, and Bench measures the raw model too so the mod
 | Metric | Why it matters |
 |---|---|
 | Gate-usable rate | The failure mode CuratorKIT warns about for small judges: unparseable = data thrown away. |
-| Decision agreement, Cohen's κ | The gate only acts on pass/reject at 0.7; κ corrects for skewed pass rates. |
+| Decision agreement, Cohen's κ | The gate only acts on pass/reject at 0.7; κ corrects for skewed pass rates. Both measure agreement with the teacher, i.e. imitation, not correctness. |
 | Spearman ρ, MAE | Calibration of scores beyond the threshold. |
-| Grounding verdict accuracy | HallucinationGate is the higher-stakes gate. |
-| Human agreement | Keeps the teacher honest: the teacher's own human agreement is the ceiling. |
+| Grounding verdict accuracy | HallucinationGate is the higher-stakes gate (again against the teacher's verdict). |
+| Golden-300, adversarial-100 (Bench) | A balanced subset, and items built to fool a judge. |
+| Human agreement | The only check on the teacher itself. <!-- human_status --> |
 | Downstream F1 / groundedness | A judge is only as good as the data it lets through. |
 | Latency, throughput, cost per 1M judgments | Pipeline fit and the ROI the hackathon asks for. |
 
@@ -64,9 +67,13 @@ gate's reply to its JSON schema, and Bench measures the raw model too so the mod
 
 <!-- results:judge_eval -->
 
+<!-- bench -->
+
 <!-- results:plugin_eval -->
 
 <!-- results:downstream -->
+
+<!-- downstream_notes -->
 
 ## ROI: self-hosted Lorde vs paying per token
 
@@ -86,19 +93,17 @@ We changed a few things from the build spec (LORDE-SPEC-001 v1.0), on purpose:
 
 ## Limitations
 
-- Lorde copies an 8B teacher and inherits its blind spots; human agreement is reported against that ceiling.
-- It is trained on CuratorKIT's default RewardGate and HallucinationGate templates. Other rubrics are out of
-  distribution; template fingerprints flag them.
-- Judged content can try to instruct the judge; adversarial-100 measures this (see Bench), and high-stakes
-  datasets still deserve a human in the loop.
+<!-- limitations -->
 
 ## Reproduce it
 
-Everything runs on a free Kaggle 2×T4 notebook: `forge/kaggle_runbook.ipynb` in the GitHub repo. Model,
-data (with CuratorKIT manifests and provenance), Bench sets and every result file are on the Hub.
+Everything runs on free Kaggle 2×T4 sessions: `forge/kaggle_runbook.ipynb` in the GitHub repo runs the steps of
+`forge/kaggle_driver.py`, with the downstream settings reported above. Model, data (with CuratorKIT manifests and
+provenance), Bench sets and the result files are on the Hub. <!-- reproduce_note -->
 
 ## Licences
 
 Lorde's weights are CC-BY-NC-4.0 (inherited from Tiny Aya Global; Cohere Labs Acceptable Use Policy applies).
-CuratorKIT (LSAL v1.1) and AuditKIT (LSAL v1.2) are non-commercial source-available; AlignTune is MIT.
-Lorde is for research and non-commercial use.
+CuratorKIT (LSAL v1.1) and AuditKIT (LSAL v1.2) are non-commercial source-available; AlignTune is MIT. The data
+includes Wikipedia excerpts under CC BY-SA 4.0, whose terms continue to apply to them. Lorde is for research and
+non-commercial use. See `THIRD_PARTY_LICENSES.md` in the GitHub repo.
