@@ -106,6 +106,39 @@ access to `datasets/Oxlino/lorde-work` only), optional `LABEL_USERS=name:pw,...`
 
 Vercel adds `NEXT_PUBLIC_SITE_URL=https://lorde-console.vercel.app`.
 
-Still to do by the account owner: Supabase email templates → `/auth/confirm?token_hash=...` links (see
-`console/README.md`) for cross-device email links; custom SMTP; CAPTCHA (Turnstile) on sign-up; leaked-password
-protection needs the Supabase Pro plan; the unused Railway `Postgres` service can be removed.
+Still to do by the account owner: apply the email templates below (cross-device email links); custom SMTP; CAPTCHA
+(Turnstile, below); leaked-password protection needs the Supabase Pro plan; the unused Railway `Postgres` service can
+be removed.
+
+## Supabase Auth: email templates
+
+The default templates link to `{{ .ConfirmationURL }}`, a PKCE link: it only works in the browser that asked for the
+email, so a link opened in a phone's mail app or on another device fails (`pkce_code_verifier_not_found`). The five
+templates in `supabase/templates/` link to `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=<type>&next={{ .RedirectTo }}`
+instead, which the Console verifies server-side (`verifyOtp`), so they work anywhere. Apply them once per project:
+
+1. Supabase Dashboard → project `lorde` → Authentication → URL Configuration: Site URL
+   `https://lorde-console.vercel.app` (it is `{{ .SiteURL }}` in the links), redirect allow-list
+   `https://lorde-console.vercel.app/**`.
+2. Authentication → Emails → Templates (older dashboards: Authentication → Email Templates). For each template,
+   set the subject and paste the whole file as the message body (Source view), then Save:
+
+   | Template | Subject | File | `type` |
+   |---|---|---|---|
+   | Confirm sign up | `Confirm your Lorde account` | `supabase/templates/confirm-signup.html` | `email` |
+   | Invite user | `You have been invited to Lorde` | `supabase/templates/invite.html` | `invite` |
+   | Magic link | `Your Lorde sign-in link` | `supabase/templates/magic-link.html` | `magiclink` |
+   | Change email address | `Confirm your new email for Lorde` | `supabase/templates/email-change.html` | `email_change` |
+   | Reset password | `Reset your Lorde password` | `supabase/templates/recovery.html` | `recovery` |
+
+   The subject is also in the comment at the top of each file. Leave "Reauthentication" as is (the Console does
+   not use it).
+3. Check: sign up on one browser, open the confirmation email on another device; it must land in the Console signed in.
+   Request a password reset and open it elsewhere; it must land on "Choose a new password".
+
+`/auth/confirm` accepts `type` = `signup`, `email`, `magiclink`, `recovery`, `email_change` and `invite` (unit test
+`tests/unit/auth.test.ts` renders each template and checks it). Recovery always lands on `/reset-password`, an invite on
+`/reset-password?invited=1` (choose a first password); the others follow `next`, limited to `/console/*`. Until the
+templates are applied, the old PKCE links still work in the browser that requested them; opened elsewhere, the sign-in
+page says "Your email is confirmed: sign in to continue" (sign-up) or that the link was opened in a different browser
+and to request a new one (sign-in link, password reset), instead of "We could not start your session".

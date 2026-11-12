@@ -100,3 +100,29 @@ test("a PKCE link opened in another browser says what to do next instead of fail
   assert.deepEqual(plan("error=invalid_request&error_code=pkce_code_verifier_not_found&flow=signup"), { kind: "fail", code: "email_confirmed" });
   assert.equal(codeForAuthRedirect("server_error", "pkce_code_verifier_not_found"), "other_browser");
 });
+
+test("the five Supabase email templates link to /auth/confirm with a token_hash it accepts", async () => {
+  const { readFileSync } = await import("node:fs");
+  const dir = new URL("../../../supabase/templates/", import.meta.url);
+  const expected: Record<string, { type: string; to: string }> = {
+    "confirm-signup.html": { type: "email", to: "/console/keys" },
+    "magic-link.html": { type: "magiclink", to: "/console/keys" },
+    "recovery.html": { type: "recovery", to: "/reset-password" },
+    "email-change.html": { type: "email_change", to: "/console/keys" },
+    "invite.html": { type: "invite", to: "/reset-password?invited=1" },
+  };
+  // What Supabase substitutes: {{ .RedirectTo }} is the emailRedirectTo the form sent, inserted unencoded.
+  const vars = { SiteURL: O, TokenHash: "pkce_0123abcd", RedirectTo: `${O}/auth/callback?next=%2Fconsole%2Fkeys&flow=signup`, Email: "a@b.c" };
+  for (const [file, want] of Object.entries(expected)) {
+    const html = readFileSync(new URL(file, dir), "utf8");
+    assert.match(html, /Subject: \S/, `${file} names its subject`);
+    assert.doesNotMatch(html, /ConfirmationURL/, `${file} must not use the PKCE {{ .ConfirmationURL }}`);
+    const hrefs = [...html.matchAll(/href="([^"]+)"/g)].map((m) => m[1]);
+    assert.ok(hrefs.length >= 1, file);
+    for (const href of hrefs) {
+      const url = new URL(href.replace(/\{\{ \.(\w+) \}\}/g, (_, k: keyof typeof vars) => vars[k]));
+      assert.equal(url.origin + url.pathname, `${O}/auth/confirm`, file);
+      assert.deepEqual(planAuth(url.searchParams, O, true), { kind: "otp", type: want.type, tokenHash: "pkce_0123abcd", to: want.to }, file);
+    }
+  }
+});

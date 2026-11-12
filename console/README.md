@@ -29,9 +29,11 @@ pnpm test:e2e:live       # Playwright, live mode: production build (.next-live) 
 - **Database functions**: the Console has no service-role key. Aggregates (daily usage, pass rates, histograms, the
   review queue, member emails) and owner-only data deletion are SQL functions in
   `../supabase/migrations/0006_console.sql`, called with the user's session; apply it before deploying.
-- **Email links** work on any device: point the Supabase email templates at
-  `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=<type>&next={{ .RedirectTo }}`, which verifies the link
-  server-side (`verifyOtp`). `/auth/callback` keeps handling GitHub and PKCE `code` links.
+- **Email links** work on any device once the five templates in `../supabase/templates/` are applied (steps in
+  `../docs/DEPLOYMENT.md`, "Supabase Auth: email templates"): they link to
+  `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=<type>&next={{ .RedirectTo }}`, verified server-side
+  (`verifyOtp`). `/auth/callback` keeps handling GitHub and PKCE `code` links; a PKCE email link opened in another
+  browser gets "your email is confirmed, sign in" (sign-up) or "request a new link" (sign-in link, reset).
 
 ## Design
 
