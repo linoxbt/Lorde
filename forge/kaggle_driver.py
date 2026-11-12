@@ -19,7 +19,9 @@ checkpoint while training), so progress is visible while it runs and a killed se
 
 Human labels belong to the label tool: the driver never uploads data/human_labels.jsonl (its older local copy
 would overwrite newer labels), uploads the human sample and its key only after the step that writes them, and
-pulls the latest labels again right before the steps that read them.
+pulls the latest labels again right before the steps that read them. The sample key (opaque id -> item, variant)
+goes to LORDE_LABEL_KEY_REPO when that is set (a private repo the label service's token cannot read), never to the
+work repo the label service syncs with; unset, it stays in the work repo as before (with a warning).
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 HF_USER = os.environ.get("HF_USER", "Oxlino")
 WORK_REPO = os.environ.get("WORK_REPO", f"{HF_USER}/lorde-work")
 HUMAN_LANGS = os.environ.get("HUMAN_LANGS", "en,fr,es")
+KEY_REPO = os.environ.get("LORDE_LABEL_KEY_REPO") or None  # private home of human_sample_key.jsonl (audit 2, S6)
 SERVE = "export PATH=$PWD/envs/serve/bin:$PATH"
 PY = "envs/data/bin/python"
 
@@ -202,14 +205,21 @@ READS_HUMAN_LABELS = {"judge-eval", "judge-timing", "publish-private"}
 TRAIN_STEPS = {"train-smoke", "train"}
 
 
-def push_ignore(base: str, human_sample: bool = False) -> list[str]:
+def push_ignore(base: str, human_sample: bool = False, key_repo: str | None = None) -> list[str]:
     """ignore_patterns for upload_folder of ROOT/<base> (patterns are relative to that folder)."""
     out = ["*.tmp", "_input/**", "*.pid"]
     if base == "data":
         out += ["human_labels.jsonl", "human_labels.jsonl.*"]  # never: the label tool owns them
         if not human_sample:  # a stale local copy must not undo forge/04b_blind_sample.py on the hub
             out += ["human_sample.jsonl", "human_sample_key.jsonl"]
+        elif key_repo:  # the key goes to its own repo, out of the label token's reach
+            out += ["human_sample_key.jsonl"]
     return out
+
+
+def key_repo_for(name: str) -> str:
+    """Repo that holds data/<name>: the key repo for the sample key when one is configured, else the work repo."""
+    return KEY_REPO if (name == "human_sample_key.jsonl" and KEY_REPO) else WORK_REPO
 
 
 def pull_patterns(checkpoints: bool = False) -> list[str]:
@@ -244,6 +254,8 @@ class Hub:
 
         self.api = HfApi()
         self.api.create_repo(WORK_REPO, repo_type="dataset", private=True, exist_ok=True)
+        if KEY_REPO:
+            self.api.create_repo(KEY_REPO, repo_type="dataset", private=True, exist_ok=True)
         self.lock = threading.Lock()
 
     def pull(self, checkpoints: bool = False) -> None:
@@ -258,7 +270,7 @@ class Hub:
 
         for name in HUMAN_FILES:
             try:
-                got = hf_hub_download(WORK_REPO, f"data/{name}", repo_type="dataset", force_download=True)
+                got = hf_hub_download(key_repo_for(name), f"data/{name}", repo_type="dataset", force_download=True)
                 (ROOT / "data").mkdir(exist_ok=True)
                 shutil.copyfile(got, ROOT / "data" / name)
                 print(f"[driver] pulled the latest data/{name}", flush=True)
@@ -272,9 +284,21 @@ class Hub:
                     try:
                         self.api.upload_folder(repo_id=WORK_REPO, repo_type="dataset", folder_path=str(ROOT / base),
                                                path_in_repo=base if base != "logs" else "live/logs",
-                                               ignore_patterns=push_ignore(base, human_sample), commit_message=message)
+                                               ignore_patterns=push_ignore(base, human_sample, KEY_REPO),
+                                               commit_message=message)
                     except Exception as e:  # a failed sync must never kill a long run
                         print(f"[driver] sync of {base} failed: {e}", flush=True)
+            key = ROOT / "data" / "human_sample_key.jsonl"
+            if human_sample and key.exists():
+                if KEY_REPO:
+                    try:
+                        self.api.upload_file(path_or_fileobj=str(key), path_in_repo="data/human_sample_key.jsonl",
+                                             repo_id=KEY_REPO, repo_type="dataset", commit_message=message)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[driver] upload of the sample key to {KEY_REPO} failed: {e}", flush=True)
+                else:
+                    print(f"[driver] WARNING: the human sample key went to {WORK_REPO}, which the label service's "
+                          "token can read; set LORDE_LABEL_KEY_REPO to keep it in a separate private repo", flush=True)
 
     def push_checkpoints(self) -> None:
         """Upload the newest complete training checkpoint per run, dropping older ones from the repo."""

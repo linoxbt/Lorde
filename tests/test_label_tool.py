@@ -373,3 +373,27 @@ def test_auth_from_env_and_lockout():
         auth("ana", "bad")
     assert not auth("ana", "x1")  # locked out
     assert auth("lino", "pw")
+
+
+def test_deblinding_guards(tmp_path, capsys):
+    """Audit 2, S6: the fabricated-figure tell is detected, the key's location is checked, the page warns."""
+    tool = load_tool()
+    assert human.text_tells({"answer": "The bridge opened in spring (1874; 63%)"})
+    assert human.text_tells({"response": "Yes. (1990; 5%) "})
+    assert not human.text_tells({"answer": "It opened in 1874 and carries 63% of the traffic."})
+
+    class Api:
+        def __init__(self, present):
+            self.present = present
+
+        def file_exists(self, repo, path, repo_type=None):
+            assert path == "data/human_sample_key.jsonl" and repo_type == "dataset"
+            return self.present
+
+    assert tool.warn_if_key_readable("u/lorde-work", api=Api(True))
+    assert "LORDE_LABEL_KEY_REPO" in capsys.readouterr().out
+    assert not tool.warn_if_key_readable("u/lorde-work", api=Api(False))
+
+    sample, _ = human.blind(legacy_sample(2), salt="s")
+    demo = tool.build_app(tool.Labeler(sample, tool.Store(tmp_path / "l.jsonl")), lambda request: "t")
+    assert "Do not look items up in the public Lorde dataset" in json.dumps(demo.get_config_file(), default=str)

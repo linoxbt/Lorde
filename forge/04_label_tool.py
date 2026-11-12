@@ -250,6 +250,22 @@ def hub_sync(store: Store, repo: str, api=None, download=None, attempts: int = 6
     return upload
 
 
+def warn_if_key_readable(repo: str, api=None) -> bool:
+    """Say so (server-side only) when the sample key sits in the repo this service's token reads: the key maps
+    every opaque id back to its item and variant. Only checks that the file exists; never reads it."""
+    try:
+        from huggingface_hub import HfApi
+
+        found = (api or HfApi()).file_exists(repo, "data/human_sample_key.jsonl", repo_type="dataset")
+    except Exception:  # noqa: BLE001
+        return False
+    if found:
+        print(f"[label] WARNING: data/human_sample_key.jsonl is in {repo}, which this service's token can read. "
+              "Move it to a separate private repo (LORDE_LABEL_KEY_REPO, see forge/04b_blind_sample.py) and delete it "
+              "here; its git history stays readable, so re-blind with a new salt if that matters.", flush=True)
+    return bool(found)
+
+
 # ----------------------------------------------------------------------------- auth
 
 
@@ -469,6 +485,7 @@ def main() -> None:
                       "disabled; re-checking the hub every 2 minutes.", flush=True)
             time.sleep(120)
         jsonl.write(args.sample, items)
+        warn_if_key_readable(args.hub)
         upload = hub_sync(store, args.hub)
         uploader = Uploader(upload)
         if store.merge_in(upload.pull_labels()):  # type: ignore[attr-defined]

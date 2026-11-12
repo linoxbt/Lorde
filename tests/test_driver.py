@@ -132,3 +132,16 @@ def test_runbook_runs_the_driver_steps():
     assert 'step("a", "setup")' in code and 'step("d", "judge-timing")' in code
     assert 'step("c", "downstream")' in code
     assert "drv.Hub()" in code and "hub.push(" in code  # the driver's sync rules: never human labels
+
+
+def test_sample_key_goes_to_its_own_repo(monkeypatch):
+    """Audit 2, S6: with LORDE_LABEL_KEY_REPO the key never reaches the work repo the label service reads."""
+    monkeypatch.setenv("LORDE_LABEL_KEY_REPO", "u/lorde-key")
+    d = load_driver()
+    after_splits = uploaded(d.push_ignore("data", human_sample=True, key_repo=d.KEY_REPO))
+    assert "human_sample.jsonl" in after_splits and "human_sample_key.jsonl" not in after_splits
+    assert d.key_repo_for("human_sample_key.jsonl") == "u/lorde-key"
+    assert d.key_repo_for("human_labels.jsonl") == d.WORK_REPO
+    monkeypatch.delenv("LORDE_LABEL_KEY_REPO")
+    d = load_driver()
+    assert d.KEY_REPO is None and d.key_repo_for("human_sample_key.jsonl") == d.WORK_REPO

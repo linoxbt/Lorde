@@ -16,6 +16,7 @@ original uid are still accepted.
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
@@ -31,6 +32,21 @@ LEAKY_FIELDS = ("variant", "group", "teacher_score", "teacher_raw", "teacher_ver
 # Every name a variant can have (lorde_forge.variants and 01_build_pool); a uid ending in one is not blind.
 VARIANT_NAMES = ("gold", "student", "truncated", "off_topic", "wrong_language", "padded_repetition",
                  "swapped_answer", "fabricated_numbers", "closed_book")
+
+
+# lorde_forge.variants.fabricate_numbers appends " (<year>; <pct>%)" to an answer that has no number to change: a
+# generation artefact that marks the item as fabricated_numbers to anyone who has seen a few (audit 2, S6).
+FABRICATED_SUFFIX = re.compile(r" \((1[89]\d\d); (\d{1,2})%\)\s*$")
+
+
+def text_tells(row: dict[str, Any]) -> list[str]:
+    """Visible text that gives an item's variant away (the label is still determined by the text, but the
+    labeller no longer has to read the source to know it)."""
+    out = []
+    for f in ("answer", "response"):
+        if FABRICATED_SUFFIX.search(str(row.get(f) or "")):
+            out.append(f"`{f}` ends with the fabricated-figure suffix")
+    return out
 
 
 def opaque_id(uid: str, salt: str) -> str:

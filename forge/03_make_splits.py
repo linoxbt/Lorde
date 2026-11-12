@@ -9,7 +9,8 @@ Outputs
   data/human_sample.jsonl                    200 test items to hand-label (step 4), blind: opaque ids,
                                              no variant/group, shuffled
   data/human_sample_key.jsonl                private key: opaque id -> uid, variant, group (never shown to
-                                             labellers; step 6 uses it to join the labels)
+                                             labellers; step 6 uses it to join the labels). Keep it where the
+                                             label service's token cannot read it (LORDE_LABEL_KEY_REPO)
 
 Splits are grouped by prompt (reward) or source chunk (grounding), so no test
 prompt or source passage appears in training. Only gate-usable teacher replies
@@ -108,7 +109,9 @@ def main() -> None:
     n_test = jsonl.write(config.DATA / "test.jsonl", test)
 
     langs = [x.strip() for x in args.human_langs.split(",") if x.strip()]
-    human_pool = [t for t in test if t["lang"] in langs]
+    # Items whose text gives their variant away (the fabricated-figure suffix) would not be labelled blind:
+    # future samples leave them out (the published v1 sample has 14 of them; see lorde_forge.human.text_tells).
+    human_pool = [t for t in test if t["lang"] in langs and not human.text_tells(t)]
     sample = splits.stratified_sample(human_pool, args.human_n, keys=("kind", "lang", "variant"), salt="human")
     human.write_blind(sample, config.DATA / "human_sample.jsonl", config.DATA / "human_sample_key.jsonl",
                       salt=args.blind_salt)
