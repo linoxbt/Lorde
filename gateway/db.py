@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import json
 import logging
 import time
 import uuid
@@ -69,10 +68,6 @@ class PgKeyStore(KeyStore):
             async with self.pool.connection() as c:
                 await c.execute("update api_keys set last_used_at = now() where prefix = %s", (prefix,))
         return rec
-
-    async def averify(self, key: str) -> ApiKey | None:
-        rec = await self.alookup(key)
-        return None if rec is None or rec.revoked_at else rec
 
     async def acreate(self, name: str, org_id: str, scopes: list[str] | None = None, rpm: int = 600,
                       actor: str = "cli") -> tuple[str, ApiKey]:
@@ -166,9 +161,6 @@ class PgUsageSink:
         except Exception:  # noqa: BLE001
             logging.getLogger("lorde.usage").warning("final usage flush failed; %s events lost", len(self.queue))
 
-    def flush(self) -> None:  # parity with UsageSink
-        pass
-
 
 class JobStore:
     def __init__(self, pool: Pool) -> None:
@@ -257,4 +249,4 @@ def job_view(j: dict) -> dict[str, Any]:
             "finished_at": j["finished_at"].isoformat() if j.get("finished_at") else None}
 
 
-__all__ = ["JobStore", "PgKeyStore", "PgUsageSink", "job_view", "json", "make_pool"]
+__all__ = ["JobStore", "PgKeyStore", "PgUsageSink", "job_view", "make_pool"]

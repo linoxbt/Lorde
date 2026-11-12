@@ -54,7 +54,7 @@ worker/          Lorde Job Worker: runs CuratorKIT gating jobs from the Postgres
 supabase/        migrations: schema, RLS and column grants, job queue, requeue, retention (+ a test shim)
 sdk/             `pip install lorde`: typed sync/async client, CuratorKIT preset, CLI, stdio MCP server
 skills/          lorde-gating: a Claude skill that teaches agents when and how to gate data with Lorde
-infra/           Dockerfiles for the Gateway and the Worker
+infra/           Dockerfile.api (Gateway + Worker in one container), start-api.sh, Dockerfile.label
 console/         Lorde Console and website: Next.js 16, every page its own route, demo mode until Supabase is set
 docs/            HF Article template and builder, submission checklist
 requirements/    forge-train, forge-serve, forge-data (three separate environments) and dev
@@ -118,7 +118,7 @@ pip install -r requirements/runtime.txt
 export LORDE_KEY_PEPPER=$(python -c "import secrets; print(secrets.token_hex(32))")
 export VLLM_BASE_URL=http://localhost:8002/v1 LORDE_MODEL_REVISION=v1.0.0
 python -m gateway.keys create --name me --org demo          # prints lorde_sk_... once
-uvicorn gateway.app:app --port 8080                          # or: docker build -f infra/Dockerfile.gateway .
+uvicorn gateway.app:app --port 8080                          # or: docker build -f infra/Dockerfile.api . (Gateway + worker)
 ```
 
 | Method | Path | Purpose |
