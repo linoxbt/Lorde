@@ -62,7 +62,7 @@ from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from gateway.quota import make_quota, utc_day  # noqa: E402
+from gateway.quota import GLOBAL, make_quota, org_daily_limit, utc_day  # noqa: E402
 from gateway.settings import Settings  # noqa: E402
 from gateway.storage import from_settings  # noqa: E402
 
@@ -303,24 +303,37 @@ class Worker:
 
     # ------------------------------------------------------------------ daily quota (audit N1b)
     async def used_today(self, org: str) -> int:
-        r = await self.q("select coalesce(sum(judgments), 0)::bigint as n from usage_events where org_id = %s "
-                         "and created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'", (org,))
+        """Judgments counted today for ``org`` (or, for quota.GLOBAL, for the whole service)."""
+        if org == GLOBAL:
+            r = await self.q("select coalesce(sum(judgments), 0)::bigint as n from usage_events where created_at >= "
+                             "date_trunc('day', now() at time zone 'utc') at time zone 'utc'")
+        else:
+            r = await self.q("select coalesce(sum(judgments), 0)::bigint as n from usage_events where org_id = %s "
+                             "and created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'",
+                             (org,))
         db = int(r[0]["n"]) if r else 0
         return max(db, await self.quota.used(org)) if self.s.redis_url else db
 
     async def quota_rows(self, job: dict) -> int | None:
-        """Rows this job may judge under the org's daily quota (None: no cap below LORDE_JOB_MAX_ROWS).
-        Raises InputRejected when not even one row fits."""
-        limit = self.s.org_daily_judgments
-        if limit <= 0:
-            return None
+        """Rows this job may judge under the org's daily quota (lower for a new org) and the service's daily
+        capacity (None: no cap below LORDE_JOB_MAX_ROWS). Raises InputRejected when not even one row fits."""
+        org = str(job["org_id"])
+        r = await self.q("select created_at from orgs where id = %s", (org,))
+        limit = org_daily_limit(self.s, r[0]["created_at"] if r else None)
         gates = n_gates(job)
-        left = max(0, limit - await self.used_today(str(job["org_id"])))
-        rows = left // gates
-        if rows < 1:
-            raise InputRejected(f"the organization's daily quota of {limit} judgments (LORDE_ORG_DAILY_JUDGMENTS) "
-                                "is used up; nothing was judged. Submit the job again after 00:00 UTC")
-        return rows if rows < self.s.job_max_rows else None
+        rows = None
+        if limit > 0:
+            rows = max(0, limit - await self.used_today(org)) // gates
+            if rows < 1:
+                raise InputRejected(f"the organization's daily quota of {limit} judgments is used up; nothing was "
+                                    "judged. Submit the job again after 00:00 UTC")
+        if (cap := self.s.global_daily_cap) > 0:
+            left = max(0, cap - await self.used_today(GLOBAL)) // gates
+            if left < 1:
+                raise InputRejected(f"the service's daily judgment capacity of {cap} is used up; nothing was "
+                                    "judged. Submit the job again after 00:00 UTC")
+            rows = left if rows is None else min(rows, left)
+        return rows if rows is not None and rows < self.s.job_max_rows else None
 
     async def _run(self, job: dict, jid: str, org: str, job_dir: Path) -> None:
         """Fetch and size the input, reserve what the job can at most use against the shared daily quota (so API
@@ -344,10 +357,11 @@ class Worker:
                                 "split it into smaller jobs")
         run = JobRun(job_dir=job_dir, gates=gates, rows=rows, day=utc_day(), started=datetime.now(UTC))
         reserved = 0
-        if self.s.org_daily_judgments > 0 and self.s.redis_url:
+        counters = [org] + ([GLOBAL] if self.s.global_daily_cap > 0 else [])
+        if self.s.redis_url:  # shared with the Gateway (without Redis each process counts on its own)
             reserved = (rows if quota_rows is None else min(rows, quota_rows)) * gates
-            if reserved:
-                await self.quota.add(org, reserved, day=run.day)
+            for c in counters if reserved else []:
+                await self.quota.add(c, reserved, day=run.day)
         t0 = time.monotonic()
         try:
             await self._judge(job, jid, org, job_dir, quota_rows, source, run)
@@ -364,7 +378,8 @@ class Worker:
             except Exception:  # noqa: BLE001  (the database is gone: the quota is still settled below)
                 log.exception("job %s: could not store or meter its last judgments", jid)
             if reserved or charge:
-                await self.quota.add(org, charge - reserved, day=run.day)
+                for c in counters:
+                    await self.quota.add(c, charge - reserved, day=run.day)
 
     # ------------------------------------------------------------------ judgments as they happen (audit 2, B3)
     async def flush(self, job: dict, run: JobRun) -> None:

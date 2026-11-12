@@ -46,8 +46,9 @@ def _retry_transport(e: httpx.TransportError, method: str, idempotent: bool) -> 
 
 def _retry_status(r: httpx.Response, method: str, idempotent: bool) -> bool:
     if r.status_code == 429:
-        # refused before any work was done; but a used-up daily quota only resets at 00:00 UTC
-        return _error_code(r) != "quota_exceeded"
+        # refused before any work was done; but a used-up daily quota (the org's, or the whole service's
+        # capacity) only resets at 00:00 UTC
+        return _error_code(r) not in ("quota_exceeded", "capacity_exceeded")
     if r.status_code == 503:
         return method == "GET" or idempotent or "retry-after" in r.headers
     return r.status_code in (502, 504) and (method == "GET" or idempotent)

@@ -415,10 +415,10 @@ def test_batches_are_capped_and_stop_when_the_client_disconnects(tmp_path):
 
 
 def test_sdk_splits_large_batches_into_server_sized_requests(tmp_path):
+    from lorde import Lorde
     from test_gateway import PEPPER, stub_vllm
 
     from gateway.keys import KeyStore
-    from lorde import Lorde
 
     s = Settings(key_pepper=PEPPER, keys_file=str(tmp_path / "keys.json"), usage_file=str(tmp_path / "u.jsonl"),
                  model_revision="v1.0.0", vllm_base_url="http://vllm/v1", redis_url=None)
@@ -429,3 +429,154 @@ def test_sdk_splits_large_batches_into_server_sized_requests(tmp_path):
                        for i in range(19)])
     assert [r.index for r in out.results] == list(range(19)) and out.summary["total"] == 19
     assert len(out.request_id.split(",")) == 3
+
+
+# ------------------------------------------------------------------ S1: Sybil starvation of the one slot
+
+def test_global_daily_cap_is_shared_by_every_org_and_refunds_the_org(tmp_path):
+    from test_gateway_fairness import REWARD, make
+
+    app, h = make(tmp_path, orgs=("o1", "o2", "o3"), global_daily_cap=3, org_daily_judgments=100)
+    with TestClient(app) as c:
+        for org in ("o1", "o2", "o3"):
+            assert c.post("/v1/judge/reward", headers=h[org], json=REWARD).status_code == 200
+        for org in ("o1", "o2"):
+            r = c.post("/v1/judge/reward", headers=h[org], json=REWARD)
+            e = r.json()["error"]
+            assert r.status_code == 429 and e["code"] == "capacity_exceeded" and e["limit"] == 3
+            assert "00:00 UTC" in e["message"] and int(r.headers["retry-after"]) >= 1
+        r = c.post("/v1/judge/batch", headers=h["o3"], json={"kind": "reward", "items": [REWARD] * 2})
+        assert r.status_code == 429 and r.json()["error"]["code"] == "capacity_exceeded"
+    assert app.gw.quota.used_sync("o1") == 1 and app.gw.quota.used_sync("o3") == 1  # refused: org not charged
+
+
+@pytest.mark.skipif(not REDIS, reason="set LORDE_TEST_REDIS_URL")
+def test_global_cap_is_atomic_in_redis():
+    from gateway.quota import GLOBAL, RedisQuota
+
+    async def go():
+        q = RedisQuota(REDIS)
+        day = "t" + uuid.uuid4().hex[:8]  # a private "day" so the test's counter starts at 0
+        try:
+            got = await asyncio.gather(*(q.take(GLOBAL, 1, 5, day=day) for _ in range(30)))
+            return sum(1 for ok, _ in got if ok), await q.r.get(q.key(GLOBAL, day))
+        finally:
+            await q.close()
+    ok, stored = asyncio.run(go())
+    assert ok == 5 and int(stored) == 5
+
+
+def test_new_orgs_get_a_lower_daily_quota():
+    from datetime import UTC, datetime, timedelta
+
+    from gateway.quota import org_daily_limit
+
+    s = Settings(org_daily_judgments=500, new_org_hours=24, new_org_daily_judgments=50)
+    now = datetime.now(UTC)
+    assert org_daily_limit(s, now - timedelta(hours=1)) == 50
+    assert org_daily_limit(s, now - timedelta(hours=25)) == 500
+    assert org_daily_limit(s, None) == 500  # unknown age (file key store): the normal quota
+    assert org_daily_limit(Settings(org_daily_judgments=0, new_org_daily_judgments=50), now) == 50
+    assert org_daily_limit(Settings(org_daily_judgments=500, new_org_daily_judgments=0), now) == 500
+
+
+@pg
+def test_new_org_quota_applies_through_the_gateway(env):
+    with db(env) as c:
+        used = c.execute("select coalesce(sum(judgments), 0) from usage_events where org_id=%s and created_at >= "
+                         "date_trunc('day', now() at time zone 'utc') at time zone 'utc'", (env["org"],)).fetchone()[0]
+        c.execute("update orgs set created_at = now() - interval '1 hour' where id=%s", (env["org"],))
+    s = Settings(**{**env["s"].__dict__, "org_daily_judgments": 100_000, "new_org_daily_judgments": used + 1})
+    body = {"instruction": "Explain X", "response": "X is a thing."}
+    try:
+        with TestClient(create_app(s)) as c:
+            assert c.post("/v1/judge/reward", headers=env["keys"]["judge"], json=body).status_code == 200
+            r = c.post("/v1/judge/reward", headers=env["keys"]["judge"], json=body)
+            assert r.status_code == 429 and r.json()["error"]["code"] == "quota_exceeded"
+            assert "lower quota" in r.json()["error"]["message"] and r.json()["error"]["limit"] == used + 1
+        with db(env) as c:
+            c.execute("update orgs set created_at = now() - interval '2 days' where id=%s", (env["org"],))
+        with TestClient(create_app(s)) as c:  # a day old: the normal quota (a fresh key cache reads the age)
+            assert c.post("/v1/judge/reward", headers=env["keys"]["judge"], json=body).status_code == 200
+    finally:
+        with db(env) as c:
+            c.execute("update orgs set created_at = now() - interval '2 days' where id=%s", (env["org"],))
+
+
+@pg
+def test_jobs_respect_the_global_capacity(env):
+    clear_jobs(env)
+    with db(env) as c:
+        used_all = c.execute("select coalesce(sum(judgments), 0) from usage_events where created_at >= "
+                             "date_trunc('day', now() at time zone 'utc') at time zone 'utc'").fetchone()[0]
+    jid = submit(env, ROWS)  # accepted under no global cap, then run with the capacity used up
+    s = Settings(**{**env["s"].__dict__, "global_daily_cap": used_all})
+    assert run_one(Worker(s, worker_id="cap-g", work_dir=str(env["tmp"] / "cap-g"), poll_s=0.1)) is True
+    status, error, *_ = job_state(env, jid)
+    assert status == "failed" and "daily judgment capacity" in error
+    with TestClient(create_app(s)) as c:
+        up = upload(c, env["keys"]["all"], ROWS[:1])
+        r = c.post("/v1/jobs", headers=env["keys"]["all"], json={"upload_id": up})
+        assert r.status_code == 429 and r.json()["error"]["code"] == "capacity_exceeded"
+
+
+def test_one_waiter_per_org_and_round_robin_hand_over():
+    from gateway.slots import Busy, LocalSlots
+
+    async def go():
+        slots = LocalSlots(1, 2, 8, 5, org_max_waiters=1)
+        order: list[str] = []
+        hold = asyncio.Event()
+
+        async def use(org, tag, ev=None):
+            async with slots.acquire(org):
+                order.append(tag)
+                if ev is not None:
+                    await ev.wait()
+                await asyncio.sleep(0.01)
+
+        holder = asyncio.create_task(use("x", "x1", hold))
+        await asyncio.sleep(0.01)
+        tasks = [asyncio.create_task(use("a", "a1")), asyncio.create_task(use("a", "a2"))]
+        await asyncio.sleep(0.01)
+        tasks.append(asyncio.create_task(use("b", "b1")))
+        await asyncio.sleep(0.01)
+        # org A has two requests in the global queue (2 org slots) and one more waiting for its own slot ...
+        tasks.append(asyncio.create_task(use("a", "a3")))
+        await asyncio.sleep(0.01)
+        with pytest.raises(Busy, match="from this organization are waiting"):  # ... so a fourth is refused
+            async with slots.acquire("a"):
+                pass
+        hold.set()
+        await asyncio.gather(holder, *tasks)
+        # round-robin by org: B's request is served before A's second, though A queued it first
+        assert order == ["x1", "a1", "b1", "a2", "a3"]
+        assert slots.global_slot.used == 0 and not slots.global_slot.waiters and slots.orgs == {}
+
+    asyncio.run(go())
+
+
+def test_busy_refusals_past_the_free_budget_cost_one_judgment(tmp_path):
+    from test_gateway_fairness import REWARD, held_upstream, hold, make, until
+
+    async def go():
+        release, entered = asyncio.Event(), []
+        app, h = make(tmp_path, orgs=("orgA", "orgB"), transport=held_upstream(release, entered),
+                      upstream_concurrency=1, upstream_queue_timeout_s=0.1, org_free_busy_per_day=2,
+                      org_daily_judgments=100)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+            a1 = asyncio.create_task(c.post("/v1/judge/reward", headers=h["orgA"], json=hold()))
+            await until(lambda: len(entered) == 1)
+            charged = []
+            for _ in range(4):
+                r = await c.post("/v1/judge/reward", headers=h["orgB"], json=REWARD)
+                assert r.status_code == 429 and r.json()["error"]["code"] == "rate_limited"
+                charged.append(r.json()["error"].get("charged", 0))
+            assert charged == [0, 0, 1, 1]  # two refusals free, then each costs one judgment
+            assert app.gw.quota.used_sync("orgB") == 2
+            release.set()
+            assert (await a1).status_code == 200
+        usage = app.gw.usage.queue  # not flushed: no lifespan under ASGITransport
+        assert sum(u["judgments"] for u in usage if u["org_id"] == "orgB") == 2  # metered as charged
+
+    asyncio.run(go())

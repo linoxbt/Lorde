@@ -48,7 +48,8 @@ class PgKeyStore(KeyStore):
     def _rec(r: dict) -> ApiKey:
         return ApiKey(prefix=r["prefix"], key_hash=r["key_hash"], name=r["name"], org_id=str(r["org_id"]),
                       scopes=list(r["scopes"]), rpm=r["rpm"], created_at=str(r["created_at"]),
-                      revoked_at=str(r["revoked_at"]) if r["revoked_at"] else None, id=str(r["id"]))
+                      revoked_at=str(r["revoked_at"]) if r["revoked_at"] else None, id=str(r["id"]),
+                      org_created_at=r.get("org_created_at"))
 
     async def alookup(self, key: str) -> ApiKey | None:
         prefix = prefix_of(key)  # malformed keys never reach the database
@@ -57,7 +58,9 @@ class PgKeyStore(KeyStore):
         found, rec = self._cache.get(prefix)
         if not found:
             async with self.pool.connection() as c:
-                r = await (await c.execute("select * from api_keys where prefix = %s", (prefix,))).fetchone()
+                r = await (await c.execute("select k.*, o.created_at as org_created_at from api_keys k "
+                                           "join orgs o on o.id = k.org_id where k.prefix = %s",
+                                           (prefix,))).fetchone()
             rec = self._rec(r) if r else None
             self._cache.put(prefix, rec)
         if rec is None or not hmac.compare_digest(rec.key_hash, hash_key(key, self.pepper)):
@@ -197,6 +200,14 @@ class JobStore:
             r = await (await c.execute(
                 "select coalesce(sum(judgments), 0)::bigint as n from usage_events where org_id = %s and "
                 "created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'", (org_id,))).fetchone()
+        return int(r["n"])
+
+    async def judgments_today_all(self) -> int:
+        """Judgments metered for the whole service since 00:00 UTC (LORDE_GLOBAL_DAILY_CAP's durable view)."""
+        async with self.pool.connection() as c:
+            r = await (await c.execute(
+                "select coalesce(sum(judgments), 0)::bigint as n from usage_events where "
+                "created_at >= date_trunc('day', now() at time zone 'utc') at time zone 'utc'")).fetchone()
         return int(r["n"])
 
     async def job_by_idempotency_key(self, org_id: str, key: str) -> dict | None:

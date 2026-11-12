@@ -33,6 +33,7 @@ from .errors import (
     UnsupportedDataset,
 )
 from .keys import ApiKey
+from .quota import GLOBAL
 
 if TYPE_CHECKING:
     from .app import Gateway
@@ -127,10 +128,14 @@ async def submit_job(gw: Gateway, key: ApiKey, req: JobRequest, idempotency_key:
         raise UnsupportedDataset("dataset_url must name one file in the Hub dataset repo: "
                                  "hf://datasets/<owner>/<name>/<path>.jsonl (or .json, .csv, .parquet); "
                                  "whole repos (hf://datasets/<owner>/<name>) are not supported")
-    if (lim := gw.s.org_daily_judgments) > 0:  # a job cannot start on a used-up daily quota (audit N1b)
+    if (lim := gw.daily_limit(key)) > 0:  # a job cannot start on a used-up daily quota (audit N1b)
         used = max(await gw.quota.used(key.org_id), await jobs.judgments_today(key.org_id))
         if used >= lim:
-            raise gw.quota_error(used)
+            raise gw.quota_error(used, lim)
+    if (cap := gw.s.global_daily_cap) > 0:  # nor on the service's used-up daily capacity (audit 2, S1)
+        used = max(await gw.quota.used(GLOBAL), await jobs.judgments_today_all())
+        if used >= cap:
+            raise gw.capacity_error(used)
     source: dict = {"dataset_url": req.dataset_url}
     dataset_id = None
     if req.upload_id:

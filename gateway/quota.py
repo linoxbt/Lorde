@@ -20,6 +20,22 @@ from datetime import UTC, datetime, timedelta
 log = logging.getLogger("lorde.quota")
 
 
+GLOBAL = "__global__"  # the service-wide counter (LORDE_GLOBAL_DAILY_CAP) lives beside the per-org ones
+
+
+def org_daily_limit(s, org_created_at: datetime | None, now: datetime | None = None) -> int:
+    """The org's daily judgment limit (0 = unlimited): LORDE_ORG_DAILY_JUDGMENTS, or the lower
+    LORDE_NEW_ORG_DAILY_JUDGMENTS while the org is younger than LORDE_NEW_ORG_HOURS (audit 2, S1)."""
+    base = s.org_daily_judgments
+    new = s.new_org_daily_judgments
+    if new > 0 and s.new_org_hours > 0 and org_created_at is not None:
+        if org_created_at.tzinfo is None:
+            org_created_at = org_created_at.replace(tzinfo=UTC)
+        if (now or datetime.now(UTC)) - org_created_at < timedelta(hours=s.new_org_hours):
+            return new if base <= 0 else min(base, new)
+    return base
+
+
 def utc_day(now: datetime | None = None) -> str:
     return (now or datetime.now(UTC)).strftime("%Y%m%d")
 
@@ -41,8 +57,8 @@ class LocalQuota:
         for k in [k for k in self._used if k[1] != day]:
             del self._used[k]
 
-    def take_sync(self, org: str, n: int, limit: int) -> tuple[bool, int]:
-        day = utc_day()
+    def take_sync(self, org: str, n: int, limit: int, day: str | None = None) -> tuple[bool, int]:
+        day = day or utc_day()
         with self._lock:
             if len(self._used) > 10_000:
                 self._prune(day)
@@ -74,8 +90,8 @@ class LocalQuota:
         """Atomically raise today's counter to at least ``floor`` (never lowers it)."""
         return self.raise_to_sync(org, floor)
 
-    async def take(self, org: str, n: int, limit: int) -> tuple[bool, int]:
-        return self.take_sync(org, n, limit)
+    async def take(self, org: str, n: int, limit: int, day: str | None = None) -> tuple[bool, int]:
+        return self.take_sync(org, n, limit, day)
 
     async def add(self, org: str, n: int, day: str | None = None) -> int:
         """Add ``n`` (negative: refund) to the counter of ``day`` (default today, UTC). A settlement or refund
@@ -135,12 +151,12 @@ class RedisQuota:
             self._warned = now
             log.warning("Redis quota counter unreachable; using an in-process counter", exc_info=True)
 
-    async def take(self, org: str, n: int, limit: int) -> tuple[bool, int]:
+    async def take(self, org: str, n: int, limit: int, day: str | None = None) -> tuple[bool, int]:
         try:
-            ok, used = await self._take(keys=[self.key(org)], args=[n, limit])
+            ok, used = await self._take(keys=[self.key(org, day)], args=[n, limit])
         except Exception:  # noqa: BLE001  (fail open, counted locally)
             self._fail()
-            return self.fallback.take_sync(org, n, limit)
+            return self.fallback.take_sync(org, n, limit, day)
         self.degraded = False
         return bool(int(ok)), int(used)
 

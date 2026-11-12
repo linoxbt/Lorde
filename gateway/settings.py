@@ -23,6 +23,20 @@ Tenant fairness (audit N1; see gateway/slots.py and gateway/quota.py):
 - ``LORDE_ORG_DAILY_JUDGMENTS`` (5000, 0 = unlimited): judgments per organization per UTC day, API and jobs
   together; past it, 429 ``quota_exceeded`` until 00:00 UTC.
 
+Sybil resistance (audit 2, S1): sign-up is open and the model has one CPU slot, so many cheap organizations could
+otherwise starve real ones.
+
+- ``LORDE_GLOBAL_DAILY_CAP`` (0 = off): judgments per UTC day for the whole service, API and jobs together, matched
+  to what Serve can do (one CPU llama.cpp slot at 15-30 s per judgment: about 3,000-5,000 a day). Past it, 429
+  ``capacity_exceeded`` until 00:00 UTC. Counted atomically in Redis (``lorde:quota:__global__:<day>``) with the
+  in-process fallback, and raised every minute to the day's metered usage_events.
+- ``LORDE_NEW_ORG_HOURS`` (24) and ``LORDE_NEW_ORG_DAILY_JUDGMENTS`` (50): an organization younger than that many
+  hours gets that lower daily quota (0 for either turns the restriction off).
+- ``LORDE_ORG_MAX_WAITERS`` (1): requests one organization may have waiting for its own slot; past it, 429 at once.
+  The global slot is handed over round-robin across organizations (gateway/slots.py).
+- ``LORDE_ORG_FREE_BUSY_PER_DAY`` (20): "model busy" refusals refunded per organization per day; past it, each
+  refusal costs one judgment of the daily quota, so hammering a saturated model is not free.
+
 Per-IP limit (audit N2): ``LORDE_IP_RPM`` (300, 0 = off) requests per minute per client IP on every keyed route,
 checked before the API key is looked up, so a flood of made-up keys from one address is refused without
 reaching the database. The client IP is the TCP peer as uvicorn reports it. Behind Railway's proxy run uvicorn
@@ -113,6 +127,13 @@ class Settings:
         default_factory=lambda: float(_env("LORDE_UPSTREAM_QUEUE_TIMEOUT_S", "30")))
     upstream_max_waiters: int = field(default_factory=lambda: int(_env("LORDE_UPSTREAM_MAX_WAITERS", "32")))
     org_daily_judgments: int = field(default_factory=lambda: int(_env("LORDE_ORG_DAILY_JUDGMENTS", "5000")))
+    # Sybil resistance (audit 2, S1; see the module docstring)
+    global_daily_cap: int = field(default_factory=lambda: int(_env("LORDE_GLOBAL_DAILY_CAP", "0")))
+    new_org_hours: float = field(default_factory=lambda: float(_env("LORDE_NEW_ORG_HOURS", "24")))
+    new_org_daily_judgments: int = field(
+        default_factory=lambda: int(_env("LORDE_NEW_ORG_DAILY_JUDGMENTS", "50")))
+    org_max_waiters: int = field(default_factory=lambda: int(_env("LORDE_ORG_MAX_WAITERS", "1")))
+    org_free_busy_per_day: int = field(default_factory=lambda: int(_env("LORDE_ORG_FREE_BUSY_PER_DAY", "20")))
     # per-IP limit before key resolution (audit N2)
     ip_rpm: int = field(default_factory=lambda: int(_env("LORDE_IP_RPM", "300")))
     trusted_proxies: list[str] = field(default_factory=lambda: _csv("LORDE_TRUSTED_PROXIES"))
