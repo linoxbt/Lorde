@@ -215,7 +215,8 @@ def push_ignore(base: str, human_sample: bool = False) -> list[str]:
 def pull_patterns(checkpoints: bool = False) -> list[str]:
     out = ["data/**", "results/**", "runs/**/merged/**", "runs/**/train_meta.json", "bench/**"]
     if checkpoints:
-        out += ["runs/*/adapter/checkpoint-*/**", "runs/*/adapter/resume_key.json"]  # the key says what they belong to
+        # the key says what they belong to; the clock carries the training time of earlier sessions
+        out += ["runs/*/adapter/checkpoint-*/**", "runs/*/adapter/resume_key.json", "runs/*/adapter/train_clock.json"]
     return out
 
 
@@ -283,7 +284,8 @@ class Hub:
                 try:
                     self.api.upload_folder(repo_id=WORK_REPO, repo_type="dataset", folder_path=str(adapter),
                                            path_in_repo=adapter.relative_to(ROOT).as_posix(),
-                                           allow_patterns=[f"{ckpt.name}/**", "resume_key.json"], delete_patterns=["checkpoint-*/**"],
+                                           allow_patterns=[f"{ckpt.name}/**", "resume_key.json", "train_clock.json"],
+                                           delete_patterns=["checkpoint-*/**"],
                                            commit_message=f"checkpoint {ckpt.relative_to(ROOT).as_posix()}")
                     print(f"[driver] uploaded {ckpt.relative_to(ROOT)}", flush=True)
                 except Exception as e:  # noqa: BLE001  (never kill training over a sync)

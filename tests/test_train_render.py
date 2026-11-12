@@ -193,3 +193,37 @@ def test_trl_wipes_mismatched_checkpoints_before_training(tmp_path, monkeypatch)
     _ckpt(out, 400)  # same data and recipe on the next attempt: resumed
     train.train_trl("m", tmp_path / "train.jsonl", None, out, 1, Recipe())
     assert calls["resume"] == str(out / "checkpoint-400")
+
+
+def test_train_clock_sums_resumed_sessions(tmp_path, monkeypatch):
+    """Audit 2, B17: train_seconds used to count only the last session of a resumed run."""
+    import json
+
+    from lorde_forge import train
+    now = [1000.0]
+    monkeypatch.setattr(train.time, "time", lambda: now[0])
+    key = {"train_sha256": "abc", "recipe": {"epochs": 2}}
+    with train.TrainClock(tmp_path, key, resumed=False, interval=3600) as c:
+        now[0] += 7200  # session 1: 2 h, then Kaggle kills it (the file was written at least at entry)
+        c.write()       # the periodic writer's last tick
+    with train.TrainClock(tmp_path, key, resumed=True, interval=3600) as c:
+        now[0] += 3600  # session 2 resumes from a checkpoint: 1 h more
+    s = c.summary()
+    assert s["train_seconds"] == 10800 and s["train_sessions"] == 2 and s["train_seconds_this_session"] == 3600
+    assert json.loads((tmp_path / train.CLOCK).read_text())["seconds"] == 10800
+    # a fresh start (no checkpoint) or another key restarts the clock
+    assert train.TrainClock(tmp_path, key, resumed=False).prior == 0
+    assert train.TrainClock(tmp_path, {**key, "train_sha256": "other"}, resumed=True).prior == 0
+    assert train.TrainClock(tmp_path, key, resumed=True).prior == 10800
+
+
+def test_train_clock_writes_while_training(tmp_path):
+    import json
+    import time as _time
+
+    from lorde_forge import train
+
+    with train.TrainClock(tmp_path, {"k": 1}, resumed=False, interval=0.05):
+        _time.sleep(0.3)
+        mid = json.loads((tmp_path / train.CLOCK).read_text())["seconds"]
+    assert mid > 0  # a killed session still leaves its time on disk

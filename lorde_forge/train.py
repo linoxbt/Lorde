@@ -18,6 +18,8 @@ import json
 import math
 import shutil
 import sys
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -164,6 +166,73 @@ def prepare_resume(out_dir: Path, key: dict) -> str | None:
     return latest_checkpoint(out_dir)
 
 
+CLOCK = "train_clock.json"
+
+
+class TrainClock:
+    """Wall-clock training seconds summed over every session of one run (audit 2, B17).
+
+    A Kaggle session ends after 12 h, so a long run resumes from its newest checkpoint in a later session.
+    ``<out_dir>/train_clock.json`` holds the seconds spent so far under the run's resume key; it is rewritten
+    every ``interval`` seconds while training (so a killed session loses at most that much) and at the end. A
+    session that resumes a checkpoint adds to it; one that starts from scratch (or under another key) restarts
+    it. Sync this file with the checkpoints (the Kaggle driver does)."""
+
+    def __init__(self, out_dir: Path, key: dict, resumed: bool, interval: float = 60.0):
+        self.path = Path(out_dir) / CLOCK
+        self.key = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+        old: dict = {}
+        try:
+            old = json.loads(self.path.read_text()) if self.path.exists() else {}
+        except (OSError, ValueError):
+            old = {}
+        same = resumed and isinstance(old, dict) and old.get("key") == self.key
+        self.prior = float(old.get("seconds", 0.0)) if same else 0.0
+        self.sessions = int(old.get("sessions", 0)) + 1 if same else 1
+        self.interval = interval
+        self.t0: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def this_session(self) -> float:
+        return time.time() - self.t0 if self.t0 is not None else 0.0
+
+    @property
+    def total(self) -> float:
+        return self.prior + self.this_session
+
+    def write(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"key": self.key, "seconds": round(self.total, 1), "sessions": self.sessions}))
+        tmp.replace(self.path)
+
+    def _tick(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.write()
+            except OSError:
+                pass
+
+    def __enter__(self) -> TrainClock:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.t0 = time.time()
+        self.write()
+        self._thread = threading.Thread(target=self._tick, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        self.write()
+
+    def summary(self) -> dict:
+        return {"train_seconds": round(self.total, 1), "train_sessions": self.sessions,
+                "train_seconds_this_session": round(self.this_session, 1), "train_seconds_all_sessions": True}
+
+
 @contextmanager
 def resume_trl_from(checkpoint: str | None):
     """AlignTune 0.1.32 calls ``trl.SFTTrainer.train()`` without arguments and has no resume option; while
@@ -209,7 +278,8 @@ def attach_validation(trainer, train_path: Path, val_path: Path) -> bool:
 
 
 def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: int, r: Recipe,
-                    val_path: Path | None = None) -> None:
+                    val_path: Path | None = None) -> dict:
+    """Train; returns the TrainClock summary (seconds over every session of this run)."""
     from aligntune.core.backend_factory import create_sft_trainer
     from transformers import AutoTokenizer
 
@@ -243,13 +313,15 @@ def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: in
     last = prepare_resume(out_dir, key)
     if last:
         print(f"[train] resuming from {last}")
-    with resume_trl_from(last):
+    with resume_trl_from(last), TrainClock(out_dir, key, resumed=bool(last)) as clock:
         trainer.train()
     trainer.save_model(str(out_dir))
+    return clock.summary()
 
 
 def train_trl(base_model: str, train_path: Path, val_path: Path | None, out_dir: Path, n_rows: int,
-              r: Recipe) -> None:
+              r: Recipe) -> dict:
+    """Train; returns the TrainClock summary (seconds over every session of this run)."""
     from datasets import load_dataset
     from peft import LoraConfig
     from trl import SFTConfig, SFTTrainer
@@ -272,11 +344,14 @@ def train_trl(base_model: str, train_path: Path, val_path: Path | None, out_dir:
                           target_modules=r.targets, task_type="CAUSAL_LM")
     trainer = SFTTrainer(model=base_model, args=cfg, train_dataset=ds["train"],
                          eval_dataset=ds.get("validation"), peft_config=peft_cfg)
-    last = prepare_resume(out_dir, resume_key(base_model, train_path, r, "trl"))
+    key = resume_key(base_model, train_path, r, "trl")
+    last = prepare_resume(out_dir, key)
     if last:
         print(f"[train] resuming from {last}")
-    trainer.train(resume_from_checkpoint=last)
+    with TrainClock(out_dir, key, resumed=bool(last)) as clock:
+        trainer.train(resume_from_checkpoint=last)
     trainer.save_model(str(out_dir))
+    return clock.summary()
 
 
 def find_adapter(adapter_dir: Path) -> Path:
