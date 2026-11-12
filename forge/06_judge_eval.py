@@ -292,7 +292,8 @@ def main() -> None:
         report["api_reference"] = {"model": f"{config.CALIBRATION_MODEL} (Cohere API)",
                                    "mean_prompt_tokens": round(pt, 1), "mean_completion_tokens": round(ct, 1),
                                    "price_per_1M_tokens": price, "cost_per_1M_judgments": api,
-                                   "token_source": "calibration labels" if cal else "teacher labels (8B tokenizer)"}
+                                   "token_source": "calibration labels" if cal else "teacher labels (8B tokenizer)",
+                                   "estimate": "list price x mean tokens per judgment; no API bill was measured"}
 
     # AuditKIT significance: does the candidate agree with the teacher more often than the baseline?
     ref_dec = [t["teacher_score"] >= config.THRESHOLD for t in test]
@@ -473,7 +474,10 @@ def render_md(r: dict, cand: str) -> str:
     lines += ["## Before / after\n", table(head, body), ""]
     if "api_reference" in r:
         a = r["api_reference"]
-        lines += [f"API reference: {a['model']} at ${a['price_per_1M_tokens']['input']}/1M input and "
+        how = ("token counts of the 32B calibration replies" if a.get("token_source") == "calibration labels" else
+               "the API judge was not called; token counts are the 8B teacher's")
+        lines += [f"API reference (an estimate at list price, not a measured cost: {how}): "
+                  f"{a['model']} at ${a['price_per_1M_tokens']['input']}/1M input and "
                   f"${a['price_per_1M_tokens']['output']}/1M output tokens, {a['mean_prompt_tokens']} prompt + "
                   f"{a['mean_completion_tokens']} completion tokens per judgment ({a['token_source']}) → "
                   f"**${a['cost_per_1M_judgments']} per 1M judgments**.\n"]

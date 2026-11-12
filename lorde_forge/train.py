@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+SEED = 42  # training seed of every run (judge and downstream)
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
@@ -306,7 +307,7 @@ def train_aligntune(base_model: str, train_path: Path, out_dir: Path, n_rows: in
         precision=prec, fp16=fp16, bf16=bf16, gradient_checkpointing=True, completion_only_loss=True,
         packing=False, eval_strategy="steps" if val_path else "no", eval_interval=r.eval_steps,
         load_best_model_at_end=False, save_interval=r.save_steps, save_total_limit=2,
-        logging_steps=10, seed=42,
+        logging_steps=10, seed=SEED,
     )
     if val_path is not None:
         attach_validation(trainer, train_path, val_path)
@@ -337,7 +338,7 @@ def train_trl(base_model: str, train_path: Path, val_path: Path | None, out_dir:
         lr_scheduler_type="cosine", warmup_steps=r.warmup_steps(n_rows), max_length=r.max_len,
         completion_only_loss=True, packing=False, fp16=fp16, bf16=bf16, gradient_checkpointing=True,
         logging_steps=10, eval_strategy="steps" if val_path else "no", eval_steps=r.eval_steps,
-        save_strategy="steps", save_steps=r.save_steps, save_total_limit=2, report_to="none", seed=42,
+        save_strategy="steps", save_steps=r.save_steps, save_total_limit=2, report_to="none", seed=SEED,
         model_init_kwargs={"dtype": torch_dtype()},
     )
     peft_cfg = LoraConfig(r=r.lora_r, lora_alpha=r.lora_alpha, lora_dropout=r.lora_dropout,

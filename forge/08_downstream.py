@@ -220,6 +220,10 @@ def stage_score(args) -> None:
     s = report["significance"].get(f"{cand} vs ungated", {}).get("f1_score", {})
     if s:
         report["better_than_ungated_p05"] = bool(s.get("significant") and s.get("delta", 0) > 0)
+    # The training setup behind these numbers: one run (one seed) per set, so the article can state its limits.
+    report["setup"] = {"epochs": args.epochs, "max_rows": args.max_rows or None, "equal_size": args.equal_size,
+                       "max_len": args.max_len, "engine": args.engine, "seeds": 1, "train_seed": T.SEED,
+                       "max_new_tokens": args.max_new_tokens, "n_eval": len(ev)}
     jsonl.write_json(config.RESULTS / "downstream.json", report)
     (config.RESULTS / "downstream.md").write_text(render_md(report), encoding="utf-8")
     print(f"[downstream] wrote {config.RESULTS / 'downstream.md'}")
@@ -250,7 +254,20 @@ def render_md(r: dict) -> str:
         lines.append("Lorde-gated F1 relative to teacher-gated: undefined (teacher-gated F1 is 0), so the "
                      "within-2% criterion is not measured.\n")
     if "better_than_ungated_p05" in r:
-        lines.append(f"Lorde-gated beats ungated with p < 0.05: **{fmt(r['better_than_ungated_p05'])}**.\n")
+        lines.append(f"Lorde-gated beats ungated on F1 with p < 0.05: **{fmt(r['better_than_ungated_p05'])}**.\n")
+    worse = [(k.split(" vs ")[1], s) for k, d in r.get("significance", {}).items()
+             if (s := d.get("lexical_groundedness")) and s.get("significant") and (s.get("delta") or 0) < 0]
+    if worse:
+        lines.append("Groundedness: Lorde-gated answers are **significantly less grounded** in the source than "
+                     + " and ".join(f"{'the ungated set' if b == 'ungated' else b + '-gated'} ({fmt(s.get('mean_candidate'))} vs {fmt(s.get('mean_baseline'))}, "
+                                    f"p = {s.get('p_value', 0):.3f})" for b, s in worse) + ".\n")
+    if r.get("setup"):
+        st = r["setup"]
+        lines.append(f"Setup: {st.get('seeds', 1)} training run (seed {st.get('train_seed', '?')}) per set, "
+                     f"{st.get('epochs')} epoch(s)"
+                     + (f", at most {st['max_rows']:,} rows per set" if st.get("max_rows") else "")
+                     + (", every set subsampled to the same size" if st.get("equal_size") else "")
+                     + "; differences of this size need more seeds before they can be called parity.\n")
     if r["significance"]:
         rows = []
         for k, d in r["significance"].items():
