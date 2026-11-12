@@ -16,3 +16,13 @@ test("Gateway errors map to friendly messages", () => {
   assert.equal(friendlyGatewayError(502, null, null, "fallback"), "fallback");
   assert.equal(friendlyGatewayError(500, undefined), "Request failed (500)");
 });
+
+test("audit-2 Gateway error codes map to friendly messages", () => {
+  assert.match(friendlyGatewayError(429, { error: { code: "quota_exceeded",
+    message: "this organization's daily quota of 50 judgments is used up (50 today)" } }), /\(50 judgments a day\.\)/);
+  assert.match(friendlyGatewayError(429, { error: { code: "capacity_exceeded", message: "x" } }, "7200"),
+    /service-wide daily capacity.*about 2 h.*not charged/);
+  assert.match(friendlyGatewayError(429, { error: { code: "storage_quota_exceeded", message: "x" } }), /storage limit/);
+  assert.match(friendlyGatewayError(422, { error: { code: "unsupported_dataset", message: "x" } }), /one file/);
+  assert.match(friendlyGatewayError(405, { error: { code: "method_not_allowed", message: "x" } }), /does not accept/);
+});

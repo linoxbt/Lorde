@@ -17,7 +17,7 @@ const TOC = [["quickstart", "Quickstart"], ["grounding", "Grounding gate"], ["re
 const API = [
   ["POST", "/v1/judge/reward", "Judge one instruction/response pair", "fields ≤ 32,000 chars"],
   ["POST", "/v1/judge/grounding", "Judge one source/question/answer item", "source ≤ 24,000 chars"],
-  ["POST", "/v1/judge/batch", "Up to 256 items of one kind", "body ≤ 5 MB"],
+  ["POST", "/v1/judge/batch", "Up to 8 items of one kind; items not started when the client disconnects are refunded", "body ≤ 5 MB"],
   ["POST", "/v1/chat/completions", "OpenAI-compatible, for CuratorKIT and LiteLLM", "temperature ≤ 0.3"],
   ["GET", "/v1/models", "The served model and its revision", "–"],
   ["POST", "/v1/uploads", "Signed upload URL for a dataset", "≤ 200 MB"],
@@ -34,7 +34,7 @@ const ERRORS = [
   ["403", "forbidden", "Key revoked or lacks the scope"], ["404", "not_found", "Job or upload not in this org"],
   ["409", "conflict", "Job already finished or cancelled"], ["413", "payload_too_large", "Field, batch or upload over the limit"],
   ["422", "judge_unparseable", "The reply failed the contract (≈ 0 with structured outputs)"],
-  ["429", "rate_limited", "Rate limit hit, or the model is busy (\"model busy\"); Retry-After is set"], ["429", "quota_exceeded", "Daily per-organization judgment quota used up; resets 00:00 UTC (Retry-After)"], ["503", "model_unavailable", "Serve unhealthy; retry with backoff"],
+  ["429", "rate_limited", "Rate limit hit, or the model is busy (\"model busy\"); Retry-After is set"], ["429", "quota_exceeded", "Daily per-organization judgment quota used up (new organizations get a lower quota for their first day); resets 00:00 UTC (Retry-After); do not retry"], ["429", "capacity_exceeded", "Service-wide daily capacity reached; your quota is refunded; resets 00:00 UTC; do not retry"], ["429", "storage_quota_exceeded", "Upload refused: the organization's dataset count or byte limit is reached; delete datasets"], ["422", "unsupported_dataset", "A Hub dataset_url must name one file (.jsonl, .json, .csv, .parquet), not a whole repo"], ["405", "method_not_allowed", "Known path, wrong method; the Allow header lists the methods"], ["503", "model_unavailable", "Serve unhealthy; retry with backoff"],
 ];
 
 function H2({ id, children }: { id: string; children: React.ReactNode }) {

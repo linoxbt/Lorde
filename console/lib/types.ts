@@ -12,6 +12,8 @@ export type JobCounts = {
   rows_in?: number; evaluated?: number; passed?: number; rejected?: number; pass_rate?: number | null;
   rejection_reasons?: Record<string, number>; judge_errors?: number; progress?: string; wall_s?: number;
   notice?: string; not_evaluated?: number; quota_rows?: number;
+  /** Judgments made / charged, rows judged (kept and charged on every exit path, audit 2 B3), Hub revision used. */
+  judgments?: number; judgments_charged?: number; rows_judged?: number; evaluated_rows?: number; hf_revision?: string;
 };
 export type Job = {
   id: string; status: JobStatus; dataset_id: string | null; dataset_name?: string;

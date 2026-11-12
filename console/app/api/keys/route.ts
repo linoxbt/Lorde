@@ -47,6 +47,7 @@ export async function POST(req: Request) {
     }).select(COLS).single();
     if (error) {
       console.error("[console] key insert failed:", error.code, error.message);
+      if (error.code === "54000") return apiError(409, "too_many_keys", "Your organization has 20 active keys. Revoke one you no longer use, then create a new one.");
       return error.code === "42501"
         ? apiError(403, "forbidden", "Only owners and admins can create keys.")
         : apiError(500, "internal", "Could not create the key. Try again.");

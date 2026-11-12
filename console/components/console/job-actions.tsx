@@ -12,9 +12,12 @@ import type { JobStatus } from "@/lib/types";
 const LABELS: Record<string, string> = {
   passed: "passed.jsonl", rejected: "rejected.jsonl", report: "report.md", manifest: "manifest.json",
   lexsi_provenance: "lexsi_provenance.json", judgments: "judgments.jsonl", summary: "summary.json",
+  partial: "partial.jsonl",
 };
 
-export function JobActions({ id, status, demo, cancelRequested }: { id: string; status: JobStatus; demo: boolean; cancelRequested?: boolean }) {
+export function JobActions({ id, status, demo, cancelRequested, judged }: { id: string; status: JobStatus; demo: boolean; cancelRequested?: boolean; judged?: number }) {
+  // Failed or cancelled jobs keep the judgments they made (partial.jsonl), so they can be downloaded too.
+  const hasPartial = (status === "failed" || status === "cancelled") && (judged ?? 0) > 0;
   const router = useRouter();
   const [msg, setMsg] = useState<{ text: string; error?: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -61,7 +64,7 @@ export function JobActions({ id, status, demo, cancelRequested }: { id: string; 
             <XCircle className="size-3.5" />{cancelRequested ? "Cancelling…" : "Cancel"}
           </Button>
         )}
-        {status === "succeeded" && <Button size="sm" onClick={download} disabled={busy}><Download className="size-3.5" />{busy ? "Fetching…" : "Download results"}</Button>}
+        {(status === "succeeded" || hasPartial) && <Button size="sm" onClick={download} disabled={busy}><Download className="size-3.5" />{busy ? "Fetching…" : status === "succeeded" ? "Download results" : "Download partial results"}</Button>}
       </div>
       {needKey && !getKey() && <ConnectKey need={active ? ["jobs:write"] : ["jobs:read"]} onChange={(c) => c && setNeedKey(false)} />}
       {files && (

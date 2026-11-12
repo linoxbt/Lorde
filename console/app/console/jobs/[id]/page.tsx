@@ -44,7 +44,7 @@ export default async function JobDetail(props: PageProps<"/console/jobs/[id]">) 
       <AutoRefresh active={active && ws.mode === "live"} />
       <PageHeader title={`Job ${id.slice(0, 8)}`}
         lead={<span className="flex flex-wrap items-center gap-2"><JobStatusBadge status={job.status} />{jobDatasetLabel(job)}{job.model_revision ? ` · ${job.model_revision}` : ""}</span>}
-        actions={<JobActions id={id} status={job.status} demo={ws.mode === "demo"} cancelRequested={job.cancel_requested} />} />
+        actions={<JobActions id={id} status={job.status} demo={ws.mode === "demo"} cancelRequested={job.cancel_requested} judged={job.counts?.judgments} />} />
       {job.error && <Card className="mb-6 border-[#f6cfb3] bg-reject-wash p-4 font-mono text-[13px] text-[#9a4300]">{job.error}</Card>}
       <Card className="mb-6 p-5">
         <div className="flex items-center justify-between text-sm">
