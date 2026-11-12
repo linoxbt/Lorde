@@ -35,6 +35,20 @@ pnpm test:e2e:live       # Playwright, live mode: production build (.next-live) 
   (`verifyOtp`). `/auth/callback` keeps handling GitHub and PKCE `code` links; a PKCE email link opened in another
   browser gets "your email is confirmed, sign in" (sign-up) or "request a new link" (sign-in link, reset).
 
+## Security headers
+
+Every page gets a per-response, nonce-based Content-Security-Policy from `proxy.ts` (built in `lib/csp.ts`):
+`script-src 'nonce-…' 'strict-dynamic'` (no `'unsafe-inline'`, no `'unsafe-eval'` in production), `object-src 'none'`,
+`base-uri 'self'`, `form-action 'self'`, `frame-ancestors 'none'`, and `connect-src` limited to this site, the Supabase
+project and the Gateway's public URL (plus Cloudflare Turnstile when it is enabled). Next puts the nonce on its own
+scripts while rendering, so every page renders per request (`app/layout.tsx`); the marketing pages are no longer
+prerendered. Styles keep `'unsafe-inline'` because React `style` attributes cannot carry a nonce.
+
+Trade-off: `@supabase/ssr` stores the session in cookies that JavaScript can read (the browser client refreshes the
+token itself), so they cannot be `HttpOnly`. An injected script could read the session; the CSP above is what stops
+scripts from being injected, and React's escaping is the other half. `pnpm test:e2e:live` checks the header, the
+nonce on every script and that pages hydrate without CSP violations.
+
 ## Design
 
 Layout and rhythm take cues from base.org (oversized tight headlines, pill buttons, hairline cards with line

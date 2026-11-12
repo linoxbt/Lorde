@@ -193,3 +193,34 @@ test("a PKCE email link opened in another browser says what to do next", async (
   await page.goto("/signin?error=other_browser");
   await expect(page.locator("p[role=alert]")).toContainText("This link was opened in a different browser.");
 });
+
+test("every page carries a nonce-based CSP that its own scripts satisfy", async ({ context, baseURL, page }) => {
+  await signIn(context, baseURL!, "member");
+  const violations: string[] = [];
+  page.on("console", (m) => { if (/Content Security Policy|Refused to (load|execute)/i.test(m.text())) violations.push(m.text()); });
+  page.on("pageerror", (e) => violations.push(`pageerror: ${e.message}`));
+  const nonces = new Set<string>();
+  for (const path of ["/", "/docs", "/status", "/console", "/console/jobs", "/console/datasets", "/console/jobs/new",
+    "/console/playground", "/console/review", "/console/keys", "/console/settings", "/console/reports"]) {
+    const r = await page.goto(path, { waitUntil: "load" });
+    const csp = r?.headers()["content-security-policy"] ?? "";
+    const nonce = /'nonce-([^']+)'/.exec(csp)?.[1];
+    expect(nonce, `${path} has a script nonce`).toBeTruthy();
+    expect(csp).toContain("'strict-dynamic'");
+    expect(csp).not.toMatch(/script-src[^;]*'unsafe-(inline|eval)'/);
+    expect(csp).toContain("frame-ancestors 'none'");
+    nonces.add(nonce!);
+    // Next put this response's nonce on every script in the HTML (the ones they load later pass by 'strict-dynamic')
+    const tags = (await r!.text()).match(/<script\b[^>]*>/g) ?? [];
+    expect(tags.length).toBeGreaterThan(0);
+    expect(tags.filter((t) => !t.includes(`nonce="${nonce}"`)), `${path}: scripts without the nonce`).toEqual([]);
+    // and the page hydrated: client components respond
+    await expect(page.locator("body")).toBeVisible();
+  }
+  expect(nonces.size, "a fresh nonce per response").toBe(12);
+  // hydration works under the policy: the menu (a client component) opens
+  await page.goto("/docs", { waitUntil: "networkidle" });
+  await page.getByRole("button", { name: "Open menu" }).click();
+  await expect(page.getByRole("dialog", { name: "Menu" })).toBeVisible();
+  expect(violations).toEqual([]);
+});

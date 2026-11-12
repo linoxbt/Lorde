@@ -13,6 +13,13 @@ export const metadata: Metadata = {
   openGraph: { title: "Lorde", description: "The judge for trustworthy training data.", type: "website" },
 };
 
+/**
+ * Every page renders per request: the nonce-based Content-Security-Policy (proxy.ts, lib/csp.ts) is new for each
+ * response, and Next can only put it on its scripts while rendering. A prerendered page would carry no nonce and its
+ * scripts would be blocked.
+ */
+export const dynamic = "force-dynamic";
+
 export const viewport: Viewport = { themeColor: "#ffffff", width: "device-width", initialScale: 1 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
