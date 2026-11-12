@@ -5,9 +5,13 @@
     python forge/kaggle_driver.py b      # Session B: smoke train, full LoRA SFT, merge, save
     python forge/kaggle_driver.py ab     # A, then B if A's exit check passed
     python forge/kaggle_driver.py c      # Session C: judge eval, plug-in runs, downstream, private publish
+    python forge/kaggle_driver.py d      # Session D: step-6 timings and predictions, downstream, private publish
 
-Same commands as forge/kaggle_runbook.ipynb, run in the Kaggle kernel's own Python (huggingface_hub is
-preinstalled there). Needs HF_TOKEN in the environment and HF_USER (default Oxlino). Every step resumes from
+forge/kaggle_runbook.ipynb runs these same step scripts (it imports this file), here in the Kaggle kernel's own
+Python (huggingface_hub is preinstalled there). Needs HF_TOKEN in the environment; HF_USER (default Oxlino),
+WORK_REPO, HUMAN_LANGS, DOWNSTREAM_ARGS, TRAIN_ARGS / TRAIN_BUDGET_H and LORDE_TRUST_LEGACY_CACHE=1 (reuse step-6
+prediction caches that have no weights fingerprint; off by default, so a reproduction recomputes them) are
+optional. Every step resumes from
 the private work repo <HF_USER>/lorde-work, and the driver uploads data/, results/, bench/ and logs/ there
 after each step (data and logs also every 10 minutes during long steps, plus the newest complete training
 checkpoint while training), so progress is visible while it runs and a killed session loses at most one step
@@ -93,14 +97,34 @@ cat runs/lorde-v1/train_meta.json"""),
 
 # Downstream (step 8): train the three sets on both T4s at once, equal size and capped so the step fits a session
 # (~32 s per optimiser step at batch 1 x 16 on a T4), then generate and score on one GPU.
+# These are the settings behind the published downstream numbers (forge/kaggle_runbook.ipynb runs this same script).
 DOWNSTREAM_ARGS = os.environ.get("DOWNSTREAM_ARGS", "--equal-size --max-rows 2000 --epochs 1 --max-len 1024")
 _DS = "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True envs/train/bin/python forge/08_downstream.py"
-DOWNSTREAM = f"""CUDA_VISIBLE_DEVICES=0 {_DS} train --sets ungated,teacher,lorde --only-sets ungated,lorde {DOWNSTREAM_ARGS} &
+
+
+def parallel(cmd0: str, cmd1: str, what: str = "job") -> str:
+    """Bash for two background commands (one per GPU). The step runs under ``set -e``, where a bare
+    ``wait $p0`` that fails would exit before ``wait $p1`` and leave the other GPU's job orphaned: here the first
+    failure stops the sibling (its whole process group, so worker processes go too), both are reaped, and the step
+    fails."""
+    return f"""set -m
+{{ {cmd0}; }} &
 p0=$!
-CUDA_VISIBLE_DEVICES=1 {_DS} train --sets ungated,teacher,lorde --only-sets teacher {DOWNSTREAM_ARGS} &
+{{ {cmd1}; }} &
 p1=$!
-wait $p0
-wait $p1
+set +m
+r=0
+wait -n || r=1
+if [ $r -ne 0 ]; then kill -- -$p0 -$p1 2>/dev/null || true; fi
+wait $p0 || r=1
+wait $p1 || r=1
+if [ $r -ne 0 ]; then echo "[driver] {what} failed on one GPU; stopped the other" >&2; exit 1; fi"""
+
+
+DOWNSTREAM = parallel(
+    f"CUDA_VISIBLE_DEVICES=0 {_DS} train --sets ungated,teacher,lorde --only-sets ungated,lorde {DOWNSTREAM_ARGS}",
+    f"CUDA_VISIBLE_DEVICES=1 {_DS} train --sets ungated,teacher,lorde --only-sets teacher {DOWNSTREAM_ARGS}",
+    "downstream training") + f"""
 CUDA_VISIBLE_DEVICES=0 {_DS} generate --sets ungated,teacher,lorde --include-base {DOWNSTREAM_ARGS}
 CUDA_VISIBLE_DEVICES=0 {_DS} score --sets ungated,teacher,lorde --include-base {DOWNSTREAM_ARGS}
 cat results/downstream.md"""
@@ -148,8 +172,14 @@ def train_args() -> str:
     return f"--epochs 1 --max-samples {int(budget / per_row)}"
 
 
-# Session D: redo what Session C could not finish, keeping its judge-eval and plug-in results: cold, stratified
-# step-6 timings (predictions reused from the cache), downstream, private publish.
+# Prediction caches written before fingerprints existed (Session C's) are reused only when LORDE_TRUST_LEGACY_CACHE=1.
+# The published Session D run did that: its step-6 predictions are Session C's, stamped "legacy_trusted" in
+# results/preds/*.meta.json with the weights Session D served. By default a reproduction recomputes them
+# (06 moves an untrusted legacy cache aside to <judge>.jsonl.stale.* and asks the server again: 937 items per judge).
+TRUST_LEGACY = " --trust-legacy-cache" if os.environ.get("LORDE_TRUST_LEGACY_CACHE") == "1" else ""
+
+# Session D: redo what Session C could not finish, keeping its plug-in results: cold, stratified step-6 timings and
+# predictions (recomputed unless LORDE_TRUST_LEGACY_CACHE=1), downstream, private publish.
 SESSION_D = [
     ("setup", SETUP),
     ("judge-timing", f"""{SERVE}
@@ -157,8 +187,7 @@ bash forge/00_serve.sh stop
 CUDA_VISIBLE_DEVICES=0 bash forge/00_serve.sh student
 CUDA_VISIBLE_DEVICES=1 bash forge/00_serve.sh lorde
 {PY} forge/06_judge_eval.py --judge base=openai/student@http://localhost:8001/v1 \\
-  --judge lorde=openai/lorde@http://localhost:8002/v1 --gpu-hourly base=0.50 --gpu-hourly lorde=0.50 --structured \\
-  --trust-legacy-cache
+  --judge lorde=openai/lorde@http://localhost:8002/v1 --gpu-hourly base=0.50 --gpu-hourly lorde=0.50 --structured{TRUST_LEGACY}
 bash forge/00_serve.sh stop"""),
     ("downstream", DOWNSTREAM),
     ("publish-private", f"{PY} forge/09_publish.py --user {HF_USER}"),
