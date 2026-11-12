@@ -10,7 +10,7 @@
 # this image runs as uid 10001: set RAILWAY_RUN_UID=0 on the service (Railway's documented fix for non-root
 # images); the tool exits with a clear message at start if the directory is not writable.
 # The sample key (human_sample_key.jsonl) is never needed here: keep it out of LABEL_HUB_REPO (LORDE_LABEL_KEY_REPO).
-FROM python:3.11-slim
+FROM python:3.15-slim
 RUN useradd --create-home --uid 10001 label
 WORKDIR /app
 RUN pip install --no-cache-dir "gradio==6.31.0" "huggingface_hub==1.33.0"
