@@ -399,9 +399,10 @@ class Worker:
                 charge = 0 if run.requeued else run.counted
                 if charge:
                     await self.meter(job, charge, int((time.monotonic() - t0) * 1000), run)
-                await self.q("update jobs set counts = counts || %s where id = %s",
+                await self.q("update jobs set counts = counts || %s where id = %s "
+                             "and (locked_by is null or locked_by = %s)",  # not a job another worker took over
                              (Jsonb({"judgments": run.counted, "judgments_charged": charge,
-                                     "rows_judged": len(run.rows_seen)}), jid))
+                                     "rows_judged": len(run.rows_seen)}), jid, self.id))
             except Exception:  # noqa: BLE001  (the database is gone: the quota is still settled below)
                 log.exception("job %s: could not store or meter its last judgments", jid)
             if reserved or charge:
