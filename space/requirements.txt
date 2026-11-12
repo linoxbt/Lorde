@@ -1,0 +1,7 @@
+curatorkit==0.1.23   # the exact templates Lorde was trained on
+jsonschema>=4
+openai>=1.40
+transformers>=5.15,<6
+torch
+accelerate>=1.0
+huggingface_hub

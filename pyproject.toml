@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lorde-forge"
+version = "0.1.0"
+description = "Lorde Forge: data, training and evaluation pipeline for the Lorde judge model"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "curatorkit[generation]>=0.1.21,<0.2",
+    "jsonschema>=4",
+    "openai>=1.40",
+    "scipy>=1.11",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "hypothesis>=6", "ruff>=0.6"]
+
+[tool.setuptools]
+packages = ["lorde_forge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501", "B008", "B905", "UP031", "E741"]

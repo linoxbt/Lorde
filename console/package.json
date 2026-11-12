@@ -1,0 +1,38 @@
+{
+  "name": "lorde-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start --port 3000",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node --test --experimental-strip-types tests/unit/*.test.ts",
+    "test:e2e": "playwright test --trace off",
+    "test:e2e:live": "playwright test --config playwright.live.config.ts --trace off"
+  },
+  "dependencies": {
+    "@supabase/ssr": "0.12.7",
+    "@supabase/supabase-js": "^2.80.0",
+    "clsx": "^2.1.1",
+    "geist": "1.9.2",
+    "lucide-react": "^0.540.0",
+    "next": "16.4.6",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "recharts": "^3.2.0",
+    "server-only": "^0.0.1",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@tailwindcss/postcss": "4.3.5",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "tailwindcss": "4.3.5",
+    "typescript": "^5.9.0"
+  },
+  "packageManager": "pnpm@10.18.0"
+}

@@ -1,0 +1,12 @@
+# forge-data: steps 1-4, 6, 7, 9, bench/ and tests. No GPU libraries.
+curatorkit[generation]==0.1.23   # LSAL v1.1 (non-commercial); judge prompts, parser, QA stage, gating runs
+auditkit==1.1.6                  # LSAL v1.2; per-sample scoring and significance tests
+litellm>=1.60
+openai>=1.40
+pydantic>=2.7
+datasets>=3.0
+scipy>=1.11
+jsonschema>=4
+tqdm>=4.66
+huggingface_hub>=1.0
+gradio>=5                        # step 4 label tool only

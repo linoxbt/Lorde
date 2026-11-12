@@ -1,0 +1,10 @@
+.git
+envs
+data
+results
+runs
+logs
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.hypothesis
