@@ -1,10 +1,11 @@
 # Lorde
 
-**A 3B judge model for trustworthy training data.** Lorde is Cohere's **Tiny Aya Global (3.35B)**
+**A 3B judge model for CuratorKIT's quality gates.** Lorde is Cohere's **Tiny Aya Global (3.35B)**
 fine-tuned to run [CuratorKIT](https://github.com/Lexsi-Labs/CuratorKIT)'s two LLM-judge quality gates:
 **RewardGate** (helpfulness, honesty, instruction following) and **HallucinationGate** (is every claim in an
-answer supported by its source?). It gives API-grade gate decisions from a model that runs on one inexpensive
-GPU, in replies CuratorKIT's strict parser always accepts.
+answer supported by its source?). It imitates an Aya Expanse 8B teacher's gate decisions from a model that runs
+on one inexpensive GPU, in replies CuratorKIT's strict parser can read (100% of the held-out test set). See
+[Scope and status](#scope-and-status) for what the v1 results do and do not show.
 
 Built for the **Lexsi AI Safety & Alignment Hackathon, Track 1 (Fine-tuning and Data Curation)** by chaining
 all three Track 1 toolkits: **CuratorKIT → AlignTune → AuditKIT**. This repo holds Phase 0 (spec
@@ -14,7 +15,7 @@ HF Article tooling.
 | | |
 |---|---|
 | Student | `CohereLabs/tiny-aya-global` (3.35B, CC-BY-NC-4.0) |
-| Teacher | `CohereLabs/aya-expanse-8b` (self-hosted vLLM, bulk labels) · `c4ai-aya-expanse-32b` via the Cohere API (calibration) |
+| Teacher | `CohereLabs/aya-expanse-8b` (self-hosted vLLM, bulk labels) · `c4ai-aya-expanse-32b` via the Cohere API (planned calibration slice; not run for v1) |
 | Languages | English, Hindi, French, Arabic, Spanish, Portuguese, Indonesian, Turkish |
 | Problem statements | *Replacing a closed-model API* · *Data-scarce domains* (curated data measurably beats raw) |
 | Outputs | HF model `<user>/lorde-tiny-aya`, data `<user>/lorde-data`, Space `<user>/lorde-demo`, two HF collections |
@@ -24,6 +25,35 @@ the student, so every label comes from a teacher that actually reads the languag
 wide spread of scripts and regions (Latin, Devanagari, Arabic; Europe, South Asia, the Middle East,
 Southeast Asia, Latin America, Africa). The spec's earlier set included Swahili, Yoruba and Hausa, which Aya
 Expanse does not support, so the teacher would have been guessing in them.
+
+## Scope and status
+
+**Model status (v1.0.0, from the result files; full write-up in [`docs/HF_ARTICLE.md`](docs/HF_ARTICLE.md)).**
+
+- **Not promotable by its own acceptance criteria** (spec 9.2): κ vs the teacher 0.748 (target ≥ 0.75), worst
+  language Arabic 84.5% (target ≥ 85%), golden-300 87.3% / κ 0.691 (targets ≥ 90% / ≥ 0.75), adversarial-100
+  pass rate 46% (target ≤ 5%), human agreement not measured.
+- **Human agreement is pending:** 0 of the 200 blind sample items are labelled. The planned Aya Expanse 32B
+  calibration slice was not run. Every agreement number is against the 8B teacher, which is lenient on grounding,
+  so it measures imitation rather than correctness.
+- **Downstream:** Lorde-gated data matches teacher-gated F1 but is significantly less grounded, from one seed per
+  set; the API cost in the ROI is a list-price estimate, not a measured bill.
+- **The live Gateway serves the untrained base model** (Cohere's Tiny Aya Global GGUF on CPU,
+  `tiny-aya-global-q4km@staging-base-cpu`) until a GGUF export of the published weights
+  (`forge/10_export_gguf.py`) is served and promoted; see `docs/DEPLOYMENT.md`.
+
+**Intentionally out of scope for the hackathon** (in the spec, not built here):
+
+- the weekly drift job (FR-13);
+- observability: Sentry, OpenTelemetry tracing, Grafana dashboards and alerts;
+- degraded mode and a spend/budget cap;
+- operational runbooks (incident, rollback, key rotation);
+- release and nightly CI (including the golden-300 gate in CI), container and dependency scanning (Trivy,
+  Dependabot);
+- k6 load tests;
+- infrastructure manifests (infrastructure as code); services were configured by hand (`docs/DEPLOYMENT.md`).
+
+Third-party licence terms are collected in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
 ## How it works
 
@@ -211,8 +241,9 @@ also run end to end on CPU with `trl-internal-testing/tiny-Cohere2ForCausalLM`; 
 - **Structured outputs in CuratorKIT runs:** the spec's worker sent `judge_llm` straight to Serve, so it got no
   schemas. Step 7 adds them per gate through CuratorKIT's `reward_llm` / `hallucination_llm` overrides.
 - **`CuratorConfig` has no `pii` field.** The PII option is `pii_pseudonymize`; Phase 1's worker must use that.
-- **Calibration on golden-300:** the 32B slice labels golden-300 (also used for CI), so cost and agreement
-  numbers compare against the same 32B judge the ROI section prices.
+- **Calibration on golden-300 (planned, not run for v1):** the 32B slice would label golden-300, so agreement
+  would be measured against the same 32B judge the ROI section prices. Without it, the ROI's API cost is a
+  list-price estimate from the 8B teacher's token counts.
 - **Closed-model reference:** step 6 accepts any OpenAI-compatible API judge (`--judge-key`, `--api-price`)
   for the closed-source ROI comparison the rules prefer.
 
@@ -220,5 +251,6 @@ also run end to end on CPU with `trl-internal-testing/tiny-Cohere2ForCausalLM`; 
 
 Code in this repo: MIT. **Lorde's weights are CC-BY-NC-4.0**, inherited from Tiny Aya Global (Cohere Labs
 Acceptable Use Policy applies): non-commercial use only. CuratorKIT (LSAL v1.1) and AuditKIT (LSAL v1.2) are
-Lexsi Labs source-available licences for non-commercial use; AlignTune is MIT. Any paid launch needs
-commercial licences from Cohere and Lexsi Labs first (spec §15).
+Lexsi Labs source-available licences for non-commercial use; AlignTune is MIT. The published dataset includes
+Wikipedia excerpts under CC BY-SA 4.0, whose terms continue to apply. Any paid launch needs commercial licences
+from Cohere and Lexsi Labs first (spec §15). Details: [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).

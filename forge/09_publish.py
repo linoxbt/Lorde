@@ -372,11 +372,11 @@ The data, labels, CuratorKIT plug-in runs and result files behind
 ## Sources and licences
 
 - Prompts and human answers: `CohereLabs/aya_dataset` (Apache-2.0); its language labels are used as given.
-- Passages: Wikipedia via `wikimedia/wikipedia` (CC BY-SA 4.0). The excerpts in this dataset, and text derived
-  from them, stay under CC BY-SA 4.0: attribute Wikipedia's contributors and share adaptations under the same
-  licence.
-- Teacher labels and generated QA: Aya Expanse (CC-BY-NC-4.0 weights + Cohere Labs Acceptable Use Policy):
-  non-commercial research use.
+- Passages: Wikipedia via `wikimedia/wikipedia` (CC BY-SA 4.0; older revisions CC BY-SA 3.0, most text also
+  GFDL). The excerpts in this dataset, and text derived from them, stay under CC BY-SA: attribute Wikipedia's
+  contributors and share adaptations under the same licence.
+- Teacher labels, generated QA and translations: Aya Expanse 8B; student and closed-book answers: Tiny Aya
+  Global (both CC-BY-NC-4.0 + Cohere Labs Acceptable Use Policy): non-commercial research use.
 - Produced with CuratorKIT and AuditKIT (Lexsi Labs LSAL, non-commercial source-available). Third-party terms:
   `THIRD_PARTY_LICENSES.md` in the GitHub repo.
 """
