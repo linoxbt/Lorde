@@ -11,7 +11,11 @@ import { Logo } from "@/components/brand";
 import { buttonClass } from "@/components/ui";
 import type { NavGroup, NavLink } from "@/lib/nav";
 
-/** Full-screen hamburger menu with expandable groups. Escape closes; focus moves in and back out. */
+/**
+ * Full-screen hamburger menu with expandable groups. Escape closes; focus moves in and back out. Any link click
+ * closes it too: a same-page link (/docs#api from /docs) changes no pathname, so the pathname effect alone would leave
+ * the menu covering the section the user asked for.
+ */
 export function HamburgerMenu({ groups, links, cta = { label: "Open console", href: "/console" }, title }:
   { groups?: NavGroup[]; links?: NavLink[]; cta?: NavLink; title?: string }) {
   const [open, setOpen] = useState(false);
@@ -64,6 +68,7 @@ export function HamburgerMenu({ groups, links, cta = { label: "Open console", hr
           aria-modal="true"
           aria-label={title ?? "Menu"}
           className="fixed inset-0 z-50 flex flex-col overflow-y-auto bg-white"
+          onClick={(e) => { if ((e.target as HTMLElement).closest("a[href]")) { setOpen(false); setExpanded(null); } }}
         >
           <div className="mx-auto flex h-[72px] w-full max-w-[1200px] shrink-0 items-center justify-between px-5 sm:px-8">
             <Logo />

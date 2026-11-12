@@ -29,3 +29,18 @@ test("code tabs switch", async ({ page }) => {
   await page.getByRole("tab", { name: "CuratorKIT" }).first().click();
   await expect(page.getByRole("tabpanel").first()).toContainText("judge_llm=judge_llm()");
 });
+
+test("the menu closes after a same-page hash link", async ({ page }) => {
+  await page.goto("/docs");
+  const menu = page.getByRole("dialog", { name: "Menu" });
+  await expect(async () => {
+    await page.getByRole("button", { name: "Open menu" }).click();
+    await expect(menu).toBeVisible({ timeout: 1000 });
+  }).toPass({ timeout: 15_000 });
+  const link = menu.getByRole("link", { name: /API reference/ });
+  if (!(await link.isVisible())) await menu.getByRole("button", { name: "Developers" }).click();  // phone: groups collapse
+  await link.click();
+  await expect(page).toHaveURL(/\/docs#api$/);
+  await expect(menu).toBeHidden();
+  await expect(page.locator("#api")).toBeInViewport();
+});
