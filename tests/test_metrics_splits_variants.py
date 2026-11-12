@@ -86,3 +86,43 @@ def test_reference_verdict_is_canonical():
            "teacher_verdict_raw": None}
     assert canonical.reference_verdict(new) == "partially_grounded"
     assert canonical.reference_verdict({"kind": "reward", "teacher_raw": "{}"}) is None
+
+
+def test_near_duplicate_groups_merge_only_near_copies():
+    """Audit 2 (B17 / result validity): re-punctuated or re-numbered copies of a prompt share one split."""
+    base = "Write a short story about a lighthouse keeper who finds a message in a bottle, chapter 4"
+    rows = [
+        {"uid": "a:gold", "kind": "reward", "lang": "en", "group": "a", "instruction": base},
+        {"uid": "b:gold", "kind": "reward", "lang": "en", "group": "b", "instruction": base.replace("4", "5")},
+        {"uid": "c:gold", "kind": "reward", "lang": "en", "group": "c", "instruction": "  WRITE a short story about "
+         "a lighthouse keeper who finds a message in a bottle, chapter 4 "},
+        {"uid": "d:gold", "kind": "reward", "lang": "en", "group": "d", "instruction": "What is the capital of Peru?"},
+        {"uid": "e:gold", "kind": "reward", "lang": "fr", "group": "e", "instruction": base},  # other language
+        {"uid": "f:gold", "kind": "grounding", "lang": "en", "group": "f", "source_text": base},  # other kind
+    ]
+    m = splits.near_duplicate_groups(rows, 0.9)
+    assert m["a"] == m["b"] == m["c"] and len({m["a"], m["d"], m["e"], m["f"]}) == 4
+    assert m["d"] == "d" and m["e"] == "e"  # groups without a near-duplicate keep their own bucket
+    assert splits.near_duplicate_groups(rows, 0) == {g: g for g in "abcdef"}  # disabled: the v1 splits
+    for r in rows:
+        r["split_group"] = m[r["group"]]
+    parts = splits.grouped_split(rows * 1, key="split_group")
+    where = {r["uid"]: k for k, v in parts.items() for r in v}
+    assert where["a:gold"] == where["b:gold"] == where["c:gold"]
+    assert splits.similarity(splits.normalize_text("A  b C"), splits.normalize_text("a b c")) == 1.0
+
+
+def test_leakage_report_counts_near_copies_and_identical_answers():
+    train = [{"kind": "reward", "lang": "en", "variant": "gold", "instruction": "List five French cheeses, please.",
+              "response": "Brie, Comté, Roquefort, Camembert, Reblochon"},
+             {"kind": "grounding", "lang": "en", "variant": "gold", "source_text": "The Nile is long."}]
+    test = [{"kind": "reward", "lang": "en", "variant": "gold", "instruction": "List five French cheeses please",
+             "response": "brie, comté, roquefort,  camembert, reblochon"},
+            {"kind": "reward", "lang": "en", "variant": "gold", "instruction": "Name a planet.", "response": "Mars"},
+            {"kind": "reward", "lang": "fr", "variant": "gold", "instruction": "List five French cheeses, please.",
+             "response": "x"},
+            {"kind": "grounding", "lang": "en", "variant": "gold", "source_text": "Paris is in France."}]
+    rep = splits.leakage_report(train, test, 0.9)
+    assert rep["test_prompts"] == 3 and rep["test_prompts_near_train"] == 1  # the fr copy is another language
+    assert rep["test_passages"] == 1 and rep["test_passages_near_train"] == 0
+    assert rep["test_gold_responses_identical_to_train"] == 1
