@@ -7,6 +7,7 @@ import { ConnectKey } from "@/components/console/connect-key";
 import { Badge, Button, Card } from "@/components/ui";
 import { agreement } from "@/lib/agreement";
 import { pct } from "@/lib/format";
+import { nextUnlabelled } from "@/lib/review";
 import { errorMessage, gatewayFetch, getKey } from "@/lib/gateway-client";
 import type { Gate, ReviewItem, ReviewLabel } from "@/lib/types";
 
@@ -60,10 +61,21 @@ export function ReviewQueue({ items, initialLabels, demo, orgId, userId }:
   const done = items.length > 0 && items.every((x) => x.ref in labels);
   const stats = useMemo(() => agreement(Object.values(labels).map((l) => ({ human: l.human, lorde: l.lorde }))), [labels]);
 
-  const advance = useCallback(() => { setScore(null); setI((x) => Math.min(items.length - 1, x + 1)); }, [items.length]);
+  // The newest labels, for navigation right after a save (before React has re-rendered with them).
+  const labelsRef = useRef(labels);
+  labelsRef.current = labels;
+  /** Move to the next row not yet labelled (wrapping round); stays put when none is left ("All caught up"). */
+  const advance = useCallback((justLabelled?: string) => {
+    setScore(null);
+    const seen = new Set(Object.keys(labelsRef.current));
+    if (justLabelled) seen.add(justLabelled);
+    setI((x) => nextUnlabelled(items.map((it) => it.ref), seen, x) ?? x);
+  }, [items]);
+  const already = item ? labels[item.ref] : undefined;
 
   const save = useCallback(async () => {
     if (!item || score === null || busy.current) return;
+    if (item.ref in labelsRef.current) return advance();  // saved before (reached with ←): never insert it twice
     busy.current = true; setSaving(true); setMsg(null);
     try {
       if (!demo) {
@@ -74,7 +86,7 @@ export function ReviewQueue({ items, initialLabels, demo, orgId, userId }:
       }
       setLabels((l) => ({ ...l, [item.ref]: { kind: item.kind, human: score, lorde: item.lorde_score } }));
       setMsg({ text: demo ? "Labelled (demo: not saved)." : "Saved." });
-      advance();
+      advance(item.ref);
     } catch {
       setMsg({ text: "Not saved: could not reach the server. Try again.", error: true });
     } finally {
@@ -97,12 +109,13 @@ export function ReviewQueue({ items, initialLabels, demo, orgId, userId }:
       if (btn && e.key === " ") return;
       if (/^[0-9]$/.test(e.key)) setScore(Number(e.key) / 10);
       else if (e.key === "p" || e.key === "P") setScore(1);
-      else if (e.key === "s" || e.key === "S" || e.key === "ArrowRight") advance();
+      else if (e.key === "s" || e.key === "S") advance();
+      else if (e.key === "ArrowRight") { setScore(null); setI((x) => Math.min(items.length - 1, x + 1)); }
       else if (e.key === "ArrowLeft") { setScore(null); setI((x) => Math.max(0, x - 1)); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [save, advance]);
+  }, [save, advance, items.length]);
 
   async function loadText() {
     if (!item?.job_id || loading) return;
@@ -184,8 +197,17 @@ export function ReviewQueue({ items, initialLabels, demo, orgId, userId }:
             ))}
           </div>
           <div className="mt-5 flex flex-wrap items-center gap-2">
-            <Button onClick={save} disabled={score === null || saving} data-enter-saves="">{saving ? "Saving…" : "Save and next"}</Button>
-            <Button variant="secondary" onClick={advance}>Skip</Button>
+            {already ? (
+              <>
+                <span role="status" className="text-[13px] text-muted">Already labelled: you gave {already.human.toFixed(1)}.</span>
+                <Button variant="secondary" onClick={() => advance()}>Next unlabelled</Button>
+              </>
+            ) : (
+              <>
+                <Button onClick={save} disabled={score === null || saving} data-enter-saves="">{saving ? "Saving…" : "Save and next"}</Button>
+                <Button variant="secondary" onClick={() => advance()}>Skip</Button>
+              </>
+            )}
             {msg && <span role={msg.error ? "alert" : "status"} className={`text-[13px] ${msg.error ? "text-reject" : "text-muted"}`}>{msg.text}</span>}
           </div>
           <p className="mt-4 font-mono text-[11px] text-faint">Keys: 0–9 = 0.0–0.9 · P = 1.0 · Enter save · S skip · ← → move</p>

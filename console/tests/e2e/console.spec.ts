@@ -77,3 +77,23 @@ test("datasets show a status; only ready ones can start a job", async ({ page })
   await expect(page.locator("#ds option[value=d2]")).toBeDisabled();
   await expect(page.locator("#ds")).not.toHaveValue("d2");
 });
+
+test("review: a labelled row cannot be saved twice", async ({ page }) => {
+  await page.goto("/console/review", { waitUntil: "networkidle" });
+  await expect(page.getByText(/^1 \/ \d+$/)).toBeVisible();
+  await page.keyboard.press("3");
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("1 labeled")).toBeVisible();
+  await expect(page.getByText(/^2 \/ \d+$/)).toBeVisible();
+  await page.keyboard.press("ArrowLeft");  // back to the row just labelled
+  await expect(page.getByText("Already labelled: you gave 0.3.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save and next" })).toHaveCount(0);
+  await page.keyboard.press("5");
+  await page.keyboard.press("Enter");  // moves on without a second insert
+  await expect(page.getByText(/^2 \/ \d+$/)).toBeVisible();
+  await expect(page.getByText("1 labeled")).toBeVisible();
+  await page.keyboard.press("ArrowLeft");
+  await page.getByRole("button", { name: "Next unlabelled" }).click();
+  await expect(page.getByText(/^2 \/ \d+$/)).toBeVisible();
+  await expect(page.getByText("1 labeled")).toBeVisible();
+});
