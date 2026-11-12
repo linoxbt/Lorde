@@ -99,6 +99,30 @@ and `LORDE_RELAY_SECRET` (same value on Vercel, so the Console relay passes each
 `0007_fairness.sql` adds round-robin job claiming across organizations.
 Promote a model with `python -m gateway.models_cli promote <repo> <revision> --bench results/judge_eval.json` (refused unless the report says `promotable: true`; `--force "<reason>"` overrides and is audited; the template fingerprints are taken from the model repo's `template_fingerprints.json` at that revision, or `--fingerprints FILE`).
 
+Backend after the second audit (12 Nov), migration `0008_audit2.sql` (apply it before deploying the new image):
+- Jobs keep, meter and charge the judgments they made however they end; a job stopped by the time limit, a
+  cancel or a failure exposes `counts.judgments`/`judgments_charged`/`rows_judged` and `partial.jsonl` (row,
+  gate, score, decision, verdict, lang) via `GET /v1/jobs/{id}/results`. A data deletion still leaves nothing.
+- Hub jobs need one file (`hf://datasets/<owner>/<name>/<file>.jsonl|json|csv|parquet`); whole repos are 422
+  `unsupported_dataset` (the image has no `datasets`). Synchronous batches take at most 8 items.
+- New error codes: 405 `method_not_allowed`, 422 `unsupported_dataset`, 429 `capacity_exceeded`, 429
+  `storage_quota_exceeded`; batch items not started after a client disconnect report `client_disconnected`; a
+  `rate_limited` "model busy" refusal past the free budget carries `"charged": 1`.
+- Membership is by invitation (`create_invite`, `my_invites`, `accept_invite`); direct inserts into `org_members`
+  are refused. At most 20 unrevoked API keys per organization. Users can no longer write storage objects directly.
+- The image installs `requirements/runtime.lock` (hashed). uvicorn runs with `--no-access-log`,
+  `--limit-concurrency ${LORDE_LIMIT_CONCURRENCY:-128}`, and trusts X-Forwarded-For only from private/CGNAT proxy
+  addresses (`FORWARDED_ALLOW_IPS` overrides). After deploying, check that per-IP limiting sees real client
+  addresses (Railway's edge should connect from 100.64.0.0/10); if every request shows one proxy address, set
+  `FORWARDED_ALLOW_IPS` to the edge's range.
+
+New settings (defaults → recommended production values on one CPU llama.cpp slot): `LORDE_UPSTREAM_CONCURRENCY`
+(16 → **1**, Serve's real parallelism: the HTTP timeout then covers waiting for one job judgment, 2 × 30 s),
+`LORDE_JOB_MAX_ROWS` (60), `LORDE_MAX_BATCH` (8), `LORDE_GLOBAL_DAILY_CAP` (0 = off → **4000**),
+`LORDE_NEW_ORG_HOURS` (24), `LORDE_NEW_ORG_DAILY_JUDGMENTS` (50), `LORDE_ORG_MAX_WAITERS` (1),
+`LORDE_ORG_FREE_BUSY_PER_DAY` (20), `LORDE_ORG_MAX_DATASETS` (20), `LORDE_ORG_MAX_DATASET_BYTES` (1073741824),
+`LORDE_LIMIT_CONCURRENCY` (128), `FORWARDED_ALLOW_IPS` (private and CGNAT ranges).
+
 Label service (`lorde-label`, `infra/Dockerfile.label`): `LABEL_HUB_REPO=Oxlino/lorde-work`, `LABEL_PASSWORD`,
 `LABEL_USER=lorde` (login name, recorded as the labeller), `HF_TOKEN` (should be a fine-grained token with write
 access to `datasets/Oxlino/lorde-work` only), optional `LABEL_USERS=name:pw,...`. The hub sample was blinded with
