@@ -59,8 +59,7 @@ displayed). Configuration is llama.cpp environment variables (`LLAMA_ARG_HF_REPO
   (a build-time variable: redeploy Vercel after changing it). A judgment takes 15-30 s on CPU.
 - **Image pinned by digest:** `ghcr.io/ggml-org/llama.cpp:server@sha256:4d2de15a0ffbce704777c64026b40512a71e0bbc0b303a5fe5ea9bf71760dff9`
   (llama.cpp b12242, the build the GGUF was tested on). The floating `:server` tag would pull a new llama.cpp on any
-  redeploy; before moving the pin, check a new build with a few judgments (CuratorKIT prompts, `response_format`, parsed by CuratorKIT)
-  before moving the pin.
+  redeploy; before moving the pin, check a new build with a few judgments (CuratorKIT prompts, `response_format`, parsed by CuratorKIT).
 - **EOS must be `<EOS_TOKEN>` (id 3).** llama.cpp's converter takes `<|END_OF_TURN_TOKEN|>` from the fine-tuned
   tokenizer config; with that EOS, llama.cpp's chat parser for Cohere templates returns HTTP 500 for structured
   replies and leaves the marker in plain ones (0/40 replies parsed in the first check). `forge/10_export_gguf.py`
