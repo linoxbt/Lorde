@@ -112,7 +112,7 @@ def test_openai_proxy_allow_list_and_clamps(gw):
         assert r.status_code == 200, r.text
         sent = seen[-1]
         assert sent["max_tokens"] == 512 and sent["temperature"] == 0.0 and sent["seed"] == 7
-        assert sent["stop"] == ["END"] and sent["top_p"] == 0.9 and sent["model"] == "lorde"
+        assert sent["stop"] == ["END", "<|END_OF_TURN_TOKEN|>"] and sent["top_p"] == 0.9 and sent["model"] == "lorde"
         assert not {"logit_bias", "mirostat", "n_probs"} & set(sent)
         c.post("/v1/chat/completions", headers=h, json={"messages": msgs, "max_completion_tokens": 64})
         assert seen[-1]["max_tokens"] == 64
@@ -245,3 +245,16 @@ def gw(tmp_path):
         app = create_app(s, transport=stub_vllm(style, seen, fail))
         return app, {"Authorization": f"Bearer {key}"}, seen, tmp_path
     return make
+
+
+def test_chat_proxy_always_stops_at_the_cohere_turn_end():
+    """llama.cpp renders Tiny Aya's <|END_OF_TURN_TOKEN|> as text in schema-less chat replies; the proxy stops on it
+    (added once, after the caller's own stop strings)."""
+    from gateway.service import TURN_END_STOPS, JudgeService
+    from gateway.settings import Settings
+
+    svc = JudgeService.__new__(JudgeService)
+    svc.s = Settings()
+    msgs = [{"role": "user", "content": "hi"}]
+    assert svc.sanitize_chat({"messages": msgs})["stop"] == list(TURN_END_STOPS)
+    assert svc.sanitize_chat({"messages": msgs, "stop": "<|END_OF_TURN_TOKEN|>"})["stop"] == ["<|END_OF_TURN_TOKEN|>"]

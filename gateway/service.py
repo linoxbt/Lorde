@@ -35,6 +35,7 @@ from .upstream import Upstream
 
 MAX_SCHEMA_BYTES = 16 * 1024   # response_format / structured_outputs / guided_json, serialized (audit N10)
 MAX_SCHEMA_DEPTH = 12
+TURN_END_STOPS = ("<|END_OF_TURN_TOKEN|>",)  # Cohere-family turn end, rendered as text by llama.cpp chat
 
 
 def _depth(v: Any) -> int:
@@ -220,7 +221,10 @@ class JudgeService:
             if not (isinstance(stop, list) and len(stop) <= 4 and all(isinstance(x, str) and len(x) <= 64
                                                                         for x in stop)):
                 raise InvalidRequest("stop must be a string or up to 4 strings")
-            out["stop"] = stop
+        # Cohere-family GGUFs (Tiny Aya, Lorde) end a turn with <|END_OF_TURN_TOKEN|>; llama.cpp renders it as text
+        # in OpenAI chat replies that carry no response_format, so the reply would end with that marker (or run to
+        # max_tokens). Stopping on it keeps such replies clean; with a schema the grammar ends the reply first.
+        out["stop"] = [*(stop or []), *(x for x in TURN_END_STOPS if x not in (stop or []))]
         seed = body.get("seed")
         if seed is not None:
             if isinstance(seed, bool) or not isinstance(seed, int):
