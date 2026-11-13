@@ -13,6 +13,7 @@ LLAMA_ARG_HF_REPO=<user>/lorde-tiny-aya-GGUF:Q8_0. Runs in the forge-train env (
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -46,6 +47,21 @@ Licence: CC-BY-NC-4.0, inherited from Tiny Aya Global, and the Cohere Labs Accep
 """
 
 
+def eos_token_id(model_dir: Path) -> int:
+    """Id of Tiny Aya's ``<EOS_TOKEN>`` in the model's tokenizer.json.
+
+    The converter takes the GGUF EOS from tokenizer_config's ``eos_token``, which transformers saves as
+    ``<|END_OF_TURN_TOKEN|>`` after chat fine-tuning. With that EOS, llama.cpp's chat parser for Cohere templates
+    rejects structured replies (HTTP 500) and leaves the turn marker in plain replies, so the export resets EOS to
+    ``<EOS_TOKEN>``, as in Cohere's own tiny-aya-global-GGUF.
+    """
+    tok = json.loads((model_dir / "tokenizer.json").read_text(encoding="utf-8"))
+    for t in tok.get("added_tokens", []):
+        if t.get("content") == "<EOS_TOKEN>":
+            return int(t["id"])
+    sys.exit(f"<EOS_TOKEN> not found in {model_dir / 'tokenizer.json'}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--user", required=True)
@@ -74,7 +90,10 @@ def main() -> None:
     out = work / f"lorde-tiny-aya-{tag}.gguf"
     subprocess.run([sys.executable, str(src / "convert_hf_to_gguf.py"), str(model_dir), "--outtype", args.outtype,
                     "--outfile", str(out)], check=True)
-    print(f"[gguf] wrote {out} ({out.stat().st_size / 1e9:.2f} GB)")
+    eos = eos_token_id(model_dir)
+    subprocess.run([sys.executable, str(src / "gguf-py" / "gguf" / "scripts" / "gguf_set_metadata.py"), str(out),
+                    "tokenizer.ggml.eos_token_id", str(eos), "--force"], check=True)
+    print(f"[gguf] wrote {out} ({out.stat().st_size / 1e9:.2f} GB), eos_token_id={eos} (<EOS_TOKEN>)")
     if args.no_push:
         return
 
@@ -83,8 +102,10 @@ def main() -> None:
     api = HfApi()
     repo = f"{args.user}/{args.repo}"
     api.create_repo(repo, private=not args.public, exist_ok=True)
-    (work / "README.md").write_text(CARD.format(user=args.user, outtype=args.outtype, tag=tag, ref=args.llama_cpp_ref), encoding="utf-8")
-    api.upload_file(path_or_fileobj=str(work / "README.md"), path_in_repo="README.md", repo_id=repo)
+    if not api.file_exists(repo, "README.md"):  # never replace a hand-written card (provenance, checks)
+        (work / "README.md").write_text(CARD.format(user=args.user, outtype=args.outtype, tag=tag,
+                                                    ref=args.llama_cpp_ref), encoding="utf-8")
+        api.upload_file(path_or_fileobj=str(work / "README.md"), path_in_repo="README.md", repo_id=repo)
     api.upload_file(path_or_fileobj=str(out), path_in_repo=out.name, repo_id=repo, commit_message="Lorde GGUF")
     print(f"[gguf] pushed https://huggingface.co/{repo} · serve with LLAMA_ARG_HF_REPO={repo}:{tag}")
 

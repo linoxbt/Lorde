@@ -32,7 +32,7 @@ revoked in the Console stop working at the Gateway within its 60 s lookup cache.
 - `/v1/judge/*` → 503 `model_unavailable` until the model endpoint exists (expected); `/readyz` 503 for the same reason.
 - `/v1/uploads` + signed PUT to the volume works; `/v1/usage` reads Postgres.
 - CORS allows the Console origin; every Console page returns 200.
-- With the CPU staging model: `/readyz` 200 (model loaded ~40 s after deploy); `/status` "Gateway and model server responding" (the page now names the served revision and warns while it is the untrained base model).
+- With the CPU model: `/readyz` 200 (model loaded ~40 s after deploy); `/status` "Gateway and model server responding" and names the served revision (`lorde-tiny-aya@v1.0.0-q4km`; it warns if the untrained base model is ever served).
 - Live grounding judgment through the Gateway: 26 s, schema-valid reply under `curatorkit-0.1.23/hallucination@027e5efc`.
   The untrained base model listed "about 6,650 km" as unsupported yet scored 0.8 (pass): the miscalibration Lorde is
   trained to remove, and a ready "before" example for the article.
@@ -45,17 +45,28 @@ revoked in the Console stop working at the Gateway within its 60 s lookup cache.
   once; store it in a password manager. Create more keys with `python -m gateway.keys` against `DATABASE_URL`, or
   rotate by adding a new bootstrap entry.
 
-## Staging model (no GPU, no card)
+## Serving model (CPU, no GPU or card)
 
-The Hugging Face account cannot pay for Inference Endpoints, and Docker Spaces now need PRO, so staging serves
-Cohere's official, ungated `CohereLabs/tiny-aya-global-GGUF` (Q4_K_M) with llama.cpp on Railway CPU. It has no
-public domain: only the Gateway reaches it over Railway's private network, with an API key (`LLAMA_API_KEY` there,
-`VLLM_API_KEY` on the Gateway, generated in the build session and never displayed). The Gateway labels it
-`tiny-aya-global-q4km@staging-base-cpu`: this is the **untrained base model**, not Lorde, and a judgment takes tens of
-seconds (`LORDE_UPSTREAM_TIMEOUT=240`, `LORDE_UPSTREAM_CONCURRENCY=1`). Configuration is entirely llama.cpp
-environment variables (`LLAMA_ARG_HF_REPO`, `LLAMA_ARG_HOST=::`, `LLAMA_ARG_CTX_SIZE=4096`, `LLAMA_ARG_JINJA`,
-`LLAMA_ARG_ALIAS=lorde`). To serve the trained Lorde on CPU, export a GGUF from `runs/lorde-v1/merged`, push it to
-the Hub, and set `LLAMA_ARG_HF_REPO` to it.
+The Hugging Face account cannot pay for Inference Endpoints, and Docker Spaces now need PRO, so Serve runs llama.cpp
+on Railway CPU (`lorde-serve`). It has no public domain: only the Gateway reaches it over Railway's private network,
+with an API key (`LLAMA_API_KEY` there, `VLLM_API_KEY` on the Gateway, generated in the build session and never
+displayed). Configuration is llama.cpp environment variables (`LLAMA_ARG_HF_REPO`, `LLAMA_ARG_HOST=::`,
+`LLAMA_ARG_CTX_SIZE=4096`, `LLAMA_ARG_JINJA`, `LLAMA_ARG_ALIAS=lorde`, `LLAMA_ARG_N_PARALLEL=1`).
+
+- **Model:** `LLAMA_ARG_HF_REPO=Oxlino/lorde-tiny-aya-GGUF:Q4_K_M`, the trained Lorde (`v1.0.0` weights) quantized
+  with llama.cpp. The Gateway labels it `lorde-tiny-aya@v1.0.0-q4km` (`LORDE_MODEL_REPO=Oxlino/lorde-tiny-aya`,
+  `LORDE_MODEL_REVISION=v1.0.0-q4km`); the Console reads the same label from `NEXT_PUBLIC_LORDE_MODEL_REVISION`
+  (a build-time variable: redeploy Vercel after changing it). A judgment takes 15-30 s on CPU.
+- **Image pinned by digest:** `ghcr.io/ggml-org/llama.cpp:server@sha256:4d2de15a0ffbce704777c64026b40512a71e0bbc0b303a5fe5ea9bf71760dff9`
+  (llama.cpp b12242, the build the GGUF was tested on). The floating `:server` tag would pull a new llama.cpp on any
+  redeploy; before moving the pin, check a new build with a few judgments (CuratorKIT prompts, `response_format`, parsed by CuratorKIT)
+  before moving the pin.
+- **EOS must be `<EOS_TOKEN>` (id 3).** llama.cpp's converter takes `<|END_OF_TURN_TOKEN|>` from the fine-tuned
+  tokenizer config; with that EOS, llama.cpp's chat parser for Cohere templates returns HTTP 500 for structured
+  replies and leaves the marker in plain ones (0/40 replies parsed in the first check). `forge/10_export_gguf.py`
+  resets it; the Gateway's `/v1/chat` proxy also always sends `stop: ["<|END_OF_TURN_TOKEN|>"]` for schema-less calls.
+- **Rollback:** set `LLAMA_ARG_HF_REPO=CohereLabs/tiny-aya-global-GGUF:Q4_K_M` (the untrained base) and the labels
+  back to `tiny-aya-global-q4km@staging-base-cpu`; the Console then shows its base-model warning again.
 
 ## Connect a GPU model (when billing works)
 

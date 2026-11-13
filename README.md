@@ -38,9 +38,10 @@ Expanse does not support, so the teacher would have been guessing in them.
   so it measures imitation rather than correctness.
 - **Downstream:** Lorde-gated data matches teacher-gated F1 but is significantly less grounded, from one seed per
   set; the API cost in the ROI is a list-price estimate, not a measured bill.
-- **The live Gateway serves the untrained base model** (Cohere's Tiny Aya Global GGUF on CPU,
-  `tiny-aya-global-q4km@staging-base-cpu`) until a GGUF export of the published weights
-  (`forge/10_export_gguf.py`) is served and promoted; see `docs/DEPLOYMENT.md`.
+- **The live Gateway serves the trained Lorde** (`lorde-tiny-aya@v1.0.0-q4km`): a Q4_K_M GGUF of the published
+  weights, [Oxlino/lorde-tiny-aya-GGUF](https://huggingface.co/Oxlino/lorde-tiny-aya-GGUF), on CPU with llama.cpp,
+  tens of seconds per judgment. A 40-item check of the quantized file: 40/40 gate-usable, 39/40 decisions equal to
+  the full-precision model's. See `docs/DEPLOYMENT.md`.
 
 **Intentionally out of scope for the hackathon** (in the spec, not built here):
 
