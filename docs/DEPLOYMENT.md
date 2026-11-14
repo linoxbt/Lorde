@@ -141,13 +141,18 @@ New settings (defaults → recommended production values on one CPU llama.cpp sl
 Label service (`lorde-label`, `infra/Dockerfile.label`): `LABEL_HUB_REPO=Oxlino/lorde-work`, `LABEL_PASSWORD`,
 `LABEL_USER=lorde` (login name, recorded as the labeller), `HF_TOKEN` (should be a fine-grained token with write
 access to `datasets/Oxlino/lorde-work` only), optional `LABEL_USERS=name:pw,...`. The hub sample was blinded with
-`forge/04b_blind_sample.py` (opaque ids, no variants; the key file stays private).
+`forge/04b_blind_sample.py` (opaque ids, no variants). The key (`data/human_sample_key.jsonl`) lives in the separate
+private dataset `Oxlino/lorde-label-key` (moved out of `lorde-work` on 2026-11-14; set
+`LORDE_LABEL_KEY_REPO=Oxlino/lorde-label-key` wherever `forge/kaggle_driver.py` runs). It is still in `lorde-work`'s git
+history, so the token on `lorde-label` must be fine-grained (write to `lorde-work` only), or the key repo gains nothing.
+Saves land on the Railway volume `lorde-label-data` at `/app/data` (`RAILWAY_RUN_UID=0`: Railway mounts it as root and
+the image runs as uid 10001) before they are pushed.
 
 Vercel adds `NEXT_PUBLIC_SITE_URL=https://lorde-console.vercel.app`.
 
-Still to do by the account owner: apply the email templates below (cross-device email links); custom SMTP; CAPTCHA
-(Turnstile, below); leaked-password protection needs the Supabase Pro plan; the unused Railway `Postgres` service can
-be removed.
+Still to do by the account owner: apply the email templates below (cross-device email links; the session's Supabase
+access cannot change auth settings); custom SMTP; leaked-password protection needs the Supabase Pro plan; the unused
+Railway `Postgres` service can be removed. CAPTCHA (Turnstile) is on.
 
 ## Supabase Auth: email templates
 
