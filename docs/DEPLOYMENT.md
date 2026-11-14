@@ -53,10 +53,19 @@ with an API key (`LLAMA_API_KEY` there, `VLLM_API_KEY` on the Gateway, generated
 displayed). Configuration is llama.cpp environment variables (`LLAMA_ARG_HF_REPO`, `LLAMA_ARG_HOST=::`,
 `LLAMA_ARG_CTX_SIZE=4096`, `LLAMA_ARG_JINJA`, `LLAMA_ARG_ALIAS=lorde`, `LLAMA_ARG_N_PARALLEL=1`).
 
+- **`LLAMA_ARG_CACHE_RAM=0` is required.** llama-server's host-RAM prompt cache defaults to 8192 MiB, the whole
+  8 GB container. As distinct prompts pile up it evicts the memory-mapped weights and the server thrashes: memory
+  pinned at the limit, CPU near zero, about 27 s per token, every judgment timing out. Seen live on 2026-11-14 after
+  about 40 judgments; gating jobs stalled until the variable was set.
+- **`LLAMA_ARG_THREADS=8`, the service's vCPU limit.** llama.cpp otherwise starts one thread per host core (24),
+  more than the 8-vCPU quota allows; the same 20-row grounding job took 317 s with 24 threads and 157 s with 8,
+  with identical decisions. Change it with the service's CPU limit.
+
 - **Model:** `LLAMA_ARG_HF_REPO=Oxlino/lorde-tiny-aya-GGUF:Q4_K_M`, the trained Lorde (`v1.0.0` weights) quantized
   with llama.cpp. The Gateway labels it `lorde-tiny-aya@v1.0.0-q4km` (`LORDE_MODEL_REPO=Oxlino/lorde-tiny-aya`,
   `LORDE_MODEL_REVISION=v1.0.0-q4km`); the Console reads the same label from `NEXT_PUBLIC_LORDE_MODEL_REVISION`
-  (a build-time variable: redeploy Vercel after changing it). A judgment takes 15-30 s on CPU.
+  (a build-time variable: redeploy Vercel after changing it). A judgment takes about 8 s on CPU (20 grounding rows in
+  157 s), up to about 30 s for long sources.
 - **Image pinned by digest:** `ghcr.io/ggml-org/llama.cpp:server@sha256:4d2de15a0ffbce704777c64026b40512a71e0bbc0b303a5fe5ea9bf71760dff9`
   (llama.cpp b12242, the build the GGUF was tested on). The floating `:server` tag would pull a new llama.cpp on any
   redeploy; before moving the pin, check a new build with a few judgments (CuratorKIT prompts, `response_format`, parsed by CuratorKIT).
@@ -99,7 +108,7 @@ Migrations `0005_hardening.sql` and `0006_console.sql` were applied by the Gatew
   6-hourly purge.
 
 New Gateway settings (defaults): `LORDE_PUBLIC_DOCS=0`, `LORDE_ACCESS_LOG=1`, `LORDE_MODEL_REGISTRY=1`,
-`LORDE_JOB_MAX_SECONDS=3600`, `LORDE_JOB_MAX_ROWS=60` (was 50000; audit 2), `LORDE_JOB_MAX_INPUT_BYTES=209715200`,
+`LORDE_JOB_MAX_SECONDS=3600`, `LORDE_JOB_STALL_SECONDS=900` (a job with no judgment for that long fails as stalled, keeping what it judged), `LORDE_JOB_MAX_ROWS=60` (was 50000; audit 2), `LORDE_JOB_MAX_INPUT_BYTES=209715200`,
 `LORDE_WORKER_JUDGE_CONCURRENCY=1`, `LORDE_WORKER_SHARES_UPSTREAM=1`, `LORDE_ORG_UPSTREAM_CONCURRENCY=1`,
 `LORDE_UPSTREAM_QUEUE_TIMEOUT_S=30`, `LORDE_UPSTREAM_MAX_WAITERS=32`, `LORDE_ORG_DAILY_JUDGMENTS=5000`, `LORDE_IP_RPM=300`,
 `LORDE_TRUSTED_PROXIES` (empty), `LORDE_RELAY_SECRET` (unset). Set in production (CPU llama.cpp, ~20 s per judgment,
@@ -136,13 +145,18 @@ New settings (defaults → recommended production values on one CPU llama.cpp sl
 Label service (`lorde-label`, `infra/Dockerfile.label`): `LABEL_HUB_REPO=Oxlino/lorde-work`, `LABEL_PASSWORD`,
 `LABEL_USER=lorde` (login name, recorded as the labeller), `HF_TOKEN` (should be a fine-grained token with write
 access to `datasets/Oxlino/lorde-work` only), optional `LABEL_USERS=name:pw,...`. The hub sample was blinded with
-`forge/04b_blind_sample.py` (opaque ids, no variants; the key file stays private).
+`forge/04b_blind_sample.py` (opaque ids, no variants). The key (`data/human_sample_key.jsonl`) lives in the separate
+private dataset `Oxlino/lorde-label-key` (moved out of `lorde-work` on 2026-11-14; set
+`LORDE_LABEL_KEY_REPO=Oxlino/lorde-label-key` wherever `forge/kaggle_driver.py` runs). It is still in `lorde-work`'s git
+history, so the token on `lorde-label` must be fine-grained (write to `lorde-work` only), or the key repo gains nothing.
+Saves land on the Railway volume `lorde-label-data` at `/app/data` (`RAILWAY_RUN_UID=0`: Railway mounts it as root and
+the image runs as uid 10001) before they are pushed.
 
 Vercel adds `NEXT_PUBLIC_SITE_URL=https://lorde-console.vercel.app`.
 
-Still to do by the account owner: apply the email templates below (cross-device email links); custom SMTP; CAPTCHA
-(Turnstile, below); leaked-password protection needs the Supabase Pro plan; the unused Railway `Postgres` service can
-be removed.
+Still to do by the account owner: apply the email templates below (cross-device email links; the session's Supabase
+access cannot change auth settings); custom SMTP; leaked-password protection needs the Supabase Pro plan; the unused
+Railway `Postgres` service can be removed. CAPTCHA (Turnstile) is on.
 
 ## Supabase Auth: email templates
 

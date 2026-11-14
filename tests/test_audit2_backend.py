@@ -1070,3 +1070,28 @@ def test_at_most_20_active_api_keys_per_org(sqldb):
         c.execute("update api_keys set revoked_at = now() where prefix = 'lorde_sk_K2000000'")
         c.execute("insert into api_keys (org_id, name, prefix, key_hash) values (%s, 'k', 'lorde_sk_K20yyyyy', 'h')",
                   (org,))  # a revoked key frees a place
+
+@pg
+@pytest.mark.skipif(not REDIS, reason="set LORDE_TEST_REDIS_URL")
+def test_a_job_with_no_judgments_for_the_stall_window_fails_fast_as_stalled(env):
+    """Live, 2026-11-14: Serve thrashed (prompt cache filled its RAM) and a job ground on at one judgment every
+    few minutes until the one-hour limit. A job that records no judgment for LORDE_JOB_STALL_SECONDS now stops
+    at once with an error that says Serve is unavailable, not the time limit."""
+    from stub_openai import serve
+
+    hang, hurl = serve("hang")
+    try:
+        clear_jobs(env)
+        s = slow_settings(env, vllm_base_url=hurl, job_stall_seconds=2, job_max_seconds=120)
+        jid = submit(env, ROWS, s)
+        w = Worker(s, worker_id="stall", work_dir=str(env["tmp"] / "stall"), heartbeat_s=0.3)
+        t0 = time.monotonic()
+        t = run_in_thread(w)
+        t.join(60)
+        assert not t.is_alive()
+        status, error, counts, results, n, metered = job_state(env, jid)
+        assert status == "failed" and "no judgment for 2 s" in error and "Serve is unavailable" in error
+        assert "time limit" not in error and time.monotonic() - t0 < 30
+        assert n == 0 and counts["judgments"] == 0 and not results  # nothing judged: no empty partial.jsonl
+    finally:
+        hang.shutdown()

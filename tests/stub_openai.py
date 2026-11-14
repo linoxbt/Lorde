@@ -55,10 +55,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send({"object": "list", "data": [{"id": "stub", "object": "model"}]})
 
     def do_POST(self):
-        if self.style == "slow":
+        if self.style in ("slow", "hang"):
             import time
 
-            time.sleep(1.0)
+            time.sleep(1.0 if self.style == "slow" else 300.0)  # "hang": a Serve that accepts and never answers
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n) or b"{}")
         prompt = req["messages"][-1]["content"]
