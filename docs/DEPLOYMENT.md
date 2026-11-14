@@ -57,11 +57,15 @@ displayed). Configuration is llama.cpp environment variables (`LLAMA_ARG_HF_REPO
   8 GB container. As distinct prompts pile up it evicts the memory-mapped weights and the server thrashes: memory
   pinned at the limit, CPU near zero, about 27 s per token, every judgment timing out. Seen live on 2026-11-14 after
   about 40 judgments; gating jobs stalled until the variable was set.
+- **`LLAMA_ARG_THREADS=8`, the service's vCPU limit.** llama.cpp otherwise starts one thread per host core (24),
+  more than the 8-vCPU quota allows; the same 20-row grounding job took 317 s with 24 threads and 157 s with 8,
+  with identical decisions. Change it with the service's CPU limit.
 
 - **Model:** `LLAMA_ARG_HF_REPO=Oxlino/lorde-tiny-aya-GGUF:Q4_K_M`, the trained Lorde (`v1.0.0` weights) quantized
   with llama.cpp. The Gateway labels it `lorde-tiny-aya@v1.0.0-q4km` (`LORDE_MODEL_REPO=Oxlino/lorde-tiny-aya`,
   `LORDE_MODEL_REVISION=v1.0.0-q4km`); the Console reads the same label from `NEXT_PUBLIC_LORDE_MODEL_REVISION`
-  (a build-time variable: redeploy Vercel after changing it). A judgment takes 15-30 s on CPU.
+  (a build-time variable: redeploy Vercel after changing it). A judgment takes about 8 s on CPU (20 grounding rows in
+  157 s), up to about 30 s for long sources.
 - **Image pinned by digest:** `ghcr.io/ggml-org/llama.cpp:server@sha256:4d2de15a0ffbce704777c64026b40512a71e0bbc0b303a5fe5ea9bf71760dff9`
   (llama.cpp b12242, the build the GGUF was tested on). The floating `:server` tag would pull a new llama.cpp on any
   redeploy; before moving the pin, check a new build with a few judgments (CuratorKIT prompts, `response_format`, parsed by CuratorKIT).
