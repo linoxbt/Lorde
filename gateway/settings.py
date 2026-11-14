@@ -117,6 +117,9 @@ class Settings:
         default_factory=lambda: int(_env("LORDE_ORG_MAX_DATASET_BYTES", str(1024 * 1024 * 1024))))
     # worker limits (spec Section 11.4; audit S4)
     job_max_seconds: int = field(default_factory=lambda: int(_env("LORDE_JOB_MAX_SECONDS", "3600")))
+    # A running job that records no judgment for this long is stopped as stalled (Serve down or overloaded):
+    # CuratorKIT tries a judge call 4 times at 120 s each, so a healthy but slow Serve stays well inside it.
+    job_stall_seconds: int = field(default_factory=lambda: int(_env("LORDE_JOB_STALL_SECONDS", "900")))
     # 60 rows x 2 gates x 30 s (one CPU llama.cpp slot, worst case) = 3600 s = LORDE_JOB_MAX_SECONDS: a job of
     # LORDE_JOB_MAX_ROWS rows finishes inside the time limit. Size it as JOB_MAX_SECONDS / (gates x seconds per
     # judgment); on a GPU (~1.7 judgments/s) thousands of rows fit. Jobs that still hit the limit keep and are

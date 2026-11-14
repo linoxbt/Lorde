@@ -27,6 +27,9 @@ A cancel ends it cancelled with its results and judgments kept (the work was don
 deletion (request_org_data_deletion sets delete_requested, 0008) ends it cancelled with its uploaded result
 files expired (results_expire_at = now()) for the purge, and no further judgments are stored for it.
 
+Stalls: a job that records no judgment for LORDE_JOB_STALL_SECONDS (Serve down, restarting or thrashing) is
+stopped as failed with what it judged kept and charged, instead of grinding on until the time limit.
+
 Isolation between tenants (audit S4/S10): one job may run for at most LORDE_JOB_MAX_SECONDS and judge
 at most LORDE_JOB_MAX_ROWS rows; inputs over LORDE_JOB_MAX_INPUT_BYTES are refused; the child calls Serve
 with LORDE_WORKER_JUDGE_CONCURRENCY (default 1: the worker shares Serve with the Gateway, which leaves that
@@ -94,6 +97,7 @@ class JobRun:
     pending: list = field(default_factory=list)
     rows_seen: set = field(default_factory=set)
     store_closed: bool = False  # lease lost or data deletion requested: store nothing more
+    last_progress: float = field(default_factory=time.monotonic)  # when the last judgment was read
     requeued: bool = False
 
 
@@ -429,6 +433,7 @@ class Worker:
                         run.pending.append(j)
                         run.counted += 1
                         run.rows_seen.add(j["row_idx"])
+                        run.last_progress = time.monotonic()
         if not run.pending or run.store_closed:
             run.pending.clear()
             return
@@ -489,7 +494,8 @@ class Worker:
         log_task = asyncio.create_task(proc.stdout.read())
         exited = asyncio.create_task(proc.wait())
         stop = asyncio.create_task(self._stop_event().wait())
-        outcome = None  # None (exited) | 'cancelled' | 'timeout' | 'shutdown' | 'lost'
+        outcome = None  # None (exited) | 'cancelled' | 'timeout' | 'stalled' | 'shutdown' | 'lost'
+        run.last_progress = t0
         try:
             while True:
                 await asyncio.wait({exited, stop}, timeout=self.heartbeat_s, return_when=asyncio.FIRST_COMPLETED)
@@ -511,6 +517,9 @@ class Worker:
                     outcome = "cancelled"
                     break
                 await self.flush(job, run)
+                if time.monotonic() - run.last_progress > self.s.job_stall_seconds:
+                    outcome = "stalled"
+                    break
         finally:  # whatever happened (including a dropped database), never leave the child running
             stop.cancel()
             if proc.returncode is None:
@@ -541,6 +550,13 @@ class Worker:
                                                    "(LORDE_JOB_MAX_SECONDS); the rows judged before it are kept "
                                                    "(partial.jsonl) and charged; split the dataset into smaller jobs",
                               counts={**partial, "progress": "failed"}, results=await self.partial_results(job, run))
+            return
+        if outcome == "stalled":
+            await self.finish(job, "failed", error=f"no judgment for {self.s.job_stall_seconds} s: Lorde Serve is "
+                                                   "unavailable or overloaded (LORDE_JOB_STALL_SECONDS); the rows judged "
+                                                   "before it are kept (partial.jsonl) and charged; submit the job again "
+                                                   "later", counts={**partial, "progress": "failed"},
+                              results=await self.partial_results(job, run))
             return
         if proc.returncode != 0:
             tail = "\n".join(output.strip().splitlines()[-15:])
