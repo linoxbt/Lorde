@@ -53,6 +53,11 @@ with an API key (`LLAMA_API_KEY` there, `VLLM_API_KEY` on the Gateway, generated
 displayed). Configuration is llama.cpp environment variables (`LLAMA_ARG_HF_REPO`, `LLAMA_ARG_HOST=::`,
 `LLAMA_ARG_CTX_SIZE=4096`, `LLAMA_ARG_JINJA`, `LLAMA_ARG_ALIAS=lorde`, `LLAMA_ARG_N_PARALLEL=1`).
 
+- **`LLAMA_ARG_CACHE_RAM=0` is required.** llama-server's host-RAM prompt cache defaults to 8192 MiB, the whole
+  8 GB container. As distinct prompts pile up it evicts the memory-mapped weights and the server thrashes: memory
+  pinned at the limit, CPU near zero, about 27 s per token, every judgment timing out. Seen live on 2026-11-14 after
+  about 40 judgments; gating jobs stalled until the variable was set.
+
 - **Model:** `LLAMA_ARG_HF_REPO=Oxlino/lorde-tiny-aya-GGUF:Q4_K_M`, the trained Lorde (`v1.0.0` weights) quantized
   with llama.cpp. The Gateway labels it `lorde-tiny-aya@v1.0.0-q4km` (`LORDE_MODEL_REPO=Oxlino/lorde-tiny-aya`,
   `LORDE_MODEL_REVISION=v1.0.0-q4km`); the Console reads the same label from `NEXT_PUBLIC_LORDE_MODEL_REVISION`
